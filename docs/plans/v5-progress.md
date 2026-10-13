@@ -252,6 +252,16 @@ An app in daily use, on its owner's own stage, run every day in `sst dev` with a
   - The start-up message from the `sst5` bridge was read, so the two agree on that much.
 - Not called under `sst5 dev`: the four routes the diff showed as deleted, and the workflow.
 
+## 2026-10-13
+
+### `sst dev` responses, and the first pre-release
+
+| Commit | What |
+| --- | --- |
+| `7b026c61c`, `0252dbb7c`, `755cbaa8f` | `sst dev` sends a function's response, error or init error again, five times, three seconds apart, and the bridge drops the copies. Right after a cold start, AppSync accepted some responses and never delivered them. The same change is #102 on `main`. |
+| `22f742ccf` | A tag such as `v5.0.0-alpha.1` publishes to npm under `next-experimental` and is a pre-release on GitHub. A 5.x tag without a suffix stops. |
+| The commit after it | The notes for `v5.0.0-alpha.1`, and the README says how to install a pre-release. |
+
 ## What the harness can and can't see
 
 It records what's registered with the engine and compares, between a 4.x component and its v5 port: each resource's address (through aliases, as Pulumi resolves them), inputs, deploy options, registered outputs, what a function is built from, and what depends on what.

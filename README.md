@@ -11,7 +11,7 @@
 ---
 
 > [!NOTE]
-> This is the `v5` branch. **It isn't released**: there is no 5.x on npm. For the version you can install today, see the [`main` branch](https://github.com/sst-community/sst/tree/main).
+> This is the `v5` branch. **It's in pre-release**: 5.x is on npm under the `next-experimental` tag, and an install without a version still gets 4.x. For the stable version, see the [`main` branch](https://github.com/sst-community/sst/tree/main).
 >
 > sst-community is a community-maintained fork of [SST](https://github.com/anomalyco/sst). It is not affiliated with SST or Anomaly.
 
@@ -82,14 +82,22 @@ Resources are named after the app and stage, as in SST's components. That list o
 
 ## Status
 
-- **Ported:** `Alb`, `ApiGatewayV2`, `AppSync`, `Aurora`, `Bucket`, `Cluster`, `CognitoUserPool`, `CronV2`, `Dsql`, `Dynamo`, `Efs`, `Function`, `Mysql`, `Postgres`, `Queue`, `Redis`, `Service`, `SnsTopic` and `Task`.
+- **Ported:** `Alb`, `ApiGatewayV2`, `AppSync`, `Aurora`, `Bucket`, `Bus`, `Cluster`, `CognitoUserPool`, `CronV2`, `Dsql`, `Dynamo`, `Efs`, `Function`, `Mysql`, `Postgres`, `Queue`, `Redis`, `Service`, `SnsTopic` and `Task`.
 - **Not yet:** the sites (`Nextjs`, `Astro` and the rest), `Vpc`, `Router`, `StaticSite` and the others.
 - **Version 4 components are untouched.** Everything in `sst.aws.*` works as it does on `main`, so an app can mix the two.
 - **How it's been checked:** each port is tested against the component it replaces, under a mock of the deploy engine, to confirm a switch keeps what's deployed. The ported components have also been through it once in a real AWS account: deployed with version 4, switched to v5, and removed. Nothing was replaced on the switch except the uploaded code of functions that got a new name.
 
 ## Try it
 
-You need [Go](https://go.dev/) and [Bun](https://bun.sh/) to build it, and Node.js 22 or later to run it, as on `main` since 4.18.0.
+Install the newest pre-release in an app, and use it on a stage of its own. It needs Node.js 22 or later, as on `main` since 4.18.0. A `version` rule in `sst.config.ts` has to name a pre-release to accept one, as `">= 5.0.0-0"` does.
+
+```bash
+npm install sst@npm:@sst-community/sst@next-experimental
+```
+
+Each pre-release's notes are on the [releases page](https://github.com/sst-community/sst/releases).
+
+To build it from this branch instead, you need [Go](https://go.dev/) and [Bun](https://bun.sh/):
 
 ```bash
 git clone -b v5 https://github.com/sst-community/sst

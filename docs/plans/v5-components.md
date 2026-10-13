@@ -1,6 +1,6 @@
 # v5 components: plan and status
 
-Branch `v5`, started 2026-09-30. Last updated 2026-10-01.
+Branch `v5`, started 2026-09-30. Last updated 2026-10-13.
 
 ## Goal
 
@@ -38,6 +38,7 @@ Each of these was settled on the date given. Change one only on purpose, and rec
 | 2026-10-12 | **A component's type has three parts**, `<package>:<module>:<Name>`. `component()` refuses two. |
 | 2026-10-12 | **A provider a package needs is added by the app**, with `sst add`, as the deploy says. A provider's settings are in the config, so `sst install` doesn't write it there. |
 | 2026-10-12 | **One `sst` package.** It carries SST's components for a package's repo too. esbuild, archiver and glob come with it in an app's production install, which add little next to the CLI's binary. |
+| 2026-10-13 | **5.x ships as pre-releases until 5.0.0**, tagged on `v5` as `v5.0.0-alpha.N`, to npm under the `next-experimental` tag. Only `v5`'s `release.yml` handles them, so `main`'s release path doesn't change. A 5.x tag without a suffix stops in `release.yml`. See "Pre-releases of v5" in `MAINTAINING.md`. |
 
 Since 2026-10-09 a 4.x file can change, so `git diff --stat main -- platform/src cmd/sst` lists what differs from `main`.
 
@@ -98,7 +99,7 @@ Before the sites, the docs generator needed to read arg types from helper files.
   - Telling a function, an ARN and args apart only needs the definition's outer value, so the args could stay unresolved and the preview right. Worth doing?
 - **A resource whose provider requires a name** (`cloudflare.R2Bucket`) has to be given `name: ""` for SST's naming to fill it in, as upstream's own Cloudflare components do. `this.part()` could do better.
 - **Two proposals not built:** test harness conveniences (`resource()`, `names()`, default AWS answers), and a report of what a 4.x component creates, to port from.
-- **Releasing 5.x.** `release.yml` publishes any pushed `vX.Y.Z` tag, from any branch, to npm as `latest`. That has to be sorted out before a 5.x tag is pushed. `check.yml` and `docs.yml` only run for `main`.
+- **v5's docs aren't published.** `docs.yml` builds `main` only, so the v5 component pages and the component guides are only in the repo, and release notes link to them there. One way, not taken yet: build both branches into one site, with v5 under `/sst/v5/`. `check.yml` runs for `main` only too.
 - **Merging `main` into `v5`** conflicts on the root `README.md`, which is rewritten here.
 
 ## Not verified
