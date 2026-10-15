@@ -74,7 +74,7 @@ The fork numbers its own releases, with semver, because it moves faster than SST
 - **`.github/scripts/next-version.sh` works it out.** Run it on an up-to-date `main`. It takes the highest `semver:` label of the pull requests merged since the last release, and the SST release merged since then, if any. It lists what it didn't count: pull requests without the label, and commits pushed straight to `main`. Check those by hand.
 - **The automatic review sets the `semver:` label** on each pull request (see [Who can merge and release](#who-can-merge-and-release)). Correct it before merging when it's wrong.
 - **`sst version` names the SST release**, as `sst 4.18.0 (sst-community, built on SST 4.17.1)`. `release.yml` finds the newest SST tag in the release's history and `.goreleaser.yml` passes it in as `ui.Upstream`. Release notes name it too.
-- Use plain `X.Y.Z`. A suffix such as `4.17.1-community.1` fails every `version` rule in a user's `sst.config.ts`, and npm ignores `+build` metadata. Nothing compares the CLI's version with SST's, so the fork's numbers don't have to match SST's.
+- Use plain `X.Y.Z`. A version with a suffix, such as `5.0.0-alpha.1`, is a pre-release (see [Pre-releases of v5](#pre-releases-of-v5)), and npm ignores `+build` metadata. Nothing compares the CLI's version with SST's, so the fork's numbers don't have to match SST's.
 
 ## Releasing
 
@@ -125,7 +125,7 @@ Things to know:
 
 - **A 5.x tag without a suffix stops.** Before it builds anything, `release.yml` on `v5` fails a version whose major is newer than npm's `latest`, such as `v5.0.0` while 4.x is out. To release 5.0.0, remove the "Check the version" step in the commit you tag.
 - **Users install a pre-release** with `npm install sst@npm:@sst-community/sst@next-experimental`, or install the CLI alone with `curl -fsSL https://raw.githubusercontent.com/sst-community/sst/main/install | VERSION=5.0.0-alpha.1 bash`, which replaces their global CLI. A pre-release's `sst upgrade` moves to the newest 5.x version, pre-releases included, and its `sst init` writes that version.
-- **An app's `version` rule has to name a pre-release to accept one.** `">= 5.0.0-0"` accepts `5.0.0-alpha.1`, but `">= 4"`, `"5.x"` and `"*"` don't.
+- **A pre-release meets an app's `version` rule when its release would**, from `5.0.0-alpha.2` on: `">= 4"` and `"5.x"` allow it, and `"4.x"` doesn't. `5.0.0-alpha.1` only meets a rule that names a pre-release, such as `">= 5.0.0-0"`.
 - **`release.yml`, `.goreleaser.yml` and `sdk/js/scripts/release.ts` differ between `main` and `v5`.** When merging `main` into `v5` conflicts in one of them, keep `v5`'s pre-release changes.
 
 ## Building it yourself

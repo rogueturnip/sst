@@ -116,6 +116,9 @@ export interface App {
    * ```ts
    * version: ">= 3.2.49"
    * ```
+   *
+   * A pre-release, such as `5.0.0-alpha.1`, meets a range that its release meets. So
+   * `">= 4"` and `"5.x"` allow it, and `"4.x"` doesn't.
    */
   version?: string;
   /**

@@ -163,6 +163,31 @@ func (err *ErrVersionMismatch) Error() string {
 	return "ErrorVersionMismatch"
 }
 
+// Whether the app's `version` rule allows the CLI's version. A pre-release is
+// also checked as the release it leads to, since semver ranges leave
+// pre-releases out: 5.0.0-alpha.1 meets ">= 4" and "5.x", and not "4.x".
+func versionAllowed(rule string, cli string) (bool, error) {
+	constraint, err := semver.NewConstraint(rule)
+	if err != nil {
+		return false, ErrVersionInvalid
+	}
+	version, err := semver.NewVersion(cli)
+	if err != nil {
+		return false, ErrVersionInvalid
+	}
+	if constraint.Check(version) {
+		return true, nil
+	}
+	if version.Prerelease() == "" {
+		return false, nil
+	}
+	release, err := version.SetPrerelease("")
+	if err != nil {
+		return false, ErrVersionInvalid
+	}
+	return constraint.Check(&release), nil
+}
+
 type ErrBuildFailed struct {
 	msg    string
 	Errors []api.Message
@@ -345,15 +370,11 @@ console.log("~j" + JSON.stringify(await mod.app({
 			}
 
 			if proj.app.Version != "" && input.Version != "dev" {
-				constraint, err := semver.NewConstraint(proj.app.Version)
+				allowed, err := versionAllowed(proj.app.Version, input.Version)
 				if err != nil {
-					return nil, ErrVersionInvalid
+					return nil, err
 				}
-				version, err := semver.NewVersion(input.Version)
-				if err != nil {
-					return nil, ErrVersionInvalid
-				}
-				if !constraint.Check(version) {
+				if !allowed {
 					return nil, &ErrVersionMismatch{Needed: input.Version, Received: proj.app.Version}
 				}
 			}

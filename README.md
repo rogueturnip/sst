@@ -89,7 +89,7 @@ Resources are named after the app and stage, as in SST's components. That list o
 
 ## Try it
 
-Install the newest pre-release in an app, and use it on a stage of its own. It needs Node.js 22 or later, as on `main` since 4.18.0. A `version` rule in `sst.config.ts` has to name a pre-release to accept one, as `">= 5.0.0-0"` does.
+Install the newest pre-release in an app, and use it on a stage of its own. It needs Node.js 22 or later, as on `main` since 4.18.0. A `version` rule in `sst.config.ts` has to allow 5.x: `">= 4"` does, and `"4.x"` doesn't. `5.0.0-alpha.1` only meets a rule that names a pre-release, such as `">= 5.0.0-0"`.
 
 ```bash
 npm install sst@npm:@sst-community/sst@next-experimental
