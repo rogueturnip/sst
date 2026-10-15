@@ -145,6 +145,27 @@ describe("Queue", () => {
     );
   });
 
+  // A value that's only known once deployed, like the ARN of a layer that's
+  // being replaced. The preview still has to create the function, or `sst diff`
+  // shows it as deleted.
+  it("creates a subscriber whose args aren't known yet", async () => {
+    const sdk = await import("@pulumi/pulumi");
+    const unknown = sdk.output(sdk.unknown) as any;
+    new Queue("MyQueue").subscribe({
+      handler: "src/subscriber.handler",
+      environment: { LAYER: unknown },
+      layers: [unknown],
+    });
+    await pulumi.settle();
+
+    expect(
+      pulumi.resources.filter((r) => r.type === "sst:aws:Function"),
+    ).toHaveLength(1);
+    expect(
+      pulumi.resources.filter((r) => r.type === "aws:lambda/function:Function"),
+    ).toHaveLength(1);
+  });
+
   it("applies the queue's transform to the subscriber", async () => {
     new Queue("MyQueue", {
       transform: { eventSourceMapping: { enabled: false } },

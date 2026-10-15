@@ -107,10 +107,22 @@ export function functionPart(
   ] = rest.length === 3 ? (rest as any) : [undefined, ...rest];
 
   const part = component.partHandle(key, id);
-  const fn = output(
-    // A function passed in `existing`, or its ARN, is used as it is
-    (part.existing as FunctionDefinition | undefined) ?? definition,
-  ).apply((definition: unknown) => {
+  // A function passed in `existing`, or its ARN, is used as it is
+  const given = (part.existing as FunctionDefinition | undefined) ?? definition;
+  // What was passed decides what to do, not the values inside it. Waiting on
+  // those too would leave the function out of a preview whenever an arg isn't
+  // known until the deploy, and `sst diff` would show it as deleted.
+  let fn: FunctionPart;
+  if (Output.isInstance(given) || typeof (given as any)?.then === "function") {
+    fn = output(given).apply(create);
+  } else {
+    const created = create(given);
+    fn = output(undefined).apply(() => created);
+  }
+  part.defer(() => fn.apply((fn) => fn.getFunction()));
+  return fn;
+
+  function create(definition: unknown) {
     if (definition instanceof Function || definition instanceof OriginalFunction)
       return use(definition);
     if (definition instanceof Workflow) return use(definition.getFunction());
@@ -153,9 +165,7 @@ export function functionPart(
         ),
       ),
     );
-  });
-  part.defer(() => fn.apply((fn) => fn.getFunction()));
-  return fn;
+  }
 }
 
 function use(fn: Function | OriginalFunction) {
