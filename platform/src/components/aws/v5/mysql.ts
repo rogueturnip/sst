@@ -282,7 +282,7 @@ export class Mysql extends component("sst:aws:Mysql", parts) {
     const proxy = plain(args.proxy, `The "proxy" of the "${name}" database`);
     const replicas =
       plain(args.replicas, `The "replicas" of the "${name}" database`) ?? 0;
-    const engineVersion = withDefault(args.version, "8.0.40");
+    const engineVersion = withDefault(args.version, "8.0");
     const instanceType = withDefault(args.instance, "t4g.micro");
     const blueGreen = withDefault(args.blueGreen, false);
     const vpc = isVpc(args.vpc)

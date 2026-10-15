@@ -358,7 +358,7 @@ describe("Mysql", () => {
     expect(resource("MyDatabaseInstance").inputs).toMatchObject({
       dbName: "app",
       engine: "mysql",
-      engineVersion: "8.0.40",
+      engineVersion: "8.0",
       instanceClass: "db.t4g.micro",
       username: "root",
       allocatedStorage: 20,

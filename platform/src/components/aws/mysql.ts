@@ -27,7 +27,10 @@ export interface MysqlArgs {
    * causing downtime. Learn more about [upgrading databases](/docs/upgrade-aws-databases/).
    * :::
    *
-   * @default `"8.0.40"`
+   * Without it, RDS creates the database with its current minor version of MySQL 8.0, and
+   * a deployed database keeps the version it has.
+   *
+   * @default `"8.0"`
    * @example
    * ```js
    * {
@@ -493,7 +496,7 @@ export class Mysql extends Component implements Link.Linkable {
     }
 
     const multiAz = output(args.multiAz).apply((v) => v ?? false);
-    const engineVersion = output(args.version).apply((v) => v ?? "8.0.40");
+    const engineVersion = output(args.version).apply((v) => v ?? "8.0");
     const instanceType = output(args.instance).apply((v) => v ?? "t4g.micro");
     const username = output(args.username).apply((v) => v ?? "root");
     const storage = normalizeStorage();
