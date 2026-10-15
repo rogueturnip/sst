@@ -95,7 +95,7 @@ Install the newest pre-release in an app, and use it on a stage of its own. It n
 npm install sst@npm:@sst-community/sst@next-experimental
 ```
 
-Each pre-release's notes are on the [releases page](https://github.com/sst-community/sst/releases).
+Each pre-release's notes are on the [releases page](https://github.com/sst-community/sst/releases). [Migrate From v4](www/src/content/docs/docs/migrate-from-v4.mdx) has the steps, and what to change when you switch a component.
 
 To build it from this branch instead, you need [Go](https://go.dev/) and [Bun](https://bun.sh/):
 
