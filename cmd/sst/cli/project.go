@@ -14,6 +14,7 @@ import (
 	"github.com/sst/sst/v3/cmd/sst/mosaic/ui"
 	"github.com/sst/sst/v3/internal/util"
 	"github.com/sst/sst/v3/pkg/flag"
+	"github.com/sst/sst/v3/pkg/global"
 	"github.com/sst/sst/v3/pkg/project"
 )
 
@@ -70,6 +71,8 @@ func (c *Cli) InitProject() (*project.Project, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Looks for a newer sst once a day, for the UI to say on a later run
+	go global.CheckForUpdate(c.version)
 	if version := p.NodeVersion(); project.NodeTooOld(version) {
 		fmt.Fprintln(os.Stderr, ui.TEXT_WARNING_BOLD.Render("Warning: ")+fmt.Sprintf("SST needs Node.js %d or later, and this is Node.js %s. Some features may fail until you upgrade.", project.MinNodeMajor, version))
 	}

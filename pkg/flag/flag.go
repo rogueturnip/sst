@@ -32,6 +32,10 @@ var SST_VERBOSE = isTrue("SST_VERBOSE")
 var SST_EXPERIMENTAL = isTrue("SST_EXPERIMENTAL") || isTrue("SST_EXPERIMENTAL_RUN")
 var SST_RUN_ID = os.Getenv("SST_RUN_ID")
 var SST_SKIP_APPSYNC = isTrue("SST_SKIP_APPSYNC")
+
+// SST_SKIP_UPDATE_CHECK stops the CLI looking for a newer SST once a day. CI
+// never looks.
+var SST_SKIP_UPDATE_CHECK = isTrue("SST_SKIP_UPDATE_CHECK")
 var SST_NO_BUN = isTrue("NO_BUN") || isTrue("SST_NO_BUN")
 
 func isTrue(name string) bool {

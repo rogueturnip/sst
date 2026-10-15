@@ -877,6 +877,8 @@ var root = &cli.Command{
 					"```bash frame=\"none\"",
 					"sst upgrade 0.10",
 					"```",
+					"",
+					"Once a day, the commands that run your app, like `sst deploy`, `sst diff` and `sst dev`, look for a newer version in your major version, and say when there is one. Nothing is looked for in CI, or when `SST_SKIP_UPDATE_CHECK=1` is set.",
 				}, "\n"),
 			},
 			Args: cli.ArgumentList{

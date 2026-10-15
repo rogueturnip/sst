@@ -21,6 +21,7 @@ import (
 	"github.com/sst/sst/v3/cmd/sst/mosaic/deployer"
 	"github.com/sst/sst/v3/cmd/sst/mosaic/ui/common"
 	"github.com/sst/sst/v3/pkg/flag"
+	"github.com/sst/sst/v3/pkg/global"
 	"github.com/sst/sst/v3/pkg/project"
 	"github.com/sst/sst/v3/pkg/types/typescript"
 
@@ -55,6 +56,7 @@ type UI struct {
 	buffer     []interface{}
 	hasBlank   bool
 	hasHeader  bool
+	hasUpdate  bool
 	options    *Options
 	log        *os.File
 }
@@ -272,6 +274,7 @@ func (u *UI) Event(unknown interface{}) {
 	case *project.StackCommandEvent:
 		u.reset()
 		u.header(evt.Version, evt.App, evt.Stage)
+		u.update(evt.Version)
 		u.blank()
 		if evt.Command == "deploy" {
 			u.mode = ProgressModeDeploy
@@ -642,6 +645,20 @@ func (u *UI) printProgress(barColor lipgloss.Style, label string, duration time.
 		message += fmt.Sprintf(" (%.1fs)", duration.Seconds())
 	}
 	u.printEvent(barColor, label, message)
+}
+
+// update says when the last check found a newer SST, once for the UI, as
+// `sst dev` deploys again on each change
+func (u *UI) update(version string) {
+	if u.hasUpdate {
+		return
+	}
+	newest, ok := global.NewerVersion(version)
+	if !ok {
+		return
+	}
+	u.hasUpdate = true
+	u.printEvent(TEXT_INFO, "Info", fmt.Sprintf("SST %s is available. Run `sst upgrade` to update.", newest))
 }
 
 func (u *UI) printEvent(barColor lipgloss.Style, label string, message ...string) {
