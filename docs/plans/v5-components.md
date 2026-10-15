@@ -59,7 +59,7 @@ Since 2026-10-09 a 4.x file can change, so `git diff --stat main -- platform/src
 
 **How it's been checked:**
 
-- 1,631 tests under a mock of the deploy engine (2026-10-12). Each port runs its takeover cases three ways (as it is, inside another component, with another provider) and has to keep everything the 4.x component deployed, with the same inputs, options, registered outputs, function build inputs and teardown order.
+- 1,680 tests under a mock of the deploy engine (2026-10-14). Each port runs its takeover cases three ways (as it is, inside another component, with another provider) and has to keep everything the 4.x component deployed, with the same inputs, options, registered outputs, function build inputs and teardown order.
 - One run in a real AWS account on 2026-10-01: all 19 deployed with 4.x, switched, and removed. See [the report](v5-aws-test-2026-10-01.md).
 
 **Where things stand (2026-10-01):** everything above is committed and pushed. `git log origin/v5` has the latest.
@@ -99,11 +99,13 @@ Before the sites, the docs generator needed to read arg types from helper files.
 - **4.x's `functionBuilder` creates a function inside an `apply` on its args**, so when they hold a value that's unknown until the deploy, `sst diff` shows the function as deleted, and the deploy then updates it. A 4.x app showed this on 2026-10-13 (`v5-progress.md`). v5's `functionPart` no longer does (2026-10-14). Fixing 4.x is a change for `main`.
 - **A resource whose provider requires a name** (`cloudflare.R2Bucket`) has to be given `name: ""` for SST's naming to fill it in, as upstream's own Cloudflare components do. `this.part()` could do better.
 - **Two proposals not built:** test harness conveniences (`resource()`, `names()`, default AWS answers), and a report of what a 4.x component creates, to port from.
-- **v5's docs aren't published.** `docs.yml` builds `main` only, so the v5 component pages and the component guides are only in the repo, and release notes link to them there. One way, not taken yet: build both branches into one site, with v5 under `/sst/v5/`. `check.yml` runs for `main` only too.
+- **v5's docs aren't published.** `docs.yml` builds `main` only, so the v5 component pages and the component guides are only in the repo, and release notes link to them there. One way, not taken yet: build both branches into one site, with v5 under `/sst/v5/`. (`check.yml` runs for `v5` since 2026-10-14.)
 - **Merging `main` into `v5`** conflicts on the root `README.md`, which is rewritten here.
+- **What a V5 component is called once 4.x is removed.** If `sst.aws.v5.Queue` becomes `sst.aws.Queue` again, every app renames its components once more. Nothing deployed changes, as the type is the same. A command that rewrites a config could do that rename then, with the changes the "Switch from" sections list; it was left for 5.0.0 (2026-10-15).
 
 ## Not verified
 
+- Switching a V5 component back to its 4.x one. The aliases that kept its resources on the way in aren't in the 4.x component, so a renamed resource would be created again under its old name. [Migrate From v4](../../www/src/content/docs/docs/migrate-from-v4.mdx) says to check `sst diff` first.
 - `sst dev` with a `Service` or `Task`. Live functions were run on 2026-10-01 and work. On 2026-10-13, a 4.x app's dev stage went from a 4.x CLI to `sst5 dev` and back.
 - `get` and `existing` against real AWS, and a custom `provider`.
 - A shipped handler that imports a library from the package's `dependencies`, deployed.

@@ -304,6 +304,22 @@ The same change is #118 on `main`, a draft for now.
 
 On a benchmark of 16 functions that import a shared module and the AWS SDK, a change to that module took 866ms of builds and takes 329ms; 5 files changed at once took 5 rounds and take one. A file only one function imports gains nothing, and waits the 100ms. Leaving the SDK out in dev takes a function's build from 53ms to 10ms. Checked in `sst dev` on a test app in AWS, since removed.
 
+### A notice when a newer SST is out
+
+Nothing told a user that a newer SST was out. Now, once a day, in the background, the CLI looks for the newest release in its major version, the one `sst upgrade` installs (`pkg/global/update.go`). The UI says so under the header, as an `Info` line like its others: ``SST 5.0.0-alpha.2 is available. Run `sst upgrade` to update.`` A run never waits for the look, so the notice can come from the run after it. In `sst dev` it shows once. Nothing is looked for in CI, or with `SST_SKIP_UPDATE_CHECK=1`, and a dev build never looks. The `upgrade` command's docs say so.
+
+Tried and dropped (2026-10-15): the same notice for the component packages an app uses (it looked a private scoped package up on the public registry, as the CLI doesn't read scoped registries from `.npmrc`), warnings for what's deprecated in the 4.x components, and a note naming the 4.x components an app uses that have a V5 version. Each printed another way, and at another frequency, from the others.
+
+Checked with `sst5 diff` and `sst5 dev` on a test app in AWS, with a build labelled `5.0.0-alpha.0`: the look found `5.0.0-alpha.1` on GitHub, the UI said so, once in dev, and nothing showed with `CI` set. The line as it's worded now was checked through the UI.
+
+## 2026-10-15
+
+### A guide to moving from v4
+
+`www/src/content/docs/docs/migrate-from-v4.mdx`, in the sidebar under How to, and linked from the README. It gathers what was spread over the README, the release notes and the 20 "Switch from" sections: the four things the 5.x CLI reads differently in a config, installing, switching one component at a time, what every V5 component does differently, what a switch can replace, a line per component, and going back. Like the other V5 pages, it's only in the repo until the V5 docs are published.
+
+Switching a component back to 4.x hasn't been tried. A V5 component keeps some resources under new names through aliases, which the 4.x one doesn't have, so they'd be created again under the old names; the guide says to check `sst diff` first. A command that rewrites a config for v5 was considered and left for 5.0.0, when the names are final and every app has to change.
+
 ## What the harness can and can't see
 
 It records what's registered with the engine and compares, between a 4.x component and its v5 port: each resource's address (through aliases, as Pulumi resolves them), inputs, deploy options, registered outputs, what a function is built from, and what depends on what.
