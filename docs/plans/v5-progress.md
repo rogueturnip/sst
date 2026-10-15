@@ -292,6 +292,18 @@ The merge brings in v4.21.0, v4.21.1 and `main` up to `6e1c757d6`. Nothing confl
 
 The merge left the v5 `Function` without #116: it still looked the role up on every run, for 4.x's `role` and for `existing: { role }`. The takeover check couldn't see that, as the lookup is something the V5 component adds, not something the original left. The commit after the merge brings it over: a role passed by its ARN, as 4.x's `role` or in `existing`, is used as it is and only looked up when `nodes.role` is read. One passed by its name, or as an output, is still looked up, by its name even when the output is an ARN (passing an ARN in `existing` had failed the lookup).
 
+### Faster rebuilds in `sst dev`
+
+The same change is #118 on `main`, a draft for now.
+
+| Commit | What |
+| --- | --- |
+| `790a5de75` | Changed files are collected for 100ms, and the functions they affect are built once, at the same time, not one after the other. A redeploy in dev builds its functions the same way. |
+| `89789d435` | The esbuild context kept for a function in dev is replaced when its build options change. A change to its `nodejs` config had applied only once the context was evicted or `sst dev` restarted. |
+| `171361271` | `nodejs.esbuild` shows how to leave the AWS SDK out of builds in `sst dev`. |
+
+On a benchmark of 16 functions that import a shared module and the AWS SDK, a change to that module took 866ms of builds and takes 329ms; 5 files changed at once took 5 rounds and take one. A file only one function imports gains nothing, and waits the 100ms. Leaving the SDK out in dev takes a function's build from 53ms to 10ms. Checked in `sst dev` on a test app in AWS, since removed.
+
 ## What the harness can and can't see
 
 It records what's registered with the engine and compares, between a 4.x component and its v5 port: each resource's address (through aliases, as Pulumi resolves them), inputs, deploy options, registered outputs, what a function is built from, and what depends on what.
