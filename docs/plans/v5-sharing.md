@@ -71,13 +71,7 @@ In an app, both resolve to the app's own copies in `.sst/platform`, at deploy ti
 
 ## Not done yet
 
-1. **A release path for 5.x.** These files live on `main`, whose release files are newer than `v5`'s:
-   - The tag pattern in `release.yml` doesn't match `v5.0.0-alpha.1`.
-   - `sdk/js/scripts/release.ts` publishes every version as npm `latest`.
-   - goreleaser makes every GitHub release the latest one, which is what the `install` script downloads.
-   - `MAINTAINING.md` says not to tag 5.x.
-
-   The CLI side (`sst upgrade`, `sst init`) is done here.
+1. ~~**A release path for 5.x.**~~ Done 2026-10-13 on `v5` (`22f742ccf`), not `main`: a tag such as `v5.0.0-alpha.1` goes to npm under the `next-experimental` tag and is never GitHub's latest release. `5.0.0-alpha.1` was the first. See "Pre-releases of v5" in `MAINTAINING.md`.
 2. ~~**A deploy to AWS**~~ of an app that uses a package, and `sst dev` with a function inside a package's component. Done 2026-10-12 ([v5-sharing-host.md](v5-sharing-host.md), step 9). It found a crash in the CLI on a component type with two parts.
 3. **Yarn and Windows.** npm, pnpm (with its `.pnpm` layout) and bun apps have each deployed a package. Yarn and Windows haven't been run.
 4. **`sst/components` reviewed as a public API.** Its `.d.ts` also shows members marked `@internal`.
@@ -97,5 +91,5 @@ In an app, both resolve to the app's own copies in `.sst/platform`, at deploy ti
 
 ## Open questions
 
-1. **The 5.x channel.** Prereleases on npm `next`, never the GitHub latest release, until 5.0.0? Or keep the whole major off `latest`?
+1. ~~**The 5.x channel.**~~ Settled 2026-10-13: pre-releases under npm's `next-experimental` tag, never GitHub's latest release, until 5.0.0.
 2. **The import name.** `sst/components` reads well. It sits beside the SDK's `sst/*` exports, which have no `components`.

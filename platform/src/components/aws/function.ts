@@ -357,6 +357,10 @@ export interface FunctionArgs {
    * Node.js and Golang are officially supported. While, Python and Rust are
    * community supported. Support for other runtimes are on the roadmap.
    *
+   * A later release can move the default to a newer Node.js, and says so in its notes.
+   * A function that uses the default is then updated on its next deploy. Set `runtime`
+   * to keep it on one version.
+   *
    * @default `"nodejs24.x"`
    *
    * @example

@@ -206,7 +206,7 @@ Steps 1 and 2 stand alone, and could go to `v5` first. Steps 3 and 4 need step 1
 - **A package listed in the config gets no globals.** The files in `.sst` aren't given them, and that's where it's installed. A package that imports what it uses, as the guide says to, doesn't need them.
 - **A package's repo needs `skipLibCheck`.** Without it, `tsc` finds 45 errors in SST's declarations: types from providers the repo doesn't install, like cloudflare's from `sst/components/aws`, and a `T` that `cloudflare/ai.d.ts` doesn't declare.
 - **A package that uses a group installs all of that group's providers,** `@pulumi/command` and the rest for `sst/components/aws`, though it only uses aws. Without one, the import fails with Node's own message, not SST's.
-- **Nothing can be published** until the release path for 5.x is settled ("Not done yet" 1 in [v5-sharing.md](v5-sharing.md)).
+- **`sst` 5.x is only out as pre-releases** until 5.0.0, under npm's `next-experimental` tag (since 2026-10-13). A package's peer dependency on it is written `>=5.0.0-0`, so that it includes them.
 
 ## What comes from v5-sharing-deps
 

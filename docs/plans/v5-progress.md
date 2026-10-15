@@ -262,6 +262,22 @@ An app in daily use, on its owner's own stage, run every day in `sst dev` with a
 | `22f742ccf` | A tag such as `v5.0.0-alpha.1` publishes to npm under `next-experimental` and is a pre-release on GitHub. A 5.x tag without a suffix stops. |
 | The commit after it | The notes for `v5.0.0-alpha.1`, and the README says how to install a pre-release. |
 
+## 2026-10-14
+
+### Tightening, and ideas from SST's own list
+
+SST keeps a list of what to change in its next major version, [anomalyco/sst#6588](https://github.com/anomalyco/sst/issues/6588). v5 already does its component-level items in part: plain args, and `CronV2` without `job`. What was taken from it now is in the plan's decisions.
+
+| Commit | What |
+| --- | --- |
+| `9500d95cb` | `check.yml` runs for `v5`, and runs the platform's tests, which no workflow ran before. Three test files that had never loaded (`alb`, `bucket`, `service-alb`) are brought up to the code. |
+| `8ecf02a2f` | A pre-release meets a `version` rule its release meets, so `5.0.0-alpha.2` passes `">= 4"`. `5.0.0-alpha.1` only passed a rule that names a pre-release. |
+| `2a5b579ec` | `functionPart()` decides from what was passed, not the values in it, so a function whose args aren't known yet is still in the preview, and `sst diff` no longer shows it as deleted. |
+| `a953b539c` | `Mysql` defaults to `"8.0"`, for 4.x and v5. RDS had stopped offering `8.0.40`. |
+| The commit after it | This entry, the decisions, and the two breaking changes the `v5.0.0-alpha.1` notes left out. |
+
+Checked in AWS: a v5 `Mysql` without `version` was created with `8.0.46`, and `sst diff` after it showed no changes. The app was removed, and its passphrase and state files deleted.
+
 ## What the harness can and can't see
 
 It records what's registered with the engine and compares, between a 4.x component and its v5 port: each resource's address (through aliases, as Pulumi resolves them), inputs, deploy options, registered outputs, what a function is built from, and what depends on what.
