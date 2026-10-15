@@ -3,7 +3,6 @@ import {
   type CustomResourceOptions,
   type Input,
   type Inputs,
-  type Output,
   type ResourceTransformationArgs,
   output,
 } from "@pulumi/pulumi";
@@ -455,10 +454,11 @@ export class PartsComponent<P extends Parts> extends Component {
       /** What the user passed in `existing` for the part, as they passed it. */
       existing: at(this.partExisting, key, id) as unknown,
       /**
-       * Supply the part's entry in `nodes`. `node` is called when `nodes` is
-       * read, so it may fail when the resource was never created.
+       * Supply the part's entry in `nodes`: the resource, or an output of it.
+       * `node` is called when `nodes` is read, so it may fail when the
+       * resource was never created.
        */
-      defer: (node: () => Output<unknown>) =>
+      defer: (node: () => unknown) =>
         put(this.partDeferred, key, id, node),
     };
   }

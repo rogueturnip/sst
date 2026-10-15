@@ -66,7 +66,8 @@ import { KvRoutesUpdate } from "../providers/kv-routes-update";
 
 const parts = {
   /**
-   * The IAM Role the function uses.
+   * The IAM Role the function uses. A role you passed by its ARN is looked up when you
+   * read this, and the deploy fails if it doesn't exist.
    */
   role: iam.Role,
   /**
@@ -457,7 +458,8 @@ export interface FunctionArgs
  *
  * #### Use a role or log group you already have
  *
- * Pass the resource, or the name to look it up by.
+ * Pass the resource, or the name to look it up by. A role can also be passed by its ARN.
+ * It's then used as it is, and only looked up if you read `nodes.role`.
  *
  * ```ts title="sst.config.ts"
  * new sst.aws.v5.Function("MyFunction", {
@@ -476,7 +478,8 @@ export interface FunctionArgs
  *
  * - `dev`, `logging`, `url`, `url.authorization`, `python`, `python.container`,
  *   `concurrency` and `concurrency.provisioned` have to be plain values, not outputs.
- * - `role: roleArn` becomes `existing: { role }`, with the role or its name.
+ * - `role: roleArn` becomes `existing: { role: roleArn }`. It can also be the role or
+ *   its name, which is looked up on every deploy.
  * - `logging: { logGroup: name }` becomes `existing: { logGroup }`, with the log group
  *   or its name.
  * - `live: false` becomes `dev: false`, and `url.route` becomes `url.router`.
@@ -576,15 +579,31 @@ export class Function extends component("sst:aws:Function", parts) {
     const environment = normalizeEnvironment();
     const durableConfig = normalizeDurable();
 
-    // 4.x takes the role's ARN. A role that's passed is looked up by its name.
-    const role =
-      this.existingPart("role") ??
-      (original.role
-        ? this.lookupPart(
-            "role",
-            output(original.role).apply((arn) => parseRoleArn(arn).roleName),
-          )
-        : this.part("role", roleArgs()));
+    // A role passed by its ARN, the way 4.x takes it, is used as it is. It's
+    // only looked up when `nodes.role` is read: a lookup is an IAM GetRole on
+    // every run, for every function that shares the role. One passed by its
+    // name, or as an output, is looked up for its ARN.
+    const existingRole = args.existing?.role;
+    const givenRoleArn =
+      typeof existingRole === "string" && existingRole.startsWith("arn:")
+        ? existingRole
+        : existingRole === undefined
+          ? original.role
+          : undefined;
+    const lookUpRole = (id: Input<string>) =>
+      this.lookupPart(
+        "role",
+        output(id).apply((id) =>
+          id.startsWith("arn:") ? parseRoleArn(id).roleName : id,
+        ),
+      );
+    let role: iam.Role | undefined;
+    if (givenRoleArn !== undefined)
+      this.partHandle("role").defer(() => (role ??= lookUpRole(givenRoleArn)));
+    else if (existingRole !== undefined && !(existingRole instanceof iam.Role))
+      role = lookUpRole(existingRole);
+    else role = this.existingPart("role") ?? this.part("role", roleArgs());
+    const roleArn = givenRoleArn ?? role!.arn;
 
     const givenLogGroup =
       original.logGroup !== undefined && !args.existing?.logGroup;
@@ -663,7 +682,7 @@ export class Function extends component("sst:aws:Function", parts) {
       {
         name: args.name,
         description: args.description ?? "",
-        role: role.arn,
+        role: roleArn,
         timeout: withDefault(args.timeout, "20 seconds", toSeconds),
         memorySize: withDefault(args.memory, "1024 MB", toMBs),
         ephemeralStorage: { size: withDefault(args.storage, "512 MB", toMBs) },

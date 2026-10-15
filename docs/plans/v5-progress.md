@@ -290,7 +290,7 @@ The merge brings in v4.21.0, v4.21.1 and `main` up to `6e1c757d6`. Nothing confl
 | `a7b7b8ba3`, `cb562da55` | Docs: how a `Router` URL route's timeouts behave (#112), PlanetScale role successors (#111). |
 | `6e1c757d6` | A 4.x `Function` given a `role` no longer reads it on every run, only when `nodes.role` is used (#116). |
 
-The v5 `Function` doesn't have #116 yet: it still looks the role up on every run, for 4.x's `role` and for `existing: { role }`. The takeover check can't see that, as the lookup is something the V5 component adds, not something the original left.
+The merge left the v5 `Function` without #116: it still looked the role up on every run, for 4.x's `role` and for `existing: { role }`. The takeover check couldn't see that, as the lookup is something the V5 component adds, not something the original left. The commit after the merge brings it over: a role passed by its ARN, as 4.x's `role` or in `existing`, is used as it is and only looked up when `nodes.role` is read. One passed by its name, or as an output, is still looked up, by its name even when the output is an ARN (passing an ARN in `existing` had failed the lookup).
 
 ## What the harness can and can't see
 

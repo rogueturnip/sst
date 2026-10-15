@@ -300,6 +300,26 @@ describe("Function", () => {
             ]);
           },
         },
+        // Neither one looks a role up that's passed by its ARN
+        "a role the user has, by its ARN": {
+          original: (opts) =>
+            new OriginalFunction(
+              "MyFunction",
+              { handler, role: ROLE_ARN },
+              opts,
+            ),
+          v5: (opts) =>
+            new Function(
+              "MyFunction",
+              { handler, existing: { role: ROLE_ARN } },
+              opts,
+            ),
+          check: () => {
+            const fn = pulumi.resources.find((r) => r.type === LAMBDA)!;
+            expect(fn.inputs.role).toBe(ROLE_ARN);
+            expect(pulumi.graph().filter((r) => r.type === ROLE)).toEqual([]);
+          },
+        },
       },
     });
 
@@ -395,6 +415,52 @@ describe("Function", () => {
       expect(fn.nodes.image).toBeUndefined();
       expect(fn.nodes.provisioned).toBeUndefined();
       await pulumi.settle();
+    });
+
+    // A lookup is an IAM GetRole on every run, for each function that shares
+    // the role
+    for (const [way, args] of [
+      ["in existing", { existing: { role: ROLE_ARN } }],
+      ["the way 4.x takes it", { role: ROLE_ARN }],
+    ] as const)
+      it(`looks up a role passed by its ARN ${way} only when nodes.role is read`, async () => {
+        const fn = new Function("MyFunction", {
+          handler,
+          ...args,
+        } as FunctionArgs);
+        await pulumi.settle();
+        const roles = () => pulumi.resources.filter((r) => r.type === ROLE);
+
+        expect(roles()).toEqual([]);
+        expect(
+          pulumi.resources.find((r) => r.type === LAMBDA)!.inputs.role,
+        ).toBe(ROLE_ARN);
+
+        expect(fn.nodes.role).toBeInstanceOf(aws.iam.Role);
+        expect(fn.nodes.role).toBe(fn.nodes.role);
+        await pulumi.settle();
+        expect(
+          roles().map((r) => [r.name, r.kind, r.options.id]),
+        ).toEqual([["MyFunctionRole", "read", "my-role"]]);
+      });
+
+    it("looks up a role passed as an output by its name, even when it's an ARN", async () => {
+      new Function("MyFunction", {
+        handler,
+        existing: { role: output(ROLE_ARN) },
+      });
+      await pulumi.settle();
+
+      expect(
+        pulumi.resources
+          .filter((r) => r.type === ROLE)
+          .map((r) => [r.name, r.kind, r.options.id]),
+      ).toEqual([["MyFunctionRole", "read", "my-role"]]);
+      expect(
+        await pulumi.resolve(
+          pulumi.resources.find((r) => r.type === LAMBDA)!.inputs.role,
+        ),
+      ).toBe(ROLE_ARN);
     });
 
     it("transforms every part", async () => {
