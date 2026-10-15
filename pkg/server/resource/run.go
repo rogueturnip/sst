@@ -16,6 +16,10 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
+// The longest line of command output that is passed on, 1 MB. A longer line is
+// dropped, with a note in the output, and the lines after it still come through.
+const maxOutputLine = 1024 * 1024
+
 // Semaphore to limit concurrent executions
 type Run struct {
 	lock *semaphore.Weighted
@@ -78,22 +82,36 @@ func (r *Run) executeCommand(input *RunInputs) error {
 			cmd.Env = append(cmd.Env, key+"="+value)
 		}
 	}
-	stdout, err := cmd.StdoutPipe()
+	// One pipe for both. Reading stdout to its end before stderr (a MultiReader)
+	// blocks the command once it writes more than a pipe holds to stderr, since
+	// nobody reads that while stdout is still open.
+	reader, writer, err := os.Pipe()
 	if err != nil {
 		return err
 	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return err
-	}
-	reader := io.MultiReader(stdout, stderr)
+	cmd.Stdout = writer
+	cmd.Stderr = writer
 	err = cmd.Start()
+	writer.Close()
 	if err != nil {
+		reader.Close()
 		return err
 	}
-	scanner := bufio.NewScanner(reader)
-	for scanner.Scan() {
-		bus.Publish(&common.StdoutEvent{Line: scanner.Text()})
+	defer reader.Close()
+	err = readLines(
+		reader,
+		maxOutputLine,
+		func(line string) { bus.Publish(&common.StdoutEvent{Line: line}) },
+		func() {
+			bus.Publish(&common.StdoutEvent{Line: fmt.Sprintf("A line of the command's output is longer than %d MB and is not shown.", maxOutputLine/(1024*1024))})
+		},
+	)
+	if err != nil {
+		slog.Error("failed to read command output", "error", err, "cmd", cmd.String())
+		bus.Publish(&common.StdoutEvent{Line: "The command's output could not be read to the end: " + err.Error()})
+		// Keep reading, or the command blocks on a full pipe once nobody reads it,
+		// and Wait below never returns.
+		io.Copy(io.Discard, reader)
 	}
 	slog.Info("waiting for command to finish", "cmd", cmd.String())
 	cmd.Wait()
@@ -101,4 +119,39 @@ func (r *Run) executeCommand(input *RunInputs) error {
 		return fmt.Errorf("command exited with code %d", cmd.ProcessState.ExitCode())
 	}
 	return nil
+}
+
+// readLines passes each line of r to onLine. A line longer than max bytes is not
+// passed on: onTooLong is called once for it, and reading goes on with the next
+// line, so the output after it is not lost.
+func readLines(r io.Reader, max int, onLine func(string), onTooLong func()) error {
+	reader := bufio.NewReader(r)
+	var line []byte
+	tooLong := false
+	for {
+		part, isPrefix, err := reader.ReadLine()
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+		if !tooLong {
+			if len(line)+len(part) > max {
+				tooLong = true
+				line = nil
+				onTooLong()
+			} else {
+				line = append(line, part...)
+			}
+		}
+		if isPrefix {
+			continue
+		}
+		if !tooLong {
+			onLine(string(line))
+		}
+		line = line[:0]
+		tooLong = false
+	}
 }

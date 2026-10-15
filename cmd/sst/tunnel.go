@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"os/user"
 	"strings"
+	"time"
 
 	"github.com/sst/sst/v3/cmd/sst/cli"
 	"github.com/sst/sst/v3/cmd/sst/mosaic/dev"
@@ -109,6 +112,11 @@ var CmdTunnel = &cli.Command{
 			tun = item
 		}
 		subnets := strings.Join(tun.Subnets, ",")
+		// create a pipe so the child can detect parent death via EOF
+		pipeRead, pipeWrite, err := os.Pipe()
+		if err != nil {
+			return err
+		}
 		// run as root
 		tunnelCmd := process.CommandContext(
 			c.Context,
@@ -126,7 +134,12 @@ var CmdTunnel = &cli.Command{
 			"SSH_PRIVATE_KEY="+tun.PrivateKey,
 			"SST_LOG="+strings.ReplaceAll(os.Getenv("SST_LOG"), ".log", "_sudo.log"),
 		)
+		tunnelCmd.Stdin = pipeRead
 		tunnelCmd.Stdout = os.Stdout
+		tunnelCmd.Cancel = func() error {
+			// closing the write end signals EOF to child, which triggers cleanup
+			return pipeWrite.Close()
+		}
 		slog.Info("starting tunnel", "cmd", tunnelCmd.Args)
 		fmt.Println(ui.TEXT_HIGHLIGHT_BOLD.Render("Tunnel"))
 		fmt.Println()
@@ -141,10 +154,23 @@ var CmdTunnel = &cli.Command{
 		fmt.Println()
 		fmt.Println(ui.TEXT_DIM.Render("Waiting for connections..."))
 		fmt.Println()
-		stderr, _ := tunnelCmd.StderrPipe()
-		tunnelCmd.Start()
-		output, _ := io.ReadAll(stderr)
-		if strings.Contains(string(output), "password is required") {
+		// The stderr goes to a buffer and not a pipe we read, so Wait can give up on a
+		// child that ignores the closed stdin, such as a root copy from before this
+		// change, instead of hanging until it exits.
+		var stderr bytes.Buffer
+		tunnelCmd.Stderr = &stderr
+		tunnelCmd.WaitDelay = 10 * time.Second
+		if err := tunnelCmd.Start(); err != nil {
+			pipeRead.Close()
+			pipeWrite.Close()
+			return err
+		}
+		pipeRead.Close() // parent doesn't need read end
+		if err := tunnelCmd.Wait(); err != nil {
+			slog.Info("tunnel process ended", "error", err)
+		}
+		output := stderr.String()
+		if strings.Contains(output, "password is required") {
 			return util.NewReadableError(nil, "Make sure you have installed the tunnel with `sudo sst tunnel install`")
 		}
 		return nil
@@ -238,6 +264,20 @@ var CmdTunnel = &cli.Command{
 				if port == "" {
 					port = "22"
 				}
+				// Watch stdin before anything is set up, so a parent that dies while the
+				// interface and routes are being created still stops the tunnel.
+				ctx, cancel := context.WithCancel(c.Context)
+				defer cancel()
+				// Detect parent death via stdin EOF. Only when stdin is the pipe the
+				// parent made: run by hand with stdin on /dev/null or a closed stdin,
+				// the tunnel would stop as soon as it started.
+				if info, err := os.Stdin.Stat(); err == nil && info.Mode()&os.ModeNamedPipe != 0 {
+					go func() {
+						io.Copy(io.Discard, os.Stdin)
+						slog.Info("stdin closed, shutting down tunnel")
+						cancel()
+					}()
+				}
 				slog.Info("starting tunnel", "subnet", subnets, "host", host, "port", port)
 				err := tunnel.Start(subnets...)
 				if err != nil {
@@ -246,7 +286,7 @@ var CmdTunnel = &cli.Command{
 				defer tunnel.Stop()
 				slog.Info("tunnel started")
 				err = tunnel.StartProxy(
-					c.Context,
+					ctx,
 					user,
 					host+":"+port,
 					[]byte(os.Getenv("SSH_PRIVATE_KEY")),

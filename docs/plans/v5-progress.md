@@ -278,6 +278,20 @@ SST keeps a list of what to change in its next major version, [anomalyco/sst#658
 
 Checked in AWS: a v5 `Mysql` without `version` was created with `8.0.46`, and `sst diff` after it showed no changes. The app was removed, and its passphrase and state files deleted.
 
+### `main` merged in, through v4.21.1 and after
+
+The merge brings in v4.21.0, v4.21.1 and `main` up to `6e1c757d6`. Nothing conflicted. #102 was already on v5 as its own commits, and its files came out the same. The typecheck, the platform's tests and the Go tests passed as merged.
+
+| Commit | What |
+| --- | --- |
+| `1c4073531` | The root tunnel process stops when `sst` dies (#101). |
+| `884e27f67` | `Run` takes long output lines, and doesn't hang on one over the limit (#110). |
+| `172e16982` | Go Lambdas build without VCS metadata, so a new commit doesn't change them (#109). |
+| `a7b7b8ba3`, `cb562da55` | Docs: how a `Router` URL route's timeouts behave (#112), PlanetScale role successors (#111). |
+| `6e1c757d6` | A 4.x `Function` given a `role` no longer reads it on every run, only when `nodes.role` is used (#116). |
+
+The v5 `Function` doesn't have #116 yet: it still looks the role up on every run, for 4.x's `role` and for `existing: { role }`. The takeover check can't see that, as the lookup is something the V5 component adds, not something the original left.
+
 ## What the harness can and can't see
 
 It records what's registered with the engine and compares, between a 4.x component and its v5 port: each resource's address (through aliases, as Pulumi resolves them), inputs, deploy options, registered outputs, what a function is built from, and what depends on what.

@@ -108,8 +108,13 @@ func (p *linuxPlatform) start(routes ...string) error {
 }
 
 func (p *linuxPlatform) isRunning() bool {
-	_, err := net.InterfaceByName(resolveInterface())
-	return err == nil
+	iface, err := net.InterfaceByName(resolveInterface())
+	if err != nil {
+		return false
+	}
+	// A tunnel that was killed without cleaning up leaves its interface behind with
+	// no carrier. That one is not running, and the next start removes it.
+	return iface.Flags&net.FlagRunning != 0
 }
 
 func (p *linuxPlatform) destroy() error {
