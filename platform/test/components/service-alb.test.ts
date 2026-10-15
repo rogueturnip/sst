@@ -1,8 +1,19 @@
-import { describe, beforeAll, it, expect } from "vitest";
-import "../../src/global.d.ts";
+/// <reference path="../../src/global.d.ts" />
+import { describe, beforeAll, it, expect, vi } from "vitest";
 import * as pulumi from "@pulumi/pulumi";
 import fs from "fs";
 import path from "path";
+
+// A service's image goes to the asset registry, which comes from the CLI
+vi.mock("../../src/components/aws/helpers/bootstrap", () => ({
+  bootstrap: {
+    forRegion: async () => ({
+      asset: "sst-asset-test",
+      assetEcrRegistryId: "123456789012",
+      assetEcrUrl: "123456789012.dkr.ecr.us-east-1.amazonaws.com/sst-asset",
+    }),
+  },
+}));
 
 // Create temp directories for Docker context resolution in fargate.ts
 const testRoot = path.join("/tmp", "sst-test-" + process.pid);
@@ -51,6 +62,10 @@ pulumi.runtime.setMocks(
             "sst:ref:sg": "sg-mock-id",
             "sst:ref:vpc-id": "vpc-123",
           },
+          // The load balancer that Alb.get() reads
+          ...(args.id && args.type === "aws:lb/loadBalancer:LoadBalancer"
+            ? { securityGroups: ["sg-123"], vpcId: "vpc-123" }
+            : {}),
         },
       };
     },

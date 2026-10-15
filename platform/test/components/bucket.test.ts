@@ -1,5 +1,5 @@
+/// <reference path="../../src/global.d.ts" />
 import { describe, beforeAll, it, expect } from "vitest";
-import "../../src/global.d.ts";
 import * as pulumi from "@pulumi/pulumi";
 
 // @ts-ignore
@@ -49,9 +49,9 @@ describe("Bucket", function () {
 
     it("bucket name is prefixed", async () => {
       const bucket = new Bucket("MyBucket");
-      pulumi.all([bucket.name]).apply(([name]) => {
-        expect(name).toMatch(/^app-test-mybucket-\w{8}/);
-      });
+      // The S3 bucket is the "MyBucketBucket" resource
+      const name = await new Promise((resolve) => bucket.name.apply(resolve));
+      expect(name).toMatch(/^app-test-mybucketbucket-\w{8}/);
     });
   });
 });

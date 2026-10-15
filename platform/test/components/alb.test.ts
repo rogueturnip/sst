@@ -1,5 +1,5 @@
+/// <reference path="../../src/global.d.ts" />
 import { describe, beforeAll, it, expect } from "vitest";
-import "../../src/global.d.ts";
 import * as pulumi from "@pulumi/pulumi";
 
 // @ts-ignore
@@ -113,7 +113,21 @@ describe("Alb", function () {
   });
 
   describe("#getListener", () => {
-    it("throws for non-existent listener on non-ref ALB", async () => {
+    it("returns a listener it declares", async () => {
+      const alb = new Alb("TestAlbDeclared", {
+        vpc: {
+          id: "vpc-123",
+          publicSubnets: ["subnet-a", "subnet-b"],
+          privateSubnets: ["subnet-c", "subnet-d"],
+        },
+        listeners: [{ port: 80, protocol: "http" }],
+      });
+
+      expect(alb.getListener("http", 80)).toBe(alb.getListener("http", 80));
+    });
+
+    // A listener added to the load balancer some other way is read from AWS
+    it("looks up a listener it doesn't declare", async () => {
       const alb = new Alb("TestAlbMissing", {
         vpc: {
           id: "vpc-123",
@@ -123,22 +137,10 @@ describe("Alb", function () {
         listeners: [{ port: 80, protocol: "http" }],
       });
 
-      expect(() => alb.getListener("https", 443)).toThrow(
-        /Listener "HTTPS:443" not found/,
-      );
-    });
-
-    it("error message includes ALB name", async () => {
-      const alb = new Alb("MyNamedAlb", {
-        vpc: {
-          id: "vpc-123",
-          publicSubnets: ["subnet-a", "subnet-b"],
-          privateSubnets: ["subnet-c", "subnet-d"],
-        },
-        listeners: [{ port: 80, protocol: "http" }],
-      });
-
-      expect(() => alb.getListener("https", 443)).toThrow(/MyNamedAlb/);
+      const listener = alb.getListener("https", 443);
+      const urn = await new Promise((resolve) => listener.urn.apply(resolve));
+      expect(urn).toMatch(/::TestAlbMissingListenerHTTPS443$/);
+      expect(alb.getListener("https", 443)).toBe(listener);
     });
   });
 
