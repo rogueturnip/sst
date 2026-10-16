@@ -21,6 +21,7 @@ import (
 	"github.com/sst/sst/v3/cmd/sst/mosaic/watcher"
 	"github.com/sst/sst/v3/pkg/bus"
 	"github.com/sst/sst/v3/pkg/id"
+	"github.com/sst/sst/v3/pkg/process"
 	"github.com/sst/sst/v3/pkg/project"
 	"github.com/sst/sst/v3/pkg/runtime"
 	"github.com/sst/sst/v3/pkg/server"
@@ -343,9 +344,7 @@ func function(ctx context.Context, input input) {
 		}
 		go func() {
 			logs := worker.Logs()
-			scanner := bufio.NewScanner(logs)
-			for scanner.Scan() {
-				line := scanner.Text()
+			onLine := func(line string) {
 				stateMu.Lock()
 				requestID := info.CurrentRequestID
 				stateMu.Unlock()
@@ -355,6 +354,14 @@ func function(ctx context.Context, input input) {
 					RequestID:  requestID,
 					Line:       line,
 				})
+			}
+			// A line too long for a bufio.Scanner stopped it, and the worker was
+			// then taken for dead while it was still running.
+			err := process.ReadLines(logs, maxOutputLine, onLine, func() { onLine(tooLongNote("function")) })
+			if err != nil {
+				log.Error("failed to read function output", "workerID", workerID, "err", err)
+				// Keep reading, or the worker blocks on a full pipe.
+				io.Copy(io.Discard, logs)
 			}
 			workerShutdownChan <- info
 		}()

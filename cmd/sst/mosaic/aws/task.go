@@ -1,11 +1,12 @@
 package aws
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -137,28 +138,26 @@ func task(ctx context.Context, input input) {
 				cmd.Env = append(os.Environ(), body.Environment...)
 				stdout, _ := cmd.StdoutPipe()
 				stderr, _ := cmd.StderrPipe()
-				go func() {
-					scanner := bufio.NewScanner(stdout)
-					for scanner.Scan() {
-						line := scanner.Text()
-						bus.Publish(&TaskLogEvent{
-							TaskID:   body.TaskID,
-							WorkerID: msg.Source,
-							Line:     line,
-						})
+				onLine := func(line string) {
+					bus.Publish(&TaskLogEvent{
+						TaskID:   body.TaskID,
+						WorkerID: msg.Source,
+						Line:     line,
+					})
+				}
+				var readers sync.WaitGroup
+				read := func(r io.Reader) {
+					defer readers.Done()
+					err := process.ReadLines(r, maxOutputLine, onLine, func() { onLine(tooLongNote("task")) })
+					if err != nil {
+						log.Error("failed to read task output", "taskID", body.TaskID, "err", err)
+						// Keep reading, or the command blocks on a full pipe.
+						io.Copy(io.Discard, r)
 					}
-				}()
-				go func() {
-					scanner := bufio.NewScanner(stderr)
-					for scanner.Scan() {
-						line := scanner.Text()
-						bus.Publish(&TaskLogEvent{
-							TaskID:   body.TaskID,
-							WorkerID: msg.Source,
-							Line:     line,
-						})
-					}
-				}()
+				}
+				readers.Add(2)
+				go read(stdout)
+				go read(stderr)
 				go func() {
 					done := make(chan struct{})
 					cmd.Start()
@@ -168,6 +167,8 @@ func task(ctx context.Context, input input) {
 						Command:  cmd.String(),
 					})
 					go func() {
+						// Wait closes the pipes, so the output is read to its end first.
+						readers.Wait()
 						cmd.Wait()
 						done <- struct{}{}
 					}()
