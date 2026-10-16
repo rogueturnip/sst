@@ -36,6 +36,10 @@ var SST_SKIP_APPSYNC = isTrue("SST_SKIP_APPSYNC")
 // SST_SKIP_UPDATE_CHECK stops the CLI looking for a newer SST once a day. CI
 // never looks.
 var SST_SKIP_UPDATE_CHECK = isTrue("SST_SKIP_UPDATE_CHECK")
+
+// SST_DEV_CLOUDWATCH_LOGS has sst dev send what a function prints locally to its
+// bridge in Lambda, which prints it in the function's log group.
+var SST_DEV_CLOUDWATCH_LOGS = isTrue("SST_DEV_CLOUDWATCH_LOGS")
 var SST_NO_BUN = isTrue("NO_BUN") || isTrue("SST_NO_BUN")
 
 func isTrue(name string) bool {

@@ -1,6 +1,7 @@
 package aws
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"github.com/kballard/go-shellquote"
 	"github.com/sst/sst/v3/cmd/sst/mosaic/aws/bridge"
 	"github.com/sst/sst/v3/pkg/bus"
+	"github.com/sst/sst/v3/pkg/flag"
 	"github.com/sst/sst/v3/pkg/process"
 	"github.com/sst/sst/v3/pkg/project"
 )
@@ -56,6 +58,28 @@ func task(ctx context.Context, input input) {
 
 	ecsClient := ecs.NewFromConfig(input.config)
 	trackedTasks := map[string]bool{}
+
+	var cloudLogs *pendingLogs
+	if flag.SST_DEV_CLOUDWATCH_LOGS {
+		cloudLogs = newPendingLogs()
+	}
+	// sendLogs sends the task's stand-in what its command printed since the last
+	// time, for it to print in the task's log group.
+	sendLogs := func(workerID string) {
+		lines, dropped := cloudLogs.take(workerID)
+		if len(lines) == 0 && dropped == 0 {
+			return
+		}
+		body, err := json.Marshal(bridge.LogsBody{Lines: lines, Dropped: dropped})
+		if err != nil {
+			log.Error("failed to encode logs", "workerID", workerID, "err", err)
+			return
+		}
+		writer := input.client.NewWriter(bridge.MessageLogs, input.prefix+"/"+workerID+"/in")
+		if err := sendMessage(writer, bytes.NewReader(body)); err != nil {
+			log.Error("failed to send logs", "workerID", workerID, "err", err)
+		}
+	}
 
 	for {
 		select {
@@ -139,6 +163,9 @@ func task(ctx context.Context, input input) {
 				stdout, _ := cmd.StdoutPipe()
 				stderr, _ := cmd.StderrPipe()
 				onLine := func(line string) {
+					if cloudLogs != nil {
+						cloudLogs.add(msg.Source, line)
+					}
 					bus.Publish(&TaskLogEvent{
 						TaskID:   body.TaskID,
 						WorkerID: msg.Source,
@@ -172,12 +199,30 @@ func task(ctx context.Context, input input) {
 						cmd.Wait()
 						done <- struct{}{}
 					}()
-					for {
+					ping := func() {
 						writer := input.client.NewWriter(bridge.MessagePing, input.prefix+"/"+msg.Source+"/in")
 						json.NewEncoder(writer).Encode(bridge.PingBody{})
 						writer.Close()
+					}
+					ping()
+					pings := time.NewTicker(time.Second * 5)
+					defer pings.Stop()
+					var flushes <-chan time.Time
+					if cloudLogs != nil {
+						ticker := time.NewTicker(time.Second)
+						defer ticker.Stop()
+						flushes = ticker.C
+					}
+					for {
 						select {
+						case <-pings.C:
+							ping()
+						case <-flushes:
+							sendLogs(msg.Source)
 						case <-done:
+							if cloudLogs != nil {
+								sendLogs(msg.Source)
+							}
 							writer := input.client.NewWriter(bridge.MessageTaskComplete, input.prefix+"/"+msg.Source+"/in")
 							json.NewEncoder(writer).Encode(bridge.TaskCompleteBody{})
 							writer.Close()
@@ -188,8 +233,6 @@ func task(ctx context.Context, input input) {
 							return
 						case <-ctx.Done():
 							return
-						case <-time.After(time.Second * 5):
-							continue
 						}
 					}
 				}()
