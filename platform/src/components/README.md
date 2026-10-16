@@ -230,6 +230,11 @@ Everything above applies. The rest is specific to SST's own components in
 
 ### Ground rules
 
+- **Hold to the [v5 goals](https://github.com/sst-community/sst/blob/v5/docs/plans/v5-goals.md).**
+  A port keeps what the 4.x component deployed, never replaces or deletes a resource
+  that holds data, declares every resource it creates as a part, and shows in
+  `sst diff` what its deploy does. An edit to a 4.x file changes nothing for an app
+  that hasn't switched.
 - **The V5 component has the original's name, in the `v5` folder.** `Queue` in
   `aws/queue.ts` is ported as `Queue` in `aws/v5/queue.ts`, with the same type,
   `sst:aws:Queue`. An app uses it as `sst.aws.v5.Queue`, next to `sst.aws.Queue`.
@@ -516,8 +521,12 @@ describe("takes over a deployed Queue", () => {
   `get` and what's added to a component from `get` included.
 - A case says what's expected to go (`unclaimed`) or be updated (`changed`) when it isn't
   nothing, the same for every case or by the way it's run (`(way) => [...]`). Don't
-  loosen it. Where the two components aren't written the same way, give `original` and
-  `v5` in place of `create`.
+  loosen it. A resource that holds data (a bucket, table, database, cache, file system,
+  user pool, queue, log group, or a secret or password) is never in `unclaimed`, and
+  never in `changed` for a field that replaces it. Where a port could lose one, assert
+  that it's kept (see "keeps the secret under its new name" in `v5/redis.test.ts`).
+  Where the two components aren't written the same way, give `original` and `v5` in
+  place of `create`.
 - Wrappers whose names aren't worth writing out can be counted: give the mock a
   `wrappers` pattern and the case a `wrappers` number (see `v5/apigatewayv2.test.ts`).
 - For a one-off, `pulumi.takesOver(original, v5)` returns `{ unclaimed, changed,
@@ -628,7 +637,8 @@ For a component with function parts, test a function that links the component.
 8. Typecheck, run the tests, and `bun run build:cli` from the repo root.
 9. Review before calling it done. Read the original's constructor and the new one side
    by side, resource by resource: args, options, names, what's read back. Then read the
-   generated page.
+   generated page, and check the port against the
+   [v5 goals](https://github.com/sst-community/sst/blob/v5/docs/plans/v5-goals.md).
 
 The existing ports are the reference, all in `aws/v5/`: `alb.ts` for a custom domain
 with aliases, and a method that looks a part up when it's asked for (`getListener`);

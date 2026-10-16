@@ -112,7 +112,8 @@ Things to know:
 v5 goes out as pre-releases from the `v5` branch, to npm and GitHub, without changing what 4.x users get. Only `v5`'s `release.yml` runs for a tag with a suffix; `main`'s doesn't.
 
 1. Write `.github/release-notes/v5.0.0-alpha.N.md`. Without it, the GitHub release lists every commit since the newest tag in `v5`'s history.
-2. Push the tag on a commit that's on `v5`: `v5.0.0-alpha.1`, then `v5.0.0-alpha.2`, and so on. Count up, and never reuse a number.
+2. Check it against [the v5 goals](docs/plans/v5-goals.md). Update where each one stands, and name any goal the release doesn't meet under Known issues in the notes.
+3. Push the tag on a commit that's on `v5`: `v5.0.0-alpha.1`, then `v5.0.0-alpha.2`, and so on. Count up, and never reuse a number.
 
 For a tag with a suffix, `release.yml`:
 

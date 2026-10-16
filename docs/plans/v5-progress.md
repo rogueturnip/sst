@@ -320,6 +320,27 @@ Checked with `sst5 diff` and `sst5 dev` on a test app in AWS, with a build label
 
 Switching a component back to 4.x hasn't been tried. A V5 component keeps some resources under new names through aliases, which the 4.x one doesn't have, so they'd be created again under the old names; the guide says to check `sst diff` first. A command that rewrites a config for v5 was considered and left for 5.0.0, when the names are final and every app has to change.
 
+## 2026-10-16
+
+### The goals, written down
+
+[v5-goals.md](v5-goals.md) has six goals, how each is checked, and where each stands:
+
+1. A switch leaves the state as it was, or close to it.
+2. Moving to v5 never loses data.
+3. Anyone can write a component, and share it.
+4. Installing v5 changes nothing until a component is switched.
+5. Every resource is yours to change.
+6. `sst diff` shows what the deploy will do.
+
+Going back to 4.x isn't a goal. The README lists the goals, and the rulebook's ground rules, its checklist and the pre-release steps in `MAINTAINING.md` point to them. The rulebook now says a resource that holds data is never in a takeover case's `unclaimed`.
+
+Checked against them as they stand:
+
+- **Goal 6 isn't met.** A 4.x component's function can still show as deleted in `sst diff`.
+- **Goal 4 hasn't been checked against the latest 4.x.**
+- **Goal 2 holds in the takeover suites.** No resource that holds data is expected to go. The `EventBus` in `bucket.test.ts`'s list is the default bus, which 4.x looked up and didn't create.
+
 ## What the harness can and can't see
 
 It records what's registered with the engine and compares, between a 4.x component and its v5 port: each resource's address (through aliases, as Pulumi resolves them), inputs, deploy options, registered outputs, what a function is built from, and what depends on what.

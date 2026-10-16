@@ -73,12 +73,16 @@ Whoever uses it gets what SST's components give, with nothing more to write: `tr
 
 Resources are named after the app and stage, as in SST's components. That list of resource types is still there, but it no longer limits you: a type that isn't on it is named by its provider, or you say which field holds its name with `sst.Component.naming()`.
 
-## What it sets out to do
+## Goals
 
-- **Every resource is yours to change.** `transform`, `existing` and `nodes` cover all of a component's resources, and they're typed and documented from the same list.
-- **Switch without redeploying.** The v5 components sit next to the version 4 ones, as `sst.aws.v5.*`. Change `sst.aws.Queue` to `sst.aws.v5.Queue`, keep the name, and the resources you've deployed are kept. You switch one component at a time, and each component's docs list what's written differently.
-- **Write your own components, across providers.** One component can hold resources from several providers, and it works like SST's own.
-- **Test components without AWS.** `mock()` stands in for the deploy engine, so a test can create a component and check what it would deploy.
+1. **A switch leaves the state as it was, or close to it.**
+2. **Moving to v5 never loses data.**
+3. **Anyone can write a component, and share it as a package.**
+4. **Installing v5 changes nothing until you switch a component.**
+5. **Every resource a component creates is yours to change.**
+6. **`sst diff` shows what the deploy will do.**
+
+Every change to v5 is held to these. [v5-goals.md](docs/plans/v5-goals.md) says what each means, how it's checked, and where it stands.
 
 ## Status
 

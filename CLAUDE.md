@@ -42,4 +42,4 @@ This is sst-community, a fork of SST. `MAINTAINING.md` covers merging an SST rel
 
 ## Plans and progress
 
-What's been done, what's next and what's undecided is in `docs/plans/`, not in this file. Start with `docs/plans/v5-components.md`. When a piece of work lands, add it to `docs/plans/v5-progress.md` and update the status in the plan. Keep this file to how to work in the repo.
+What's been done, what's next and what's undecided is in `docs/plans/`, not in this file. Every v5 change is held to the goals in `docs/plans/v5-goals.md`. Then start with `docs/plans/v5-components.md`. When a piece of work lands, add it to `docs/plans/v5-progress.md` and update the status in the plan. Keep this file to how to work in the repo.

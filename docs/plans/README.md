@@ -4,6 +4,7 @@ Where the fork's larger pieces of work are planned and tracked. `CLAUDE.md` hold
 
 | File | What's in it |
 | --- | --- |
+| [v5-goals.md](v5-goals.md) | What v5 holds to: six goals, how each is checked, and where each stands. Every change on `v5` is held to them. |
 | [v5-components.md](v5-components.md) | The v5 plan: the goal, the decisions it rests on, what's ported, the order from here, and the open questions. Start here. |
 | [v5-progress.md](v5-progress.md) | The log: what landed on which day, in which commit, and what was learned on the way. |
 | [v5-port-notes.md](v5-port-notes.md) | One section per ported component: its parts, what's plain, what changes on a switch, and what's deliberately different from version 4. |

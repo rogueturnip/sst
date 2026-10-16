@@ -1,8 +1,10 @@
 # v5 components: plan and status
 
-Branch `v5`, started 2026-09-30. Last updated 2026-10-13.
+Branch `v5`, started 2026-09-30. Last updated 2026-10-16.
 
 ## Goal
+
+**What v5 holds to is in [v5-goals.md](v5-goals.md):** six goals, how each is checked, and where it stands. Every change is held to them.
 
 v5 is the fork's own major version. It rebuilds the components on one foundation:
 
