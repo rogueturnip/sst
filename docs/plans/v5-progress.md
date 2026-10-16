@@ -341,6 +341,27 @@ Checked against them as they stand:
 - **Goal 4 hasn't been checked against the latest 4.x.**
 - **Goal 2 holds in the takeover suites.** No resource that holds data is expected to go. The `EventBus` in `bucket.test.ts`'s list is the default bus, which 4.x looked up and didn't create.
 
+### Output in CloudWatch in `sst dev`
+
+In `sst dev`, a function's log group only got the stub's own lines. With `SST_DEV_CLOUDWATCH_LOGS=true`, what functions and tasks print locally is printed in their log groups too. It's off by default. The Live page has a Logs section, and the `sst dev` and `Task` docs point to it.
+
+| Commit | What |
+| --- | --- |
+| `ddf502f4a` | A durable function's stub runs the bridge with its output passed on. |
+| `3fa0eaab4` | Function and task output is read past a line over 64 KB (`process.ReadLines`). |
+| `428540fce` | `SST_DEV_CLOUDWATCH_LOGS`, for functions and tasks, and its docs. |
+
+- **Functions:** the CLI sends a function's output to its bridge after each reply, as a new message (`MessageLogs`), and marks the reply as having output to follow. The bridge waits for it, up to 2 seconds and never past the invocation's deadline, prints it, then asks Lambda for the next invocation. So each line is in the invocation it belongs to. An error is printed after it, as `ERROR Invoke Error {...}`. Up to 256 KB is sent per invocation.
+- **Durable functions and `Workflow`:** their stub ran the bridge with `execFile`, which kept everything the bridge printed in memory and stopped the bridge past 1 MB. It now runs it with its output passed on. That's a fix on its own: their log groups now get the bridge's lines too, as other functions' do.
+- **Tasks:** the CLI sends what a task's `dev.command` prints every second, and before the task completes. The `bridge-task` image prints it in order. That module builds against an older, pinned copy of the CLI's bridge package, so it names the message's number itself; a test keeps that number.
+- **Lines over 64 KB:** a function's or a task's output was read with a `bufio.Scanner`, which stops at a line over 64 KB. For a function, the worker was then taken for dead while it still ran. `Run`'s `readLines` (#110) is now `process.ReadLines`, used for all three. A line over 1 MB is left out with a note, and the lines after it come through. A task's output is now read to its end before the CLI waits for the command, as `os/exec` requires.
+
+An older bridge or CLI ignores the new message and the new field on a reply, so a mixed pair works as before.
+
+Checked in AWS, with test apps removed after: functions (output, stderr, JSON, an error, a failure to load, output after the reply, the limit), a durable function before and after the stub fix, a `Workflow` using the SDK, a `Task` in ECS with a test build of the `bridge-task` image, and lines of 100 KB from a function and a task. Callers saw no difference: a median of 0.33s with it on and 0.36s off, over 40 calls each. The stub runs about 110ms longer per invocation (363ms against 251ms).
+
+**Task output needs a new `bridge-task` image.** Every version's `sst dev` runs `ghcr.io/sst-community/sst/bridge-task:latest`, and only a release from `main` pushes it. Until then, an older image ignores the output, so this part takes effect through `main`.
+
 ## What the harness can and can't see
 
 It records what's registered with the engine and compares, between a 4.x component and its v5 port: each resource's address (through aliases, as Pulumi resolves them), inputs, deploy options, registered outputs, what a function is built from, and what depends on what.
