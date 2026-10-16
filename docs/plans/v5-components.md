@@ -59,7 +59,7 @@ Since 2026-10-09 a 4.x file can change, so `git diff --stat main -- platform/src
 
 **How it's been checked:**
 
-- 1,680 tests under a mock of the deploy engine (2026-10-14). Each port runs its takeover cases three ways (as it is, inside another component, with another provider) and has to keep everything the 4.x component deployed, with the same inputs, options, registered outputs, function build inputs and teardown order.
+- 1,667 tests under a mock of the deploy engine (2026-10-15). Each port runs its takeover cases three ways (as it is, inside another component, with another provider) and has to keep everything the 4.x component deployed, with the same inputs, options, registered outputs, function build inputs and teardown order.
 - One run in a real AWS account on 2026-10-01: all 19 deployed with 4.x, switched, and removed. See [the report](v5-aws-test-2026-10-01.md).
 
 **Where things stand (2026-10-01):** everything above is committed and pushed. `git log origin/v5` has the latest.
