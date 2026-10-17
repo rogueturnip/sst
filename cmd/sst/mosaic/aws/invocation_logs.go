@@ -19,7 +19,12 @@ const invocationLogsKept = 100
 // fileLogger writes what each invocation of a function gets, prints and returns
 // to a file of its own, under the project's log folder.
 func fileLogger(p *project.Project) {
-	logInvocations(context.Background(), filepath.Join(p.PathLog(""), "lambda"))
+	logInvocations(context.Background(), invocationLogsDir(p))
+}
+
+// invocationLogsDir is the folder of the invocation logs: .sst/log/lambda.
+func invocationLogsDir(p *project.Project) string {
+	return filepath.Join(p.PathLog(""), "lambda")
 }
 
 // logInvocations writes the log of each invocation in a folder of dir named
@@ -81,8 +86,12 @@ func (l *invocationLogs) handle(evt interface{}) {
 }
 
 // write adds text to the log of a request, and closes it when the request is
-// done.
+// done. Output that's not part of a request has no end, so its log is closed
+// after each write.
 func (l *invocationLogs) write(functionID, requestID, text string, done bool) {
+	if requestID == "" {
+		done = true
+	}
 	key := functionID + "/" + requestID
 	file, ok := l.open[key]
 	if !ok {

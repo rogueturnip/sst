@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/sst/sst/v3/pkg/bus"
+	"github.com/sst/sst/v3/pkg/project"
 )
 
 // logFiles lists the log files of a function, by name.
@@ -137,6 +138,33 @@ func TestInvocationLogsKeepTheNewest(t *testing.T) {
 	}
 }
 
+// The logs are in .sst/log/lambda, where sst dev wrote them before, so the
+// ones from earlier sessions are counted.
+func TestInvocationLogsDir(t *testing.T) {
+	if got, want := invocationLogsDir(&project.Project{}), filepath.Join(".sst", "log", "lambda"); got != want {
+		t.Fatalf("invocationLogsDir() = %q, want %q", got, want)
+	}
+}
+
+// Output that's not part of an invocation, as a worker's before its first one,
+// isn't kept open, as it has no response to close it.
+func TestInvocationLogsCloseOutputOutsideAnInvocation(t *testing.T) {
+	dir := t.TempDir()
+	logs := newInvocationLogs(dir, 10)
+	logs.handle(&FunctionLogEvent{FunctionID: "Fn", Line: "starting"})
+	logs.handle(&FunctionLogEvent{FunctionID: "Fn", Line: "ready"})
+	if len(logs.open) != 0 {
+		t.Fatalf("%d files open, want 0", len(logs.open))
+	}
+	files := logFiles(t, dir, "Fn")
+	if len(files) != 1 {
+		t.Fatalf("files %v, want one", files)
+	}
+	if got := readLog(t, dir, "Fn", files[0]); got != "starting\nready\n" {
+		t.Fatalf("log is %q, want both lines", got)
+	}
+}
+
 // A function's output that's not part of an invocation goes in a log of that
 // function, not of whichever function printed first.
 func TestInvocationLogsKeepFunctionsApart(t *testing.T) {
@@ -175,14 +203,18 @@ func TestLogInvocations(t *testing.T) {
 		logInvocations(ctx, dir)
 		close(done)
 	}()
+	deadline := time.Now().Add(5 * time.Second)
 	for subscribers() == before {
+		if time.Now().After(deadline) {
+			t.Fatal("logInvocations never subscribed")
+		}
 		time.Sleep(time.Millisecond)
 	}
 
 	bus.Publish(&FunctionInvokedEvent{FunctionID: "Logged", RequestID: "r1", Input: []byte("in")})
 	bus.Publish(&FunctionResponseEvent{FunctionID: "Logged", RequestID: "r1", Output: []byte("out")})
 	want := "invocation r1\nin\nresponse r1\nout\n"
-	deadline := time.Now().Add(5 * time.Second)
+	deadline = time.Now().Add(5 * time.Second)
 	for {
 		files, _ := os.ReadDir(filepath.Join(dir, "Logged"))
 		if len(files) == 1 {
