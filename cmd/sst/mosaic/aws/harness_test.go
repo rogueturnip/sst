@@ -83,6 +83,8 @@ type fakeRuntime struct {
 	// and held is sent the function when its build is held
 	builds map[string]chan struct{}
 	held   chan string
+	// rebuild, when set, rebuilds every function on any file change
+	rebuild bool
 
 	starts atomic.Int32
 }
@@ -114,7 +116,7 @@ func (r *fakeRuntime) Run(ctx context.Context, input *runtime.RunInput) (runtime
 	return w, nil
 }
 
-func (r *fakeRuntime) ShouldRebuild(functionID string, path string) bool { return false }
+func (r *fakeRuntime) ShouldRebuild(functionID string, path string) bool { return r.rebuild }
 
 func (r *fakeRuntime) ShouldRunEagerly() bool { return true }
 
@@ -171,6 +173,13 @@ func (w *fakeWorker) run(ctx context.Context, output *io.PipeWriter) {
 		cancel()
 		requestID := resp.Header.Get("lambda-runtime-aws-request-id")
 		answer := w.runtime.handle(string(event))
+		select {
+		case <-w.stop:
+			// a worker that's stopped while it runs an invocation is killed, so
+			// it never answers
+			return
+		default:
+		}
 		resp, err = http.Post(w.api+"/invocation/"+requestID+"/response", "application/json", strings.NewReader(answer))
 		if err != nil {
 			return
