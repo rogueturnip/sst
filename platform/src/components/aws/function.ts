@@ -284,18 +284,21 @@ export interface FunctionArgs {
    * the role until the next `sst deploy`, so each switch updates the role.
    *
    * This shows under the **Functions** tab in the multiplexer sidebar where your invocations
-   * are logged. You can turn this off by setting `dev` to `false`.
+   * are logged.
    *
-   * A function that's _Live_ makes a round trip to your machine for each invocation. Turning
-   * it off for one you aren't working on makes its invocations faster. An authorizer is a
-   * good one to turn off, as it runs before each request to its routes.
+   * A function that's _Live_ makes a round trip to your machine for each invocation. You can
+   * turn this off by setting `dev` to `false`, which makes its invocations faster. It's worth
+   * doing for a function you aren't working on, such as an authorizer, which runs before
+   * each request to its routes that it doesn't have a cached result for.
    *
    * ```js
    * api.addAuthorizer({
    *   name: "MyAuthorizer",
-   *   requestFunction: {
-   *     handler: "src/authorizer.handler",
-   *     dev: false
+   *   lambda: {
+   *     function: {
+   *       handler: "src/authorizer.handler",
+   *       dev: false
+   *     }
    *   }
    * });
    * ```
