@@ -73,3 +73,32 @@ func TestNextPutsBackAnInvocationForAWorkerThatLeft(t *testing.T) {
 		t.Fatalf("invocation was lost: %v", err)
 	}
 }
+
+// A function that takes long to build holds up only its own invocations. Other
+// bridges still get their ping, which they give up on after 16 seconds, and
+// their workers still get the invocations.
+func TestBuildDoesNotHoldUpOtherFunctions(t *testing.T) {
+	slow := make(chan struct{})
+	h := newHarness(t, &fakeRuntime{handle: echo, builds: map[string]chan struct{}{"Slow": slow}})
+	h.addFunction("Fast")
+	h.addFunction("Slow")
+	fast := h.bridge("Fast")
+	if _, err := fast.invoke("warm"); err != nil {
+		t.Fatal(err)
+	}
+
+	// the Slow function starts building, and doesn't finish until it's let
+	h.bridge("Slow")
+	time.Sleep(100 * time.Millisecond)
+
+	for i := range 3 {
+		got, err := fast.invoke("x")
+		if err != nil {
+			t.Fatalf("invocation %d while another function builds: %v", i, err)
+		}
+		if got != "echo x" {
+			t.Fatalf("got %q, want %q", got, "echo x")
+		}
+	}
+	close(slow)
+}

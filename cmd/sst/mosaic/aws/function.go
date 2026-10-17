@@ -104,6 +104,27 @@ func function(ctx context.Context, input input) {
 		info, ok := workers[workerID]
 		return info, ok
 	}
+	// queueNext queues an invocation for a worker, and says whether the worker
+	// is running. Both under the lock, so a worker that exits sees the
+	// invocation queued, or the invocation sees the worker gone.
+	queueNext := func(workerID string, body io.Reader) bool {
+		stateMu.Lock()
+		ch, ok := nextChan[workerID]
+		if !ok {
+			ch = make(chan io.Reader, 100)
+			nextChan[workerID] = ch
+		}
+		_, running := workers[workerID]
+		select {
+		case ch <- body:
+			stateMu.Unlock()
+		default:
+			// a full queue is waited on without holding up everything else
+			stateMu.Unlock()
+			ch <- body
+		}
+		return running
+	}
 	// AppSync can accept an event and not deliver it, as in the seconds after a
 	// Lambda cold-starts and subscribes. The bridge has had the ping by then, so it
 	// would wait until Lambda times the invocation out. So a reply to a bridge is
@@ -137,7 +158,7 @@ func function(ctx context.Context, input input) {
 			// arrives. Put it back for the next one, or it's lost.
 			if r.Context().Err() != nil {
 				log.Info("worker disconnected, putting its invocation back", "workerID", workerID)
-				loadNextChan(workerID) <- reader
+				queueNext(workerID, reader)
 				requeued <- workerID
 				return
 			}
@@ -370,11 +391,49 @@ func function(ctx context.Context, input input) {
 		}
 	}
 
+	// next pings the bridge that sent an invocation and queues the invocation
+	// for its worker, or asks the bridge to start one. It runs outside the loop,
+	// which builds functions, so a long build doesn't keep other bridges from
+	// their ping past the 16 seconds they wait for it.
+	next := func(msg bridge.Message) {
+		writer := input.client.NewWriter(bridge.MessagePing, input.prefix+"/"+msg.Source+"/in")
+		if err := sendJSON(writer, bridge.PingBody{}); err != nil {
+			log.Error("failed to send ping", "workerID", msg.Source, "err", err)
+		}
+		if queueNext(msg.Source, msg.Body) {
+			return
+		}
+		log.Info("asking for reboot", "workerID", msg.Source)
+		writer = input.client.NewWriter(bridge.MessageReboot, input.prefix+"/"+msg.Source+"/in")
+		if err := sendJSON(writer, bridge.RebootBody{}); err != nil {
+			log.Error("failed to send reboot", "workerID", msg.Source, "err", err)
+		}
+	}
+	loopMsg := make(chan bridge.Message, 1000)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case msg := <-input.msg:
+				if msg.Type == bridge.MessageNext {
+					go next(msg)
+					continue
+				}
+				select {
+				case loopMsg <- msg:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case msg := <-input.msg:
+		case msg := <-loopMsg:
 			switch msg.Type {
 			case bridge.MessageInit:
 				loadNextChan(msg.Source)
@@ -422,22 +481,6 @@ func function(ctx context.Context, input input) {
 						log.Info("error", "body", string(body), "status", result.StatusCode)
 					}
 				}
-			case bridge.MessageNext:
-				writer := input.client.NewWriter(bridge.MessagePing, input.prefix+"/"+msg.Source+"/in")
-				if err := sendJSON(writer, bridge.PingBody{}); err != nil {
-					log.Error("failed to send ping", "workerID", msg.Source, "err", err)
-				}
-				ch := loadNextChan(msg.Source)
-				_, ok := loadWorker(msg.Source)
-				if !ok {
-					log.Info("asking for reboot", "workerID", msg.Source)
-					writer := input.client.NewWriter(bridge.MessageReboot, input.prefix+"/"+msg.Source+"/in")
-					if err := sendJSON(writer, bridge.RebootBody{}); err != nil {
-						log.Error("failed to send reboot", "workerID", msg.Source, "err", err)
-					}
-				}
-				ch <- msg.Body
-				continue
 			}
 
 		case info := <-workerShutdownChan:
