@@ -133,11 +133,15 @@ func run() error {
 			waitForSubscription(ctx, conn, client, prefix+"/"+workerID+"/in")
 			timedOut = false
 		}
-		// kept to tell how to answer the invocation if sst dev doesn't
-		var event bytes.Buffer
-		resp.Body = io.NopCloser(io.TeeReader(resp.Body, &event))
+		// read whole first, to tell how to answer the invocation if sst dev
+		// doesn't, even when sending it fails partway
+		event, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		resp.Body = io.NopCloser(bytes.NewReader(event))
 		writer := client.NewWriter(bridge.MessageNext, prefix+"/in")
-		err = resp.Write(writer)
+		if err == nil {
+			err = resp.Write(writer)
+		}
 		if err == nil {
 			err = writer.Close()
 		}
@@ -145,7 +149,7 @@ func run() error {
 			// sst dev never got the invocation, so fail it now instead of
 			// leaving it to Lambda's timeout
 			slog.Error("failed to send invocation", slog.String("requestID", requestID), slog.String("error", err.Error()))
-			unavailable(requestID, event.Bytes(), "sst dev couldn't be reached to run this invocation (worker: "+workerID+"): "+err.Error())
+			unavailable(requestID, event, "sst dev couldn't be reached to run this invocation (worker: "+workerID+"): "+err.Error())
 			timedOut = true
 			lastActive = time.Now().Round(0)
 			continue
@@ -198,7 +202,7 @@ func run() error {
 				}
 			case <-time.After(timeout):
 				fmt.Println("timeout", requestID)
-				unavailable(requestID, event.Bytes(), "sst dev didn't answer within "+timeout.String()+" (worker: "+workerID+"). Check that `sst dev` is running for this stage.")
+				unavailable(requestID, event, "sst dev didn't answer within "+timeout.String()+" (worker: "+workerID+"). Check that `sst dev` is running for this stage.")
 				timedOut = true
 				break loop
 			}
@@ -264,7 +268,8 @@ func unavailable(requestID string, event []byte, message string) {
 }
 
 // isHTTPEvent tells whether an event is a request from API Gateway, a function
-// URL or a load balancer, all of which have a requestContext.
+// URL or a load balancer, all of which have a requestContext. A WebSocket API
+// event has one too, and API Gateway reads its answer as a response as well.
 func isHTTPEvent(event []byte) bool {
 	var e struct {
 		RequestContext json.RawMessage `json:"requestContext"`
