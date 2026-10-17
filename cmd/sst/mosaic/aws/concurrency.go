@@ -10,6 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/lambda/types"
 	"github.com/sst/sst/v3/pkg/bus"
 	"github.com/sst/sst/v3/pkg/project"
+	"github.com/sst/sst/v3/pkg/runtime"
 )
 
 // ConcurrencyWarningEvent says the account can run few Lambda functions at once
@@ -22,9 +23,9 @@ type ConcurrencyWarningEvent struct {
 // gets 1,000 by default, and some new ones only 10.
 const lowConcurrency = 100
 
-// concurrencyWarning says why the account's Lambda concurrency is low for sst
-// dev, or nothing when it isn't.
-func concurrencyWarning(limit *types.AccountLimit) string {
+// concurrencyWarning says why the account's Lambda concurrency in a region is
+// low for sst dev, or nothing when it isn't.
+func concurrencyWarning(region string, limit *types.AccountLimit) string {
 	if limit == nil {
 		return ""
 	}
@@ -35,37 +36,45 @@ func concurrencyWarning(limit *types.AccountLimit) string {
 	if unreserved >= lowConcurrency {
 		return ""
 	}
-	return fmt.Sprintf("Lambda runs only %d invocations at once in this AWS account, besides reserved concurrency. "+
+	return fmt.Sprintf("Lambda runs only %d invocations at once in this AWS account in %s, besides reserved concurrency. "+
 		"In sst dev, an invocation holds one for as long as it runs on your machine, "+
 		"so more requests than that at once fail with a 500 or a 429. "+
-		"To raise it, request a higher \"Concurrent executions\" quota for Lambda in Service Quotas.", unreserved)
+		"To raise it, request a higher \"Concurrent executions\" quota for Lambda in Service Quotas.", unreserved, region)
 }
 
-// warnLowConcurrency warns, once the first deploy of sst dev is done, when the
-// account's Lambda concurrency is low. The warning waits for the deploy, as
-// the terminal that shows it isn't connected before then. When the settings
-// can't be read, as without the lambda:GetAccountSettings permission, it says
-// nothing.
-func warnLowConcurrency(ctx context.Context, settings func(context.Context) (*lambda.GetAccountSettingsOutput, error)) {
-	evts := bus.Subscribe(&project.CompleteEvent{})
+// warnLowConcurrency warns, once a deploy of sst dev is done, when the
+// account's Lambda concurrency in the region is low and the app runs a
+// function Live. The warning waits for a deploy that worked, as the terminal
+// that shows it isn't connected before then, and a function is Live only once
+// it's deployed. When the settings can't be read, as without the
+// lambda:GetAccountSettings permission, it says nothing.
+func warnLowConcurrency(ctx context.Context, region string, settings func(context.Context) (*lambda.GetAccountSettingsOutput, error)) {
+	// a function that runs Live is added as a target while it deploys
+	evts := bus.Subscribe(&project.CompleteEvent{}, &runtime.BuildInput{})
 	defer bus.Unsubscribe(evts)
 	out, err := settings(ctx)
 	if err != nil {
 		slog.Info("could not read the lambda account settings", "err", err)
 		return
 	}
-	message := concurrencyWarning(out.AccountLimit)
+	message := concurrencyWarning(region, out.AccountLimit)
 	if message == "" {
 		return
 	}
+	live := false
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case evt := <-evts:
-			if complete, ok := evt.(*project.CompleteEvent); ok && !complete.Old {
-				bus.Publish(&ConcurrencyWarningEvent{Message: message})
-				return
+			switch evt := evt.(type) {
+			case *runtime.BuildInput:
+				live = true
+			case *project.CompleteEvent:
+				if live && !evt.Old && len(evt.Errors) == 0 {
+					bus.Publish(&ConcurrencyWarningEvent{Message: message})
+					return
+				}
 			}
 		}
 	}

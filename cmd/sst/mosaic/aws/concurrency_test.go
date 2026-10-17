@@ -12,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/lambda/types"
 	"github.com/sst/sst/v3/pkg/bus"
 	"github.com/sst/sst/v3/pkg/project"
+	"github.com/sst/sst/v3/pkg/runtime"
 )
 
 func TestConcurrencyWarning(t *testing.T) {
@@ -28,12 +29,12 @@ func TestConcurrencyWarning(t *testing.T) {
 		{"unreserved not given", &types.AccountLimit{ConcurrentExecutions: 10}, "only 10 invocations"},
 	}
 	for _, c := range cases {
-		got := concurrencyWarning(c.limit)
+		got := concurrencyWarning("ca-central-1", c.limit)
 		if c.warn == "" && got != "" {
 			t.Errorf("%s: warned %q, want nothing", c.name, got)
 		}
-		if c.warn != "" && !strings.Contains(got, c.warn) {
-			t.Errorf("%s: warned %q, want it to say %q", c.name, got, c.warn)
+		if c.warn != "" && (!strings.Contains(got, c.warn) || !strings.Contains(got, "ca-central-1")) {
+			t.Errorf("%s: warned %q, want it to say %q in ca-central-1", c.name, got, c.warn)
 		}
 	}
 }
@@ -54,30 +55,47 @@ func waitForWarning(t *testing.T, evts <-chan interface{}, within time.Duration)
 	}
 }
 
-// The warning comes after the first deploy, when the terminal that shows it
-// is connected, and only once.
-func TestWarnLowConcurrency(t *testing.T) {
-	warnings := bus.Subscribe(&ConcurrencyWarningEvent{})
-	defer bus.Unsubscribe(warnings)
+func lowSettings(context.Context) (*lambda.GetAccountSettingsOutput, error) {
+	return &lambda.GetAccountSettingsOutput{AccountLimit: &types.AccountLimit{ConcurrentExecutions: 10, UnreservedConcurrentExecutions: aws.Int32(10)}}, nil
+}
+
+// startWarning runs warnLowConcurrency with low settings, and returns once it
+// has read them.
+func startWarning(t *testing.T) (context.CancelFunc, chan struct{}) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	read := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
-		warnLowConcurrency(ctx, func(context.Context) (*lambda.GetAccountSettingsOutput, error) {
+		warnLowConcurrency(ctx, "ca-central-1", func(ctx context.Context) (*lambda.GetAccountSettingsOutput, error) {
 			defer close(read)
-			return &lambda.GetAccountSettingsOutput{AccountLimit: &types.AccountLimit{ConcurrentExecutions: 10, UnreservedConcurrentExecutions: aws.Int32(10)}}, nil
+			return lowSettings(ctx)
 		})
 		close(done)
 	}()
 	<-read
+	return cancel, done
+}
+
+// The warning comes after a deploy that worked, when the terminal that shows
+// it is connected, and only once.
+func TestWarnLowConcurrency(t *testing.T) {
+	warnings := bus.Subscribe(&ConcurrencyWarningEvent{})
+	defer bus.Unsubscribe(warnings)
+	cancel, done := startWarning(t)
+	defer cancel()
 	if _, ok := waitForWarning(t, warnings, 100*time.Millisecond); ok {
 		t.Fatal("warned before the deploy was done")
 	}
 
+	bus.Publish(&runtime.BuildInput{FunctionID: "Live"})
 	bus.Publish(&project.CompleteEvent{Old: true})
 	if _, ok := waitForWarning(t, warnings, 100*time.Millisecond); ok {
 		t.Fatal("warned on the state of an earlier deploy")
+	}
+	bus.Publish(&project.CompleteEvent{Errors: []project.Error{{Message: "failed"}}})
+	if _, ok := waitForWarning(t, warnings, 100*time.Millisecond); ok {
+		t.Fatal("warned after a deploy that failed")
 	}
 
 	bus.Publish(&project.CompleteEvent{})
@@ -96,13 +114,26 @@ func TestWarnLowConcurrency(t *testing.T) {
 	}
 }
 
+// An app that runs no function Live doesn't hold any concurrency in sst dev,
+// so it isn't warned.
+func TestWarnLowConcurrencyWithoutLiveFunctions(t *testing.T) {
+	warnings := bus.Subscribe(&ConcurrencyWarningEvent{})
+	defer bus.Unsubscribe(warnings)
+	cancel, _ := startWarning(t)
+	defer cancel()
+	bus.Publish(&project.CompleteEvent{})
+	if _, ok := waitForWarning(t, warnings, 200*time.Millisecond); ok {
+		t.Fatal("warned for an app with no Live functions")
+	}
+}
+
 // Without the permission to read the settings, sst dev says nothing.
 func TestWarnLowConcurrencyWithoutSettings(t *testing.T) {
 	warnings := bus.Subscribe(&ConcurrencyWarningEvent{})
 	defer bus.Unsubscribe(warnings)
 	done := make(chan struct{})
 	go func() {
-		warnLowConcurrency(context.Background(), func(context.Context) (*lambda.GetAccountSettingsOutput, error) {
+		warnLowConcurrency(context.Background(), "ca-central-1", func(context.Context) (*lambda.GetAccountSettingsOutput, error) {
 			return nil, errors.New("AccessDeniedException")
 		})
 		close(done)
@@ -112,6 +143,7 @@ func TestWarnLowConcurrencyWithoutSettings(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("kept waiting without the settings")
 	}
+	bus.Publish(&runtime.BuildInput{FunctionID: "Live"})
 	bus.Publish(&project.CompleteEvent{})
 	if _, ok := waitForWarning(t, warnings, 100*time.Millisecond); ok {
 		t.Fatal("warned without the settings")
