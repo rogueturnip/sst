@@ -72,9 +72,9 @@ func (s *publishServer) count() int {
 // a connection that publishes to it. Retries wait a millisecond.
 func connect(t *testing.T, statuses ...int) (*Connection, *publishServer) {
 	t.Helper()
-	retries, attemptTimeout := publishRetries, publishAttemptTimeout
+	retries, attemptTimeout, timeout := publishRetries, publishAttemptTimeout, publishTimeout
 	publishRetries = []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}
-	t.Cleanup(func() { publishRetries, publishAttemptTimeout = retries, attemptTimeout })
+	t.Cleanup(func() { publishRetries, publishAttemptTimeout, publishTimeout = retries, attemptTimeout, timeout })
 
 	handler := &publishServer{t: t, statuses: statuses}
 	srv := httptest.NewTLSServer(handler)
@@ -190,7 +190,11 @@ func TestPublishStopsWhenTheContextIsDone(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- conn.Publish(ctx, "c", "event") }()
+	deadline := time.Now().Add(5 * time.Second)
 	for srv.count() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("Publish() never made its first attempt")
+		}
 		time.Sleep(time.Millisecond)
 	}
 	cancel()
@@ -204,5 +208,33 @@ func TestPublishStopsWhenTheContextIsDone(t *testing.T) {
 	}
 	if got := srv.count(); got != 1 {
 		t.Fatalf("made %d attempts, want 1", got)
+	}
+}
+
+// A publish, with all its retries, stops after publishTimeout, so a caller
+// isn't held up for long by attempts that each hang.
+func TestPublishGivesUpAfterItsTimeout(t *testing.T) {
+	conn, _ := connect(t)
+	publishAttemptTimeout = time.Hour
+	publishTimeout = 100 * time.Millisecond
+	hang := make(chan struct{})
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-hang:
+		case <-r.Context().Done():
+		}
+	}))
+	// the server waits for the hung handler when it closes, so it's let go first
+	defer srv.Close()
+	defer close(hang)
+	conn.httpEndpoint = strings.TrimPrefix(srv.URL, "https://")
+	conn.httpClient = srv.Client()
+
+	start := time.Now()
+	if err := conn.Publish(context.Background(), "c", "event"); err == nil {
+		t.Fatal("Publish() = nil, want the timeout")
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("Publish() took %v, want it to stop after %v", took, publishTimeout)
 	}
 }

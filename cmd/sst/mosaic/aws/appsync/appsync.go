@@ -415,9 +415,10 @@ func (c *Connection) getAuth(ctx context.Context, body interface{}) (interface{}
 }
 
 // How long Publish waits before each retry of a publish that was throttled or
-// failed with a server or network error, 1.4 seconds in all, and how long one
-// attempt can take. The bridge sends at most 128 KB at a time, and AppSync answers in well
-// under a second, so an attempt that takes longer has most likely hung.
+// failed with a server or network error, 1.4 seconds in all, how long one
+// attempt can take, and how long a publish can take with its retries. The
+// bridge sends at most 128 KB at a time, and AppSync answers in well under a
+// second, so an attempt that takes longer has most likely hung.
 var (
 	publishRetries = []time.Duration{
 		100 * time.Millisecond,
@@ -425,6 +426,7 @@ var (
 		time.Second,
 	}
 	publishAttemptTimeout = 5 * time.Second
+	publishTimeout        = 10 * time.Second
 )
 
 // Publish sends an event to a channel. AppSync throttles a burst of events and
@@ -442,6 +444,8 @@ func (c *Connection) Publish(ctx context.Context, channel string, event interfac
 	if err != nil {
 		return err
 	}
+	ctx, cancel := context.WithTimeout(ctx, publishTimeout)
+	defer cancel()
 	for attempt := 0; ; attempt++ {
 		retry, err := c.publish(ctx, channel, body)
 		if err == nil || !retry || attempt == len(publishRetries) {
