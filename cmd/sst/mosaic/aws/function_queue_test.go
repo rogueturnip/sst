@@ -79,7 +79,8 @@ func TestNextPutsBackAnInvocationForAWorkerThatLeft(t *testing.T) {
 // their workers still get the invocations.
 func TestBuildDoesNotHoldUpOtherFunctions(t *testing.T) {
 	slow := make(chan struct{})
-	h := newHarness(t, &fakeRuntime{handle: echo, builds: map[string]chan struct{}{"Slow": slow}})
+	held := make(chan string, 1)
+	h := newHarness(t, &fakeRuntime{handle: echo, builds: map[string]chan struct{}{"Slow": slow}, held: held})
 	h.addFunction("Fast")
 	h.addFunction("Slow")
 	fast := h.bridge("Fast")
@@ -89,7 +90,11 @@ func TestBuildDoesNotHoldUpOtherFunctions(t *testing.T) {
 
 	// the Slow function starts building, and doesn't finish until it's let
 	h.bridge("Slow")
-	time.Sleep(100 * time.Millisecond)
+	select {
+	case <-held:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the Slow function's build never started")
+	}
 
 	for i := range 3 {
 		got, err := fast.invoke("x")

@@ -79,8 +79,10 @@ type fakeRuntime struct {
 	// polling, when set, holds a worker's first request for an invocation
 	// until it's closed
 	polling chan struct{}
-	// builds holds the build of a function in it until its channel is closed
+	// builds holds the build of a function in it until its channel is closed,
+	// and held is sent the function when its build is held
 	builds map[string]chan struct{}
+	held   chan string
 
 	starts atomic.Int32
 }
@@ -88,9 +90,12 @@ type fakeRuntime struct {
 func (r *fakeRuntime) Match(runtime string) bool { return runtime == "fake" }
 
 func (r *fakeRuntime) Build(ctx context.Context, input *runtime.BuildInput) (*runtime.BuildOutput, error) {
-	if held, ok := r.builds[input.FunctionID]; ok {
+	if release, ok := r.builds[input.FunctionID]; ok {
+		if r.held != nil {
+			r.held <- input.FunctionID
+		}
 		select {
-		case <-held:
+		case <-release:
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}

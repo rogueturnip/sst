@@ -159,7 +159,14 @@ func function(ctx context.Context, input input) {
 			if r.Context().Err() != nil {
 				log.Info("worker disconnected, putting its invocation back", "workerID", workerID)
 				queueNext(workerID, reader)
-				requeued <- workerID
+				// the loop can be busy building, and the worker's runtime doesn't
+				// wait for this
+				go func() {
+					select {
+					case requeued <- workerID:
+					case <-ctx.Done():
+					}
+				}()
 				return
 			}
 			log.Info("worker got next request", "workerID", workerID)
