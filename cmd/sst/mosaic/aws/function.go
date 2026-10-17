@@ -119,8 +119,10 @@ func function(ctx context.Context, input input) {
 			}
 		})
 	}
+	// a worker whose invocation was put back in its queue, for the loop to start
+	// it again if it's gone
+	requeued := make(chan string, 100)
 	evts := bus.Subscribe(&watcher.FileChangedEvent{}, &project.CompleteEvent{}, &runtime.BuildInput{}, &FunctionInvokedEvent{})
-	go fileLogger(input.project)
 
 	input.server.Mux.HandleFunc(`/lambda/{workerID}/2018-06-01/runtime/invocation/next`, func(w http.ResponseWriter, r *http.Request) {
 		log.Info("got next request", "workerID", r.PathValue("workerID"))
@@ -131,6 +133,14 @@ func function(ctx context.Context, input input) {
 			log.Info("worker disconnected", "workerID", workerID)
 			return
 		case reader := <-ch:
+			// the worker can go, as when it exits on idle, as the invocation
+			// arrives. Put it back for the next one, or it's lost.
+			if r.Context().Err() != nil {
+				log.Info("worker disconnected, putting its invocation back", "workerID", workerID)
+				loadNextChan(workerID) <- reader
+				requeued <- workerID
+				return
+			}
 			log.Info("worker got next request", "workerID", workerID)
 			resp, _ := http.ReadResponse(bufio.NewReader(reader), r)
 			requestID := resp.Header.Get("lambda-runtime-aws-request-id")
@@ -246,6 +256,8 @@ func function(ctx context.Context, input input) {
 	})
 
 	workerEnv := map[string][]string{}
+	// the function of each worker, kept after it exits, to start it again
+	workerFunction := map[string]string{}
 	builds := map[string]*runtime.BuildOutput{}
 	targets := map[string]*runtime.BuildInput{}
 
@@ -379,6 +391,7 @@ func function(ctx context.Context, input input) {
 				}
 				log.Info("worker init", "workerID", msg.Source, "functionID", init.FunctionID)
 				workerEnv[workerID] = init.Environment
+				workerFunction[workerID] = init.FunctionID
 				if ok := startWorker(init.FunctionID, workerID); !ok {
 					result, err := http.Post("http://"+server+workerID+"/runtime/init/error", "application/json", strings.NewReader(`{"errorMessage":"Function failed to build"}`))
 					if err != nil {
@@ -432,13 +445,34 @@ func function(ctx context.Context, input input) {
 			stateMu.Lock()
 			existing, ok := workers[info.WorkerID]
 			// only delete if a new worker hasn't already been started
+			queued := false
 			if ok && existing == info {
 				log.Info("deleting worker", "workerID", info.WorkerID)
 				delete(workers, info.WorkerID)
-				delete(nextChan, info.WorkerID)
+				// an invocation can be queued for a worker that's exiting, as it
+				// still counted as running when the invocation arrived. Its bridge
+				// has had the ping, so it would wait until Lambda times it out.
+				queued = len(nextChan[info.WorkerID]) > 0
+				if !queued {
+					delete(nextChan, info.WorkerID)
+				}
 			}
 			stateMu.Unlock()
+			if queued {
+				log.Info("starting worker again for its queued invocations", "workerID", info.WorkerID)
+				startWorker(info.FunctionID, info.WorkerID)
+			}
 			break
+		case workerID := <-requeued:
+			stateMu.Lock()
+			_, running := workers[workerID]
+			queued := len(nextChan[workerID]) > 0
+			stateMu.Unlock()
+			functionID, ok := workerFunction[workerID]
+			if !running && queued && ok {
+				log.Info("starting worker again for its queued invocations", "workerID", workerID)
+				startWorker(functionID, workerID)
+			}
 		case unknown := <-evts:
 			switch evt := unknown.(type) {
 			case *FunctionInvokedEvent:
