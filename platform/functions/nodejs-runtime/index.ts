@@ -56,6 +56,7 @@ function runtimeAPI(method: "GET" | "POST", endpoint: string, body?: string) {
     headers: { get(name: string): string | null };
     json(): any;
   }>((resolve, reject) => {
+    let responded = false;
     const req = http.request(
       AWS_LAMBDA_RUNTIME_API + endpoint,
       {
@@ -70,6 +71,7 @@ function runtimeAPI(method: "GET" | "POST", endpoint: string, body?: string) {
               },
       },
       (res) => {
+        responded = true;
         const chunks: Buffer[] = [];
         res.on("data", (chunk) => chunks.push(chunk));
         res.on("error", (ex) => {
@@ -92,7 +94,12 @@ function runtimeAPI(method: "GET" | "POST", endpoint: string, body?: string) {
         });
       },
     );
-    req.on("error", reject);
+    // An error before the response began, as on a kept-alive connection sst
+    // dev closed while it was idle, says so, for the caller to send it again
+    req.on("error", (ex: any) => {
+      if (!responded) ex.beforeResponse = true;
+      reject(ex);
+    });
     // A POST gives up 300 s after it's sent, as fetch did through undici, and
     // the caller sends it again. Not the request for the next invocation,
     // which waits until there is one.
@@ -108,13 +115,14 @@ function runtimeAPI(method: "GET" | "POST", endpoint: string, body?: string) {
 }
 
 // Asks sst dev for the next invocation. A kept-alive connection that sst dev
-// closed while it was idle fails the first request on it, so that one is sent
-// again on a new connection, instead of being reported as an error.
+// closed while it was idle fails the first request on it, before any
+// response, so a request that failed that way is sent again, once, instead of
+// being reported as an error. Nothing was handed over, so it's safe to.
 async function nextInvocation() {
   try {
     return await runtimeAPI("GET", `/runtime/invocation/next`);
   } catch (ex: any) {
-    if (ex.code !== "ECONNRESET" && ex.code !== "EPIPE") throw ex;
+    if (!ex.beforeResponse) throw ex;
     return runtimeAPI("GET", `/runtime/invocation/next`);
   }
 }
