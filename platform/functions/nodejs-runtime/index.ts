@@ -51,13 +51,13 @@ let context: LambdaContext;
 // On Node.js 26.7, fetch holds a request on a kept-alive connection until a
 // timer in undici fires: up to half a second, and seconds after a longer pause.
 // Every invocation makes two of these calls.
-function runtimeAPI(method: "GET" | "POST", path: string, body?: string) {
+function runtimeAPI(method: "GET" | "POST", endpoint: string, body?: string) {
   return new Promise<{
     headers: { get(name: string): string | null };
     json(): any;
   }>((resolve, reject) => {
     const req = http.request(
-      AWS_LAMBDA_RUNTIME_API + path,
+      AWS_LAMBDA_RUNTIME_API + endpoint,
       {
         method,
         // as fetch sent them, also for a handler that returns nothing
@@ -89,12 +89,15 @@ function runtimeAPI(method: "GET" | "POST", path: string, body?: string) {
       },
     );
     req.on("error", reject);
-    // fetch gave up on a request after 300 s, and the caller sends it again.
-    // Not the request for the next invocation, which waits until there is one.
+    // A POST gives up 300 s after it's sent, as fetch did through undici, and
+    // the caller sends it again. Not the request for the next invocation,
+    // which waits until there is one.
     if (method === "POST") {
-      req.setTimeout(300_000, () =>
-        req.destroy(new Error("the runtime API didn't answer")),
+      const timer = setTimeout(
+        () => req.destroy(new Error("the runtime API didn't answer")),
+        300_000,
       );
+      req.on("close", () => clearTimeout(timer));
     }
     req.end(body ?? "");
   });

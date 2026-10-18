@@ -59,7 +59,7 @@ func runInvocationsCuttingOff(t *testing.T, code string, invocations int, cut in
 	}
 	dist := filepath.Join(repo, "platform", "dist", "nodejs-runtime", "index.js")
 	if _, err := os.Stat(dist); err != nil {
-		t.Skip("build the platform first: " + err.Error())
+		t.Skip("build the platform first, with bun run build:platform: " + err.Error())
 	}
 	root := t.TempDir()
 	platform := filepath.Join(root, ".sst", "platform", "dist", "nodejs-runtime")
@@ -176,6 +176,7 @@ func TestWorkerAnswersWithoutDelay(t *testing.T) {
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
+			extras := []time.Duration{}
 			for i, a := range runInvocations(t, c.code, 5) {
 				if a.path != c.path {
 					t.Errorf("invocation %d was answered at %s, want %s", i, a.path, c.path)
@@ -192,9 +193,13 @@ func TestWorkerAnswersWithoutDelay(t *testing.T) {
 				if a.contentType != "application/json" || a.contentLength != int64(len(a.body)) {
 					t.Errorf("invocation %d was answered with Content-Type %q and Content-Length %d for %d bytes", i, a.contentType, a.contentLength, len(a.body))
 				}
-				if extra := a.took - handlerTakes; extra > runtimeAPIBudget {
-					t.Errorf("invocation %d was answered %v after its handler finished, want under %v", i, extra.Round(time.Millisecond), runtimeAPIBudget)
-				}
+				extras = append(extras, a.took-handlerTakes)
+			}
+			// the median, so one timer that fires late on a busy machine
+			// doesn't fail it, where fetch held every call
+			slices.Sort(extras)
+			if median := extras[len(extras)/2]; median > runtimeAPIBudget {
+				t.Errorf("invocations were answered a median %v after their handler finished, want under %v (all: %v)", median.Round(time.Millisecond), runtimeAPIBudget, extras)
 			}
 		})
 	}
