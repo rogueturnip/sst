@@ -191,6 +191,9 @@ func function(ctx context.Context, input input) {
 	input.server.Mux.HandleFunc(`/lambda/{workerID}/2018-06-01/runtime/invocation/next`, func(w http.ResponseWriter, r *http.Request) {
 		log.Info("got next request", "workerID", r.PathValue("workerID"))
 		workerID := r.PathValue("workerID")
+		// A first request that comes before the worker is recorded, just after
+		// it starts, doesn't count. It still takes what's queued, and the
+		// worker asks again once it has answered, which does.
 		stateMu.Lock()
 		if info, ok := workers[workerID]; ok {
 			info.Polled = true

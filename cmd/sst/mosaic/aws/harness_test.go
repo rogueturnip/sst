@@ -6,6 +6,10 @@ package aws
 // bridges and workers talk to function the way the real ones do, over AppSync
 // and the local runtime API, so a test can play out an invocation from end to
 // end, and lose or delay what the real ones can.
+//
+// The loop takes its events from the process's one bus, so the tests that use
+// it don't run in parallel, and each one's loop has stopped before the next
+// test starts.
 
 import (
 	"bytes"
@@ -241,12 +245,21 @@ func newHarness(t *testing.T, rt *fakeRuntime) *harness {
 	}
 	client := bridge.NewClient(ctx, h.appsync, "dev", h.prefix)
 	msg := make(chan bridge.Message)
-	go function(ctx, input{
-		project: &project.Project{Runtime: runtime.NewCollection(h.cfgPath, rt)},
-		server:  &server.Server{Mux: mux, Port: srv.Listener.Addr().(*net.TCPAddr).Port},
-		client:  client,
-		msg:     msg,
-		prefix:  h.prefix,
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		function(ctx, input{
+			project: &project.Project{Runtime: runtime.NewCollection(h.cfgPath, rt)},
+			server:  &server.Server{Mux: mux, Port: srv.Listener.Addr().(*net.TCPAddr).Port},
+			client:  client,
+			msg:     msg,
+			prefix:  h.prefix,
+		})
+	}()
+	// the loop has stopped, and left the bus, before the next test starts
+	t.Cleanup(func() {
+		cancel()
+		<-stopped
 	})
 	// msg is only read once function's loop runs, which is after it subscribes
 	// to the bus, so the functions added next aren't missed
