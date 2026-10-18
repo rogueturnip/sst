@@ -191,7 +191,6 @@ while (true) {
     };
     request = await result.json();
   } catch (ex: any) {
-    if (ex.code === "UND_ERR_HEADERS_TIMEOUT") continue;
     await error(ex);
     continue;
   }

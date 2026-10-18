@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -26,9 +27,10 @@ const handlerTakes = 200 * time.Millisecond
 const runtimeAPIBudget = 100 * time.Millisecond
 
 type answer struct {
-	path string
-	body string
-	took time.Duration
+	path    string
+	body    string
+	took    time.Duration
+	chunked bool
 }
 
 // runInvocations runs the real Node.js worker with the given handler, hands it
@@ -86,7 +88,7 @@ func runInvocations(t *testing.T, code string, invocations int) []answer {
 		}
 		body, _ := io.ReadAll(r.Body)
 		mu.Lock()
-		answers = append(answers, answer{r.URL.Path, string(body), time.Since(handed)})
+		answers = append(answers, answer{r.URL.Path, string(body), time.Since(handed), slices.Contains(r.TransferEncoding, "chunked")})
 		if len(answers) == invocations {
 			close(done)
 		}
@@ -106,13 +108,20 @@ func runInvocations(t *testing.T, code string, invocations int) []answer {
 		t.Fatal(err)
 	}
 	w := worker.(*Worker)
-	t.Cleanup(func() { w.cmd.Process.Kill() })
+	t.Cleanup(func() {
+		if w.cmd.Process != nil {
+			w.cmd.Process.Kill()
+		}
+	})
 	go io.Copy(io.Discard, w.Logs())
 
 	select {
 	case <-done:
 	case <-time.After(30 * time.Second):
-		t.Fatalf("the worker answered %d of %d invocations", len(answers), invocations)
+		mu.Lock()
+		answered := len(answers)
+		mu.Unlock()
+		t.Fatalf("the worker answered %d of %d invocations", answered, invocations)
 	}
 	mu.Lock()
 	defer mu.Unlock()
@@ -176,5 +185,14 @@ func TestWorkerReportsAnInitError(t *testing.T) {
 	var e struct{ ErrorMessage string }
 	if json.Unmarshal([]byte(answers[0].body), &e); e.ErrorMessage != "it failed to load" {
 		t.Errorf("the init error was %s", answers[0].body)
+	}
+}
+
+// A handler that returns nothing is answered with an empty body that says it's
+// empty, as fetch sent it, not a chunked one.
+func TestWorkerAnswersAHandlerThatReturnsNothing(t *testing.T) {
+	a := runInvocations(t, `export const handler = async () => {};`, 1)[0]
+	if a.path != "/2018-06-01/runtime/invocation/request/response" || a.body != "" || a.chunked {
+		t.Errorf("answered at %s with %q, chunked %v; want an empty response with a length", a.path, a.body, a.chunked)
 	}
 }
