@@ -58,7 +58,6 @@ type Writer struct {
 	message   MessageType
 	source    string
 	channel   string
-	event     string
 	buffer    []byte
 	index     int
 	id        string
