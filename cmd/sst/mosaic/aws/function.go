@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -79,6 +80,9 @@ func function(ctx context.Context, input input) {
 		CurrentRequestID string
 		Env              []string
 		Streaming        bool
+		// Polled is whether the worker has asked for an invocation, so it
+		// started. One that exits before then failed as it started.
+		Polled bool
 	}
 	workerShutdownChan := make(chan *WorkerInfo, 1000)
 	nextChan := map[string]chan io.Reader{}
@@ -97,6 +101,13 @@ func function(ctx context.Context, input input) {
 			nextChan[workerID] = ch
 		}
 		return ch
+	}
+	// workersNow copies the workers, for a loop over them that starts them
+	// again, which changes the map as it goes
+	workersNow := func() map[string]*WorkerInfo {
+		stateMu.Lock()
+		defer stateMu.Unlock()
+		return maps.Clone(workers)
 	}
 	loadWorker := func(workerID string) (*WorkerInfo, bool) {
 		stateMu.Lock()
@@ -180,6 +191,11 @@ func function(ctx context.Context, input input) {
 	input.server.Mux.HandleFunc(`/lambda/{workerID}/2018-06-01/runtime/invocation/next`, func(w http.ResponseWriter, r *http.Request) {
 		log.Info("got next request", "workerID", r.PathValue("workerID"))
 		workerID := r.PathValue("workerID")
+		stateMu.Lock()
+		if info, ok := workers[workerID]; ok {
+			info.Polled = true
+		}
+		stateMu.Unlock()
 		ch := loadNextChan(workerID)
 		select {
 		case <-r.Context().Done():
@@ -589,7 +605,9 @@ func function(ctx context.Context, input input) {
 				// an invocation can be queued for a worker that's exiting, as it
 				// still counted as running when the invocation arrived. Its bridge
 				// has had the ping, so it would wait until Lambda times it out.
-				queued = len(nextChan[info.WorkerID]) > 0
+				// A worker that never asked for one failed as it started, and
+				// has sent its bridge an init error, so it isn't started again.
+				queued = info.Polled && len(nextChan[info.WorkerID]) > 0
 				if !queued {
 					delete(nextChan, info.WorkerID)
 				}
@@ -626,7 +644,7 @@ func function(ctx context.Context, input input) {
 					info.Worker.Stop()
 				}
 				builds = map[string]*runtime.BuildOutput{}
-				for workerID, info := range workers {
+				for workerID, info := range workersNow() {
 					restartOrDeferWorker(workerID, info)
 				}
 			case *runtime.BuildInput:
@@ -659,7 +677,7 @@ func function(ctx context.Context, input input) {
 					}
 				}
 
-				for workerID, info := range workers {
+				for workerID, info := range workersNow() {
 					if toBuild[info.FunctionID] {
 						restartOrDeferWorker(workerID, info)
 					}

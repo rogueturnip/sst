@@ -96,6 +96,9 @@ type fakeRuntime struct {
 	// lazy starts a worker only when it's invoked, as the Python runtime does,
 	// instead of again straight after a rebuild
 	lazy bool
+	// crash makes a worker report an init error and exit without asking for an
+	// invocation, as a Node.js worker does when its handler throws on import
+	crash atomic.Bool
 }
 
 func (r *fakeRuntime) Match(runtime string) bool { return runtime == "fake" }
@@ -151,6 +154,13 @@ func (w *fakeWorker) run(ctx context.Context, output *io.PipeWriter) {
 		time.Sleep(w.runtime.exitDelay)
 		output.Close()
 	}()
+	if w.runtime.crash.Load() {
+		resp, err := http.Post(w.api+"/init/error", "application/json", strings.NewReader(`{"errorMessage":"it failed to load"}`))
+		if err == nil {
+			resp.Body.Close()
+		}
+		return
+	}
 	if w.runtime.polling != nil {
 		select {
 		case <-w.runtime.polling:

@@ -131,6 +131,53 @@ func TestQueuedInvocationRunsAfterADeployWithALazyRuntime(t *testing.T) {
 	}
 }
 
+// A worker that fails as it starts, as when its handler throws on import, has
+// already failed its invocation with an init error. It isn't started again and
+// again for that invocation, which is still queued as it never asked for it.
+func TestWorkerThatFailsToStartIsNotStartedOverAndOver(t *testing.T) {
+	h := newHarness(t, &fakeRuntime{handle: echo})
+	h.runtime.crash.Store(true)
+	h.addFunction("Fn")
+	b := h.bridge("Fn")
+	b.invoke("x")
+	time.Sleep(time.Second)
+	// one start for the bridge's init, and one for the reboot it's asked for
+	if starts := h.runtime.starts.Load(); starts > 3 {
+		t.Errorf("a worker that fails to start was started %d times in a second", starts)
+	}
+}
+
+// A deploy starts again each lazy runtime's worker that has an invocation
+// queued, once, however many environments there are.
+func TestDeployStartsEachQueuedLazyWorkerOnce(t *testing.T) {
+	polling := make(chan struct{})
+	h := newHarness(t, &fakeRuntime{handle: echo, lazy: true, polling: polling})
+	h.addFunction("Fn")
+	const envs = 20
+	replies := make(chan error, envs)
+	for range envs {
+		b := h.bridge("Fn")
+		go func() {
+			_, err := b.invoke("x")
+			replies <- err
+		}()
+		<-b.pinged
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	bus.Publish(&project.CompleteEvent{})
+	time.Sleep(300 * time.Millisecond)
+	close(polling)
+	for range envs {
+		if err := <-replies; err != nil {
+			t.Fatalf("an invocation queued before the deploy: %v", err)
+		}
+	}
+	if starts := h.runtime.starts.Load(); starts != 2*envs {
+		t.Errorf("started %d workers for %d environments, want %d: one each, and one again after the deploy", starts, envs, 2*envs)
+	}
+}
+
 // A worker's request for the next invocation can end, as when the worker exits,
 // just as an invocation is handed to it. The invocation is put back for the
 // worker's next request instead of being written to a request that's gone.
