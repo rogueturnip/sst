@@ -130,15 +130,44 @@ func function(ctx context.Context, input input) {
 	// would wait until Lambda times the invocation out. So a reply to a bridge is
 	// sent again a few times, with the ID of the first. The bridge passes on the
 	// first copy with that ID, and a later one only fills in packets it's missing.
+	//
+	// A bridge only sends its next invocation once it's done with the one before,
+	// so its reply's resends stop then.
+	type resending struct{ cancel context.CancelFunc }
+	resends := map[string]*resending{}
+	stopResending := func(workerID string) {
+		stateMu.Lock()
+		defer stateMu.Unlock()
+		if r, ok := resends[workerID]; ok {
+			r.cancel()
+			delete(resends, workerID)
+		}
+	}
 	resendReply := func(message bridge.MessageType, workerID, messageID string, body []byte) {
 		channel := input.prefix + "/" + workerID + "/in"
-		go resend(ctx, replyResends, replyResendEvery, func() {
-			writer := input.client.NewWriter(message, channel)
-			writer.SetID(messageID)
-			if err := sendMessage(writer, bytes.NewReader(body)); err != nil {
-				log.Error("failed to resend reply", "workerID", workerID, "messageID", messageID, "err", err)
+		resendCtx, cancel := context.WithCancel(ctx)
+		r := &resending{cancel}
+		stateMu.Lock()
+		if previous, ok := resends[workerID]; ok {
+			previous.cancel()
+		}
+		resends[workerID] = r
+		stateMu.Unlock()
+		go func() {
+			resend(resendCtx, replyResends, replyResendEvery, func() {
+				writer := input.client.NewWriter(message, channel)
+				writer.SetID(messageID)
+				if err := sendMessage(writer, bytes.NewReader(body)); err != nil {
+					log.Error("failed to resend reply", "workerID", workerID, "messageID", messageID, "err", err)
+				}
+			})
+			stateMu.Lock()
+			if resends[workerID] == r {
+				delete(resends, workerID)
 			}
-		})
+			stateMu.Unlock()
+			cancel()
+		}()
 	}
 	// a worker whose invocation was put back in its queue, for the loop to start
 	// it again if it's gone
@@ -424,6 +453,7 @@ func function(ctx context.Context, input input) {
 				return
 			case msg := <-input.msg:
 				if msg.Type == bridge.MessageNext {
+					stopResending(msg.Source)
 					go next(msg)
 					continue
 				}
