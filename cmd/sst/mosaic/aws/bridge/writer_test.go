@@ -37,10 +37,16 @@ func TestWriterAllocatesWhatAMessageHolds(t *testing.T) {
 	runtime.ReadMemStats(&before)
 	for range messages {
 		w := newWriter(conn, "source", "channel", MessagePing)
-		w.Write([]byte("{}\n"))
-		w.Close()
+		if _, err := w.Write([]byte("{}\n")); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 	runtime.ReadMemStats(&after)
+	// TotalAlloc counts the whole test binary, so the budget is generous on
+	// purpose: a message allocates about 120 bytes, and before this it was 256 KB
 	if perMessage := (after.TotalAlloc - before.TotalAlloc) / messages; perMessage > 4*1024 {
 		t.Errorf("a 3-byte message allocated %d KB, want under 4 KB", perMessage/1024)
 	}
@@ -90,12 +96,17 @@ func TestStreamingWriterPublishesEachWrite(t *testing.T) {
 	conn := &publishedPackets{}
 	w := newWriter(conn, "source", "channel", MessageResponse)
 	w.SetStreaming(true)
-	w.Write([]byte("first"))
-	w.Write([]byte("second"))
+	for _, chunk := range []string{"first", "second"} {
+		if _, err := w.Write([]byte(chunk)); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if len(conn.packets) != 2 {
 		t.Fatalf("2 writes published %d packets, want 2", len(conn.packets))
 	}
-	w.Close()
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
 	var got []byte
 	for _, p := range conn.packets {
 		data, _ := base64.StdEncoding.DecodeString(p.Data)
@@ -103,5 +114,29 @@ func TestStreamingWriterPublishesEachWrite(t *testing.T) {
 	}
 	if string(got) != "firstsecond" || !conn.packets[len(conn.packets)-1].Final {
 		t.Errorf("the packets hold %q, last final %v", got, conn.packets[len(conn.packets)-1].Final)
+	}
+}
+
+// BenchmarkWriter writes and publishes a message of each size, to a connection
+// that discards it: go test -run '^$' -bench Writer ./cmd/sst/mosaic/aws/bridge/
+func BenchmarkWriter(b *testing.B) {
+	for _, c := range []struct {
+		name string
+		size int
+	}{{"ping 3 B", 3}, {"reply 1 KB", 1024}, {"event 200 KB", 200 * 1024}} {
+		b.Run(c.name, func(b *testing.B) {
+			conn := &publishedPackets{discard: true}
+			body := make([]byte, c.size)
+			b.ReportAllocs()
+			for b.Loop() {
+				w := newWriter(conn, "source", "channel", MessageResponse)
+				if _, err := w.Write(body); err != nil {
+					b.Fatal(err)
+				}
+				if err := w.Close(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }
