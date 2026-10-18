@@ -157,6 +157,11 @@ func (w *Writer) Close() error {
 	return w.Flush(true)
 }
 
+// ID is the ID the message is published with.
+func (w *Writer) ID() string {
+	return w.id
+}
+
 type Client struct {
 	as      Conn
 	prefix  string

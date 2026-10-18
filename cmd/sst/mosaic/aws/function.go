@@ -432,15 +432,22 @@ func function(ctx context.Context, input input) {
 	// which builds functions, so a long build doesn't keep other bridges from
 	// their ping past the 16 seconds they wait for it.
 	next := func(msg bridge.Message) {
-		writer := input.client.NewWriter(bridge.MessagePing, input.prefix+"/"+msg.Source+"/in")
-		if err := sendJSON(writer, bridge.PingBody{}); err != nil {
-			log.Error("failed to send ping", "workerID", msg.Source, "err", err)
-		}
+		// The ping is published while the worker starts on the invocation, not
+		// before, as publishing it takes a round trip. So it can reach the
+		// bridge after the reply. It carries the ID of the bridge's message, so
+		// a late one isn't taken for the ping of the bridge's next invocation.
+		go func() {
+			writer := input.client.NewWriter(bridge.MessagePing, input.prefix+"/"+msg.Source+"/in")
+			writer.SetID(msg.ID)
+			if err := sendJSON(writer, bridge.PingBody{}); err != nil {
+				log.Error("failed to send ping", "workerID", msg.Source, "err", err)
+			}
+		}()
 		if queueNext(msg.Source, msg.Body) {
 			return
 		}
 		log.Info("asking for reboot", "workerID", msg.Source)
-		writer = input.client.NewWriter(bridge.MessageReboot, input.prefix+"/"+msg.Source+"/in")
+		writer := input.client.NewWriter(bridge.MessageReboot, input.prefix+"/"+msg.Source+"/in")
 		if err := sendJSON(writer, bridge.RebootBody{}); err != nil {
 			log.Error("failed to send reboot", "workerID", msg.Source, "err", err)
 		}

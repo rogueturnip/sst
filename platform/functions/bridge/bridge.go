@@ -188,7 +188,9 @@ func run() error {
 					continue
 				}
 				if msg.Type == bridge.MessagePing {
-					timeout = time.Minute * 15
+					if isPingFor(msg, writer.ID()) {
+						timeout = time.Minute * 15
+					}
 					continue
 				}
 			case <-time.After(timeout):
@@ -239,4 +241,13 @@ func waitForSubscription(ctx context.Context, conn *appsync.Connection, client *
 		}
 	}
 	slog.Error("subscription never delivered a probe, continuing anyway")
+}
+
+// isPingFor says whether a ping is for the invocation sent as the message with
+// nextID. sst dev pings while its worker runs the invocation, so a ping can
+// arrive after the reply, and be read while the bridge waits on its next
+// invocation. Taken for that one's, it would wait 15 minutes for a sst dev that
+// isn't there.
+func isPingFor(msg bridge.Message, nextID string) bool {
+	return msg.Type == bridge.MessagePing && msg.ID == nextID
 }

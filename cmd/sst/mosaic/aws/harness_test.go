@@ -38,9 +38,15 @@ import (
 type fakeAppSync struct {
 	mu   sync.Mutex
 	subs map[string][]chan string
+	// pingDelay is how long publishing a ping takes, as a publish to AppSync
+	// takes a round trip
+	pingDelay atomic.Int64
 }
 
 func (f *fakeAppSync) Publish(ctx context.Context, channel string, event interface{}) error {
+	if p, ok := event.(bridge.Packet); ok && p.Type == bridge.MessagePing {
+		time.Sleep(time.Duration(f.pingDelay.Load()))
+	}
 	data, err := json.Marshal(event)
 	if err != nil {
 		return err
@@ -310,7 +316,8 @@ func (b *fakeBridge) invoke(event string) (string, error) {
 	if err := resp.Write(&next); err != nil {
 		return "", err
 	}
-	if err := sendMessage(b.client.NewWriter(bridge.MessageNext, b.h.prefix+"/in"), &next); err != nil {
+	writer := b.client.NewWriter(bridge.MessageNext, b.h.prefix+"/in")
+	if err := sendMessage(writer, &next); err != nil {
 		return "", err
 	}
 	timeout, timedOut := b.h.pingTimeout, errNoPing
@@ -321,6 +328,10 @@ func (b *fakeBridge) invoke(event string) (string, error) {
 		case msg := <-b.client.Read():
 			switch msg.Type {
 			case bridge.MessagePing:
+				// a late ping for an earlier invocation isn't this one's
+				if msg.ID != writer.ID() {
+					continue
+				}
 				timeout, timedOut = b.h.invokeTimeout, errNoReply
 				b.pinged <- struct{}{}
 			case bridge.MessageReboot:
