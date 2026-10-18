@@ -2,8 +2,11 @@ package aws
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 )
@@ -31,6 +34,51 @@ func TestWorkerExitWithQueuedInvocation(t *testing.T) {
 	}
 	if got := h.runtime.starts.Load(); got != 2 {
 		t.Fatalf("started %d workers, want 2", got)
+	}
+}
+
+// When a worker that exits with an invocation queued can't be started again, the
+// invocation fails straight away, instead of at Lambda's timeout, and isn't
+// left queued for the next worker the bridge gets.
+func TestQueuedInvocationFailsWhenTheWorkerCantRestart(t *testing.T) {
+	var mu sync.Mutex
+	ran := []string{}
+	h := newHarness(t, &fakeRuntime{handle: func(event string) string {
+		mu.Lock()
+		ran = append(ran, event)
+		mu.Unlock()
+		return echo(event)
+	}, idle: 100 * time.Millisecond, exitDelay: time.Second})
+	h.addFunction("Fn")
+	b := h.bridge("Fn")
+	if _, err := b.invoke("first"); err != nil {
+		t.Fatal(err)
+	}
+	// the worker exits on idle, and sst dev hasn't noticed yet
+	time.Sleep(300 * time.Millisecond)
+	h.runtime.failRuns.Store(true)
+
+	start := time.Now()
+	_, err := b.invoke("second")
+	if err == nil || errors.Is(err, errNoReply) {
+		t.Fatalf("invocation whose worker couldn't restart: got %v, want it to fail to start", err)
+	}
+	if waited := time.Since(start); waited > 3*time.Second {
+		t.Errorf("it failed after %v, want straight away", waited.Round(time.Millisecond))
+	}
+
+	h.runtime.failRuns.Store(false)
+	got, err := b.invoke("third")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != echo("third") {
+		t.Errorf("got %q, want %q", got, echo("third"))
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if slices.Contains(ran, "second") {
+		t.Errorf("the failed invocation was run later, by the next worker: ran %q", ran)
 	}
 }
 

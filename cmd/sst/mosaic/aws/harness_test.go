@@ -91,6 +91,8 @@ type fakeRuntime struct {
 	held   chan string
 
 	starts atomic.Int32
+	// failRuns makes starting a worker fail, as when its runtime can't run it
+	failRuns atomic.Bool
 }
 
 func (r *fakeRuntime) Match(runtime string) bool { return runtime == "fake" }
@@ -113,6 +115,9 @@ func (r *fakeRuntime) Build(ctx context.Context, input *runtime.BuildInput) (*ru
 }
 
 func (r *fakeRuntime) Run(ctx context.Context, input *runtime.RunInput) (runtime.Worker, error) {
+	if r.failRuns.Load() {
+		return nil, errors.New("the worker failed to start")
+	}
 	r.starts.Add(1)
 	logs, output := io.Pipe()
 	w := &fakeWorker{runtime: r, api: "http://" + input.Server + "/2018-06-01/runtime", stop: make(chan struct{}), logs: logs}

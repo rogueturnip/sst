@@ -232,12 +232,14 @@ func function(ctx context.Context, input input) {
 		messageID := id.Ascending()
 		writer.SetID(messageID)
 		var buf bytes.Buffer
-		tee := io.TeeReader(r.Body, &buf)
-		if err := sendMessage(writer, tee); err != nil {
+		buf.ReadFrom(r.Body)
+		// the resends are set before the first copy goes, as the bridge can
+		// send its next invocation, which stops them, before the publish returns
+		resendReply(bridge.MessageInitError, workerID, messageID, buf.Bytes())
+		if err := sendMessage(writer, bytes.NewReader(buf.Bytes())); err != nil {
 			log.Error("failed to send init error", "workerID", workerID, "err", err)
 		}
 		w.WriteHeader(200)
-		resendReply(bridge.MessageInitError, workerID, messageID, buf.Bytes())
 		info, ok := loadWorker(workerID)
 		if ok {
 			fee := &FunctionErrorEvent{
@@ -270,8 +272,9 @@ func function(ctx context.Context, input input) {
 			})
 		} else {
 			var buf bytes.Buffer
-			tee := io.TeeReader(r.Body, &buf)
-			if err := sendMessage(writer, tee); err != nil {
+			buf.ReadFrom(r.Body)
+			resendReply(bridge.MessageResponse, workerID, requestID, buf.Bytes())
+			if err := sendMessage(writer, bytes.NewReader(buf.Bytes())); err != nil {
 				log.Error("failed to send response", "workerID", workerID, "requestID", requestID, "err", err)
 			}
 			w.WriteHeader(202)
@@ -283,7 +286,6 @@ func function(ctx context.Context, input input) {
 					Output:     buf.Bytes(),
 				})
 			}
-			resendReply(bridge.MessageResponse, workerID, requestID, buf.Bytes())
 		}
 	})
 
@@ -294,12 +296,12 @@ func function(ctx context.Context, input input) {
 		writer := input.client.NewWriter(bridge.MessageError, input.prefix+"/"+workerID+"/in")
 		writer.SetID(requestID)
 		var buf bytes.Buffer
-		tee := io.TeeReader(r.Body, &buf)
-		if err := sendMessage(writer, tee); err != nil {
+		buf.ReadFrom(r.Body)
+		resendReply(bridge.MessageError, workerID, requestID, buf.Bytes())
+		if err := sendMessage(writer, bytes.NewReader(buf.Bytes())); err != nil {
 			log.Error("failed to send error", "workerID", workerID, "requestID", requestID, "err", err)
 		}
 		w.WriteHeader(202)
-		resendReply(bridge.MessageError, workerID, requestID, buf.Bytes())
 		info, ok := loadWorker(workerID)
 		if ok {
 			fee := &FunctionErrorEvent{
@@ -412,6 +414,26 @@ func function(ctx context.Context, input input) {
 		return true
 	}
 
+	// restart starts a worker again for the invocations queued for it. If it
+	// can't start, as when its build fails, the queue is dropped and the bridge
+	// sent an init error, so the invocation fails now instead of at Lambda's
+	// timeout, and isn't handed to the next worker the bridge gets.
+	restart := func(functionID string, workerID string) {
+		log.Info("starting worker again for its queued invocations", "workerID", workerID)
+		if startWorker(functionID, workerID) {
+			return
+		}
+		stateMu.Lock()
+		delete(nextChan, workerID)
+		stateMu.Unlock()
+		result, err := http.Post("http://"+server+workerID+"/2018-06-01/runtime/init/error", "application/json", strings.NewReader(`{"errorMessage":"Function failed to start"}`))
+		if err != nil {
+			log.Error("failed to report a worker that didn't start", "workerID", workerID, "err", err)
+			return
+		}
+		result.Body.Close()
+	}
+
 	restartOrDeferWorker := func(workerID string, info *WorkerInfo) {
 		target, ok := targets[info.FunctionID]
 		if !ok {
@@ -473,6 +495,8 @@ func function(ctx context.Context, input input) {
 		}
 	}()
 
+	// the loop ends with ctx, as in tests, which run it again and again
+	defer bus.Unsubscribe(evts)
 	for {
 		select {
 		case <-ctx.Done():
@@ -546,8 +570,7 @@ func function(ctx context.Context, input input) {
 			}
 			stateMu.Unlock()
 			if queued {
-				log.Info("starting worker again for its queued invocations", "workerID", info.WorkerID)
-				startWorker(info.FunctionID, info.WorkerID)
+				restart(info.FunctionID, info.WorkerID)
 			}
 			break
 		case workerID := <-requeued:
@@ -557,8 +580,7 @@ func function(ctx context.Context, input input) {
 			stateMu.Unlock()
 			functionID, ok := workerFunction[workerID]
 			if !running && queued && ok {
-				log.Info("starting worker again for its queued invocations", "workerID", workerID)
-				startWorker(functionID, workerID)
+				restart(functionID, workerID)
 			}
 		case unknown := <-evts:
 			switch evt := unknown.(type) {
