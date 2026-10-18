@@ -2,6 +2,7 @@ package node
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -95,6 +96,9 @@ func runInvocationsCuttingOff(t *testing.T, code string, invocations int, cut in
 			mu.Unlock()
 			w.Header().Set("lambda-runtime-aws-request-id", "request")
 			w.Header().Set("lambda-runtime-deadline-ms", "9999999999999")
+			w.Header().Set("lambda-runtime-invoked-function-arn", "arn:aws:lambda:us-east-1:123456789012:function:fn")
+			w.Header().Set("lambda-runtime-cognito-identity", `{"cognitoIdentityId":"id"}`)
+			w.Header().Set("lambda-runtime-client-context", `{"custom":{"k":"v"}}`)
 			w.Write([]byte(`{"n":1}`))
 			return
 		}
@@ -159,18 +163,18 @@ func TestWorkerAnswersWithoutDelay(t *testing.T) {
 		body string
 	}{
 		"response": {
-			code: `export const handler = async () => {
-				await new Promise((r) => setTimeout(r, 200));
+			code: fmt.Sprintf(`export const handler = async () => {
+				await new Promise((r) => setTimeout(r, %d));
 				return { statusCode: 200, body: "ok" };
-			};`,
+			};`, handlerTakes.Milliseconds()),
 			path: "/2018-06-01/runtime/invocation/request/response",
 			body: `{"statusCode":200,"body":"ok"}`,
 		},
 		"error": {
-			code: `export const handler = async () => {
-				await new Promise((r) => setTimeout(r, 200));
+			code: fmt.Sprintf(`export const handler = async () => {
+				await new Promise((r) => setTimeout(r, %d));
 				throw new Error("it failed");
-			};`,
+			};`, handlerTakes.Milliseconds()),
 			path: "/2018-06-01/runtime/invocation/request/error",
 		},
 	}
@@ -236,5 +240,22 @@ func TestWorkerSendsAgainWhenItsAnswerIsCutOff(t *testing.T) {
 	a := runInvocationsCuttingOff(t, `export const handler = async () => ({ ok: true });`, 1, 1)[0]
 	if a.path != "/2018-06-01/runtime/invocation/request/response" || a.body != `{"ok":true}` {
 		t.Errorf("answered at %s with %q, want the response sent again", a.path, a.body)
+	}
+}
+
+// The worker hands the handler the invocation's event, and the context it
+// reads from the runtime API's headers.
+func TestWorkerPassesTheInvocationsContext(t *testing.T) {
+	a := runInvocations(t, `export const handler = async (event, context) => ({
+		event,
+		requestID: context.awsRequestId,
+		arn: context.invokedFunctionArn,
+		remaining: context.getRemainingTimeInMillis() > 0,
+		identity: context.identity,
+		clientContext: context.clientContext,
+	});`, 1)[0]
+	want := `{"event":{"n":1},"requestID":"request","arn":"arn:aws:lambda:us-east-1:123456789012:function:fn","remaining":true,"identity":{"cognitoIdentityId":"id"},"clientContext":{"custom":{"k":"v"}}}`
+	if a.body != want {
+		t.Errorf("the handler got\n%s\nwant\n%s", a.body, want)
 	}
 }
