@@ -43,13 +43,23 @@ type answer struct {
 // after it was handed over.
 func runInvocations(t *testing.T, code string, invocations int) []answer {
 	t.Helper()
-	return runInvocationsCuttingOff(t, code, invocations, 0)
+	return runInvocationsWith(t, code, invocations, faults{})
 }
 
-// runInvocationsCuttingOff is runInvocations, but the first cut answers to the
-// worker's answers are cut off partway, as when sst dev stops mid-reply. Only
-// the answers it takes in count.
-func runInvocationsCuttingOff(t *testing.T, code string, invocations int, cut int) []answer {
+// faults are what the stand-in runtime API does wrong.
+type faults struct {
+	// cutAnswers is how many of sst dev's first answers to the worker's
+	// answers are cut off partway, as when sst dev stops mid-reply. Only the
+	// answers it takes in count.
+	cutAnswers int
+	// dropNexts is how many of the worker's first requests for an invocation
+	// have their connection closed without an answer, as a kept-alive one sst
+	// dev closed while it was idle is
+	dropNexts int
+}
+
+// runInvocationsWith is runInvocations, with the stand-in runtime API at fault.
+func runInvocationsWith(t *testing.T, code string, invocations int, f faults) []answer {
 	t.Helper()
 	if _, err := exec.LookPath("node"); err != nil {
 		t.Skip("node isn't installed")
@@ -85,7 +95,17 @@ func runInvocationsCuttingOff(t *testing.T, code string, invocations int, cut in
 	done := make(chan struct{})
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/invocation/next") {
+			if length := r.Header.Get("Content-Length"); length != "" {
+				t.Errorf("the request for the next invocation had Content-Length %s, want none, as fetch sent", length)
+			}
 			mu.Lock()
+			if f.dropNexts > 0 {
+				f.dropNexts--
+				mu.Unlock()
+				conn, _, _ := w.(http.Hijacker).Hijack()
+				conn.Close()
+				return
+			}
 			if served == invocations {
 				mu.Unlock()
 				<-r.Context().Done()
@@ -104,8 +124,8 @@ func runInvocationsCuttingOff(t *testing.T, code string, invocations int, cut in
 		}
 		body, _ := io.ReadAll(r.Body)
 		mu.Lock()
-		if cut > 0 {
-			cut--
+		if f.cutAnswers > 0 {
+			f.cutAnswers--
 			mu.Unlock()
 			conn, buf, _ := w.(http.Hijacker).Hijack()
 			buf.WriteString("HTTP/1.1 202 Accepted\r\nContent-Length: 10\r\n\r\nabc")
@@ -133,6 +153,9 @@ func runInvocationsCuttingOff(t *testing.T, code string, invocations int, cut in
 		t.Fatal(err)
 	}
 	w := worker.(*Worker)
+	if w.cmd.Process == nil {
+		t.Fatal("the worker didn't start: is node on the PATH?")
+	}
 	t.Cleanup(func() {
 		if w.cmd.Process != nil {
 			w.cmd.Process.Kill()
@@ -237,7 +260,7 @@ func TestWorkerAnswersAHandlerThatReturnsNothing(t *testing.T) {
 // the response again, as it does when sending fails, instead of waiting on the
 // rest of an answer that won't come.
 func TestWorkerSendsAgainWhenItsAnswerIsCutOff(t *testing.T) {
-	a := runInvocationsCuttingOff(t, `export const handler = async () => ({ ok: true });`, 1, 1)[0]
+	a := runInvocationsWith(t, `export const handler = async () => ({ ok: true });`, 1, faults{cutAnswers: 1})[0]
 	if a.path != "/2018-06-01/runtime/invocation/request/response" || a.body != `{"ok":true}` {
 		t.Errorf("answered at %s with %q, want the response sent again", a.path, a.body)
 	}
@@ -257,5 +280,15 @@ func TestWorkerPassesTheInvocationsContext(t *testing.T) {
 	want := `{"event":{"n":1},"requestID":"request","arn":"arn:aws:lambda:us-east-1:123456789012:function:fn","remaining":true,"identity":{"cognitoIdentityId":"id"},"clientContext":{"custom":{"k":"v"}}}`
 	if a.body != want {
 		t.Errorf("the handler got\n%s\nwant\n%s", a.body, want)
+	}
+}
+
+// When the worker's request for an invocation fails on its connection, as on a
+// kept-alive one sst dev has closed, it's sent again, instead of being reported
+// as an error.
+func TestWorkerAsksAgainWhenItsConnectionIsClosed(t *testing.T) {
+	a := runInvocationsWith(t, `export const handler = async () => ({ ok: true });`, 1, faults{dropNexts: 1})[0]
+	if a.path != "/2018-06-01/runtime/invocation/request/response" || a.body != `{"ok":true}` {
+		t.Errorf("answered at %s with %q, want the invocation's response", a.path, a.body)
 	}
 }

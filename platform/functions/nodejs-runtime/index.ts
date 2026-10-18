@@ -72,7 +72,11 @@ function runtimeAPI(method: "GET" | "POST", endpoint: string, body?: string) {
       (res) => {
         const chunks: Buffer[] = [];
         res.on("data", (chunk) => chunks.push(chunk));
-        res.on("error", reject);
+        res.on("error", (ex) => {
+          // its socket is closed, not left half-read
+          res.destroy();
+          reject(ex);
+        });
         res.on("end", () => {
           const text = Buffer.concat(chunks).toString();
           resolve({
@@ -101,6 +105,18 @@ function runtimeAPI(method: "GET" | "POST", endpoint: string, body?: string) {
     }
     req.end(body ?? "");
   });
+}
+
+// Asks sst dev for the next invocation. A kept-alive connection that sst dev
+// closed while it was idle fails the first request on it, so that one is sent
+// again on a new connection, instead of being reported as an error.
+async function nextInvocation() {
+  try {
+    return await runtimeAPI("GET", `/runtime/invocation/next`);
+  } catch (ex: any) {
+    if (ex.code !== "ECONNRESET" && ex.code !== "EPIPE") throw ex;
+    return runtimeAPI("GET", `/runtime/invocation/next`);
+  }
 }
 
 async function error(ex: any) {
@@ -148,7 +164,7 @@ while (true) {
   );
 
   try {
-    const result = await runtimeAPI("GET", `/runtime/invocation/next`);
+    const result = await nextInvocation();
     clearTimeout(timeout);
     context = {
       awsRequestId: result.headers.get("lambda-runtime-aws-request-id") || "",
