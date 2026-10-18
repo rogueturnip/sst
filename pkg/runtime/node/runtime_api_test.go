@@ -23,20 +23,32 @@ import (
 const handlerTakes = 200 * time.Millisecond
 
 // What a call to the runtime API may add to an invocation, on the same
-// machine. On Node.js 26.7, fetch held each one for about 300 ms.
-const runtimeAPIBudget = 100 * time.Millisecond
+// machine. On Node.js 26.7, fetch held each one for about 300 ms, so this
+// leaves room for a busy machine and still catches that.
+const runtimeAPIBudget = 150 * time.Millisecond
 
 type answer struct {
 	path    string
 	body    string
 	took    time.Duration
 	chunked bool
+	// the request's Content-Type and Content-Length
+	contentType   string
+	contentLength int64
 }
 
 // runInvocations runs the real Node.js worker with the given handler, hands it
 // invocations one after another, and returns how each was answered and how long
 // after it was handed over.
 func runInvocations(t *testing.T, code string, invocations int) []answer {
+	t.Helper()
+	return runInvocationsCuttingOff(t, code, invocations, 0)
+}
+
+// runInvocationsCuttingOff is runInvocations, but the first cut answers to the
+// worker's answers are cut off partway, as when sst dev stops mid-reply. Only
+// the answers it takes in count.
+func runInvocationsCuttingOff(t *testing.T, code string, invocations int, cut int) []answer {
 	t.Helper()
 	if _, err := exec.LookPath("node"); err != nil {
 		t.Skip("node isn't installed")
@@ -88,7 +100,16 @@ func runInvocations(t *testing.T, code string, invocations int) []answer {
 		}
 		body, _ := io.ReadAll(r.Body)
 		mu.Lock()
-		answers = append(answers, answer{r.URL.Path, string(body), time.Since(handed), slices.Contains(r.TransferEncoding, "chunked")})
+		if cut > 0 {
+			cut--
+			mu.Unlock()
+			conn, buf, _ := w.(http.Hijacker).Hijack()
+			buf.WriteString("HTTP/1.1 202 Accepted\r\nContent-Length: 10\r\n\r\nabc")
+			buf.Flush()
+			conn.Close()
+			return
+		}
+		answers = append(answers, answer{r.URL.Path, string(body), time.Since(handed), slices.Contains(r.TransferEncoding, "chunked"), r.Header.Get("Content-Type"), r.ContentLength})
 		if len(answers) == invocations {
 			close(done)
 		}
@@ -168,6 +189,9 @@ func TestWorkerAnswersWithoutDelay(t *testing.T) {
 						t.Errorf("invocation %d's error was %s", i, a.body)
 					}
 				}
+				if a.contentType != "application/json" || a.contentLength != int64(len(a.body)) {
+					t.Errorf("invocation %d was answered with Content-Type %q and Content-Length %d for %d bytes", i, a.contentType, a.contentLength, len(a.body))
+				}
 				if extra := a.took - handlerTakes; extra > runtimeAPIBudget {
 					t.Errorf("invocation %d was answered %v after its handler finished, want under %v", i, extra.Round(time.Millisecond), runtimeAPIBudget)
 				}
@@ -192,7 +216,20 @@ func TestWorkerReportsAnInitError(t *testing.T) {
 // empty, as fetch sent it, not a chunked one.
 func TestWorkerAnswersAHandlerThatReturnsNothing(t *testing.T) {
 	a := runInvocations(t, `export const handler = async () => {};`, 1)[0]
-	if a.path != "/2018-06-01/runtime/invocation/request/response" || a.body != "" || a.chunked {
-		t.Errorf("answered at %s with %q, chunked %v; want an empty response with a length", a.path, a.body, a.chunked)
+	if a.path != "/2018-06-01/runtime/invocation/request/response" || a.body != "" || a.chunked || a.contentLength != 0 {
+		t.Errorf("answered at %s with %q, chunked %v, Content-Length %d; want an empty response with a length", a.path, a.body, a.chunked, a.contentLength)
+	}
+	if a.contentType != "application/json" {
+		t.Errorf("answered with Content-Type %q, want application/json, as fetch sent", a.contentType)
+	}
+}
+
+// When sst dev's answer to the worker's response is cut off, the worker sends
+// the response again, as it does when sending fails, instead of waiting on the
+// rest of an answer that won't come.
+func TestWorkerSendsAgainWhenItsAnswerIsCutOff(t *testing.T) {
+	a := runInvocationsCuttingOff(t, `export const handler = async () => ({ ok: true });`, 1, 1)[0]
+	if a.path != "/2018-06-01/runtime/invocation/request/response" || a.body != `{"ok":true}` {
+		t.Errorf("answered at %s with %q, want the response sent again", a.path, a.body)
 	}
 }

@@ -60,12 +60,13 @@ function runtimeAPI(method: "GET" | "POST", path: string, body?: string) {
       AWS_LAMBDA_RUNTIME_API + path,
       {
         method,
+        // as fetch sent them, also for a handler that returns nothing
         headers:
-          body === undefined
+          method === "GET"
             ? {}
             : {
                 "Content-Type": "application/json",
-                "Content-Length": Buffer.byteLength(body),
+                "Content-Length": Buffer.byteLength(body ?? ""),
               },
       },
       (res) => {
@@ -88,7 +89,14 @@ function runtimeAPI(method: "GET" | "POST", path: string, body?: string) {
       },
     );
     req.on("error", reject);
-    req.end(body);
+    // fetch gave up on a request after 300 s, and the caller sends it again.
+    // Not the request for the next invocation, which waits until there is one.
+    if (method === "POST") {
+      req.setTimeout(300_000, () =>
+        req.destroy(new Error("the runtime API didn't answer")),
+      );
+    }
+    req.end(body ?? "");
   });
 }
 
