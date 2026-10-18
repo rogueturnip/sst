@@ -232,7 +232,9 @@ func function(ctx context.Context, input input) {
 		messageID := id.Ascending()
 		writer.SetID(messageID)
 		var buf bytes.Buffer
-		buf.ReadFrom(r.Body)
+		if _, err := buf.ReadFrom(r.Body); err != nil {
+			log.Error("failed to read init error", "workerID", workerID, "err", err)
+		}
 		// the resends are set before the first copy goes, as the bridge can
 		// send its next invocation, which stops them, before the publish returns
 		resendReply(bridge.MessageInitError, workerID, messageID, buf.Bytes())
@@ -272,7 +274,9 @@ func function(ctx context.Context, input input) {
 			})
 		} else {
 			var buf bytes.Buffer
-			buf.ReadFrom(r.Body)
+			if _, err := buf.ReadFrom(r.Body); err != nil {
+				log.Error("failed to read response", "workerID", workerID, "requestID", requestID, "err", err)
+			}
 			resendReply(bridge.MessageResponse, workerID, requestID, buf.Bytes())
 			if err := sendMessage(writer, bytes.NewReader(buf.Bytes())); err != nil {
 				log.Error("failed to send response", "workerID", workerID, "requestID", requestID, "err", err)
@@ -296,7 +300,9 @@ func function(ctx context.Context, input input) {
 		writer := input.client.NewWriter(bridge.MessageError, input.prefix+"/"+workerID+"/in")
 		writer.SetID(requestID)
 		var buf bytes.Buffer
-		buf.ReadFrom(r.Body)
+		if _, err := buf.ReadFrom(r.Body); err != nil {
+			log.Error("failed to read error", "workerID", workerID, "requestID", requestID, "err", err)
+		}
 		resendReply(bridge.MessageError, workerID, requestID, buf.Bytes())
 		if err := sendMessage(writer, bytes.NewReader(buf.Bytes())); err != nil {
 			log.Error("failed to send error", "workerID", workerID, "requestID", requestID, "err", err)
@@ -426,6 +432,12 @@ func function(ctx context.Context, input input) {
 		stateMu.Lock()
 		delete(nextChan, workerID)
 		stateMu.Unlock()
+		// the worker is gone, so the init error handler can't say whose it is
+		bus.Publish(&FunctionErrorEvent{
+			FunctionID:   functionID,
+			WorkerID:     workerID,
+			ErrorMessage: "Function failed to start",
+		})
 		result, err := http.Post("http://"+server+workerID+"/2018-06-01/runtime/init/error", "application/json", strings.NewReader(`{"errorMessage":"Function failed to start"}`))
 		if err != nil {
 			log.Error("failed to report a worker that didn't start", "workerID", workerID, "err", err)

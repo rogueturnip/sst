@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/sst/sst/v3/pkg/bus"
 )
 
 // A worker can exit, as the Node.js runtime does after a minute without work,
@@ -57,6 +59,8 @@ func TestQueuedInvocationFailsWhenTheWorkerCantRestart(t *testing.T) {
 	// the worker exits on idle, and sst dev hasn't noticed yet
 	time.Sleep(300 * time.Millisecond)
 	h.runtime.failRuns.Store(true)
+	errs := bus.Subscribe(&FunctionErrorEvent{})
+	defer bus.Unsubscribe(errs)
 
 	start := time.Now()
 	_, err := b.invoke("second")
@@ -65,6 +69,15 @@ func TestQueuedInvocationFailsWhenTheWorkerCantRestart(t *testing.T) {
 	}
 	if waited := time.Since(start); waited > 3*time.Second {
 		t.Errorf("it failed after %v, want straight away", waited.Round(time.Millisecond))
+	}
+	// what sst dev shows and logs for it
+	select {
+	case evt := <-errs:
+		if e := evt.(*FunctionErrorEvent); e.FunctionID != "Fn" || e.ErrorMessage != "Function failed to start" {
+			t.Errorf("got error event %+v, want one for Fn saying it failed to start", e)
+		}
+	case <-time.After(time.Second):
+		t.Error("no error event, so sst dev shows nothing for the failed invocation")
 	}
 
 	h.runtime.failRuns.Store(false)
