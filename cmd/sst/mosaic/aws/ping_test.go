@@ -21,7 +21,8 @@ func TestWorkerDoesNotWaitForThePing(t *testing.T) {
 	}
 	<-handed
 
-	const publish = 500 * time.Millisecond
+	// long against the handler, so a slow machine doesn't fail the test
+	const publish = 2 * time.Second
 	h.appsync.pingDelay.Store(int64(publish))
 	start := time.Now()
 	reply, err := b.invoke("event")

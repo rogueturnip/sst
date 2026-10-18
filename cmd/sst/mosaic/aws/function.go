@@ -121,7 +121,10 @@ func function(ctx context.Context, input input) {
 		default:
 			// a full queue is waited on without holding up everything else
 			stateMu.Unlock()
-			ch <- body
+			select {
+			case ch <- body:
+			case <-ctx.Done():
+			}
 		}
 		return running
 	}
@@ -438,12 +441,17 @@ func function(ctx context.Context, input input) {
 			WorkerID:     workerID,
 			ErrorMessage: "Function failed to start",
 		})
-		result, err := http.Post("http://"+server+workerID+"/2018-06-01/runtime/init/error", "application/json", strings.NewReader(`{"errorMessage":"Function failed to start"}`))
-		if err != nil {
-			log.Error("failed to report a worker that didn't start", "workerID", workerID, "err", err)
-			return
-		}
-		result.Body.Close()
+		// sent from its own goroutine, as the handler publishes it to AppSync,
+		// and the loop doesn't wait on that
+		go func() {
+			client := http.Client{Timeout: 10 * time.Second}
+			result, err := client.Post("http://"+server+workerID+"/2018-06-01/runtime/init/error", "application/json", strings.NewReader(`{"errorMessage":"Function failed to start"}`))
+			if err != nil {
+				log.Error("failed to report a worker that didn't start", "workerID", workerID, "err", err)
+				return
+			}
+			result.Body.Close()
+		}()
 	}
 
 	restartOrDeferWorker := func(workerID string, info *WorkerInfo) {
@@ -457,7 +465,13 @@ func function(ctx context.Context, input input) {
 			log.Info("lazy startup: deferring worker restart until invoked", "workerID", workerID, "functionID", info.FunctionID)
 			stateMu.Lock()
 			delete(workers, workerID)
+			// the stopped worker's exit isn't seen as this worker's any more, so
+			// an invocation already queued for it is started here
+			queued := len(nextChan[workerID]) > 0
 			stateMu.Unlock()
+			if queued {
+				restart(info.FunctionID, workerID)
+			}
 		}
 	}
 

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/sst/sst/v3/pkg/bus"
+	"github.com/sst/sst/v3/pkg/project"
 )
 
 // A worker can exit, as the Node.js runtime does after a minute without work,
@@ -92,6 +93,41 @@ func TestQueuedInvocationFailsWhenTheWorkerCantRestart(t *testing.T) {
 	defer mu.Unlock()
 	if slices.Contains(ran, "second") {
 		t.Errorf("the failed invocation was run later, by the next worker: ran %q", ran)
+	}
+}
+
+// A deploy stops every worker. A runtime that starts workers only when they're
+// invoked, as Python's does, doesn't start one again then. An invocation already
+// queued for a worker that was stopped is still run, instead of waiting for one
+// that isn't coming.
+func TestQueuedInvocationRunsAfterADeployWithALazyRuntime(t *testing.T) {
+	polling := make(chan struct{})
+	h := newHarness(t, &fakeRuntime{handle: echo, lazy: true, polling: polling})
+	h.addFunction("Fn")
+	b := h.bridge("Fn")
+
+	reply := make(chan error, 1)
+	go func() {
+		got, err := b.invoke("x")
+		if err == nil && got != "echo x" {
+			t.Errorf("got %q, want %q", got, "echo x")
+		}
+		reply <- err
+	}()
+	select {
+	case <-b.pinged:
+	case err := <-reply:
+		t.Fatalf("invocation ended before the ping: %v", err)
+	}
+	// queued for the worker, which hasn't asked for it yet
+	time.Sleep(50 * time.Millisecond)
+
+	bus.Publish(&project.CompleteEvent{})
+	// the stopped worker has gone before any other asks
+	time.Sleep(200 * time.Millisecond)
+	close(polling)
+	if err := <-reply; err != nil {
+		t.Fatalf("invocation queued before the deploy: %v", err)
 	}
 }
 

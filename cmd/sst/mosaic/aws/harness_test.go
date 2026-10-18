@@ -93,6 +93,9 @@ type fakeRuntime struct {
 	starts atomic.Int32
 	// failRuns makes starting a worker fail, as when its runtime can't run it
 	failRuns atomic.Bool
+	// lazy starts a worker only when it's invoked, as the Python runtime does,
+	// instead of again straight after a rebuild
+	lazy bool
 }
 
 func (r *fakeRuntime) Match(runtime string) bool { return runtime == "fake" }
@@ -127,7 +130,7 @@ func (r *fakeRuntime) Run(ctx context.Context, input *runtime.RunInput) (runtime
 
 func (r *fakeRuntime) ShouldRebuild(functionID string, path string) bool { return false }
 
-func (r *fakeRuntime) ShouldRunEagerly() bool { return true }
+func (r *fakeRuntime) ShouldRunEagerly() bool { return !r.lazy }
 
 type fakeWorker struct {
 	runtime  *fakeRuntime
