@@ -206,6 +206,9 @@ func (c *Connection) PublishOverSocket(ctx context.Context, channel string, even
 // over HTTPS only that event fails, so it's for events well under it. A write
 // has socketWriteTimeout, so it's for a batch no larger than an event.
 func (c *Connection) PublishBatchOverSocket(ctx context.Context, channel string, events []interface{}) error {
+	if len(events) > MaxBatch {
+		return fmt.Errorf("a publish takes at most %d events, not %d", MaxBatch, len(events))
+	}
 	err := c.publishOverSocket(ctx, channel, events)
 	if err == nil {
 		return nil

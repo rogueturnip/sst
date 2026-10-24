@@ -169,12 +169,22 @@ func BenchmarkWriter(b *testing.B) {
 type socketPackets struct {
 	mu                    sync.Mutex
 	overHTTPS, overSocket int
+	// how many requests went over HTTPS with PublishBatch
+	requests int
 }
 
 func (c *socketPackets) Publish(ctx context.Context, channel string, event interface{}) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.overHTTPS++
+	return nil
+}
+
+func (c *socketPackets) PublishBatch(ctx context.Context, channel string, events []interface{}) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.overHTTPS += len(events)
+	c.requests++
 	return nil
 }
 
@@ -217,8 +227,8 @@ func TestWriterPublishesOverTheSocketWhenTold(t *testing.T) {
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if conn.overSocket != 0 || conn.overHTTPS != 2 {
-		t.Fatalf("a message of more than a packet went %d over the socket and %d over HTTPS, want 0 and 2", conn.overSocket, conn.overHTTPS)
+	if conn.overSocket != 0 || conn.overHTTPS != 2 || conn.requests != 1 {
+		t.Fatalf("a message of more than a packet went %d over the socket and %d over HTTPS in %d requests, want 0, and 2 in 1", conn.overSocket, conn.overHTTPS, conn.requests)
 	}
 
 	conn = &socketPackets{}

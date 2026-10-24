@@ -143,10 +143,19 @@ func TestPublishBatchSendsItsEventsInOneRequest(t *testing.T) {
 
 // More events than AppSync takes in a publish are an error, without a request.
 func TestPublishBatchTakesAtMostFive(t *testing.T) {
+	if MaxBatch != 5 {
+		t.Fatalf("MaxBatch is %d, but AppSync takes 5 events in a publish", MaxBatch)
+	}
 	conn, srv := connect(t)
 	events := []interface{}{1, 2, 3, 4, 5, 6}
 	if err := conn.PublishBatch(context.Background(), "c", events); err == nil {
 		t.Fatal("PublishBatch() of 6 events = nil, want an error")
+	}
+	if got := srv.count(); got != 0 {
+		t.Fatalf("made %d requests, want none", got)
+	}
+	if err := conn.PublishBatchOverSocket(context.Background(), "c", events); err == nil {
+		t.Fatal("PublishBatchOverSocket() of 6 events = nil, want an error")
 	}
 	if got := srv.count(); got != 0 {
 		t.Fatalf("made %d requests, want none", got)
