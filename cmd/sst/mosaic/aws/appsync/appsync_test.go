@@ -417,6 +417,8 @@ func TestTransient(t *testing.T) {
 		&HandshakeError{Status: 502},
 		fmt.Errorf("dial: %w", &net.DNSError{Err: "no such host", Name: "abc.appsync-realtime-api.ca-central-1.amazonaws.com", IsNotFound: true}),
 		&net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED},
+		&net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNRESET},
+		&net.OpError{Op: "dial", Net: "tcp", Err: syscall.ETIMEDOUT},
 		websocket.ErrBadHandshake,
 	} {
 		if !Transient(err) {
@@ -428,6 +430,8 @@ func TestTransient(t *testing.T) {
 		&ConnectError{Code: 401, Type: "UnauthorizedException"},
 		&HandshakeError{Status: 403},
 		&HandshakeError{Status: 401},
+		&net.OpError{Op: "dial", Net: "tcp", Err: syscall.EACCES},
+		&net.OpError{Op: "dial", Net: "tcp", Err: &tls.CertificateVerificationError{Err: errors.New("bad cert")}},
 		errors.New("token has expired"),
 		context.Canceled,
 		&tls.CertificateVerificationError{Err: errors.New("bad cert")},
@@ -519,5 +523,26 @@ func TestSubscribeGivesUp(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("took %v", elapsed)
+	}
+}
+
+// A subscribe whose answer is late is tried again, and the late answer, an
+// error here, isn't taken for the next try's.
+func TestSubscribeIgnoresALateAnswer(t *testing.T) {
+	setReadyTimings(t, 10*time.Second, 10*time.Millisecond)
+	old := subscribeTimeout
+	subscribeTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { subscribeTimeout = old })
+	f := newFakeEventAPI(t, "ack")
+	f.lateSubscribe = true
+	conn := f.connection()
+
+	if _, err := conn.Subscribe(context.Background(), "/sst/app/stage/in"); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.subscribes != 2 {
+		t.Fatalf("subscribed %d times, want 2: the late error was taken for the second's answer", f.subscribes)
 	}
 }

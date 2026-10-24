@@ -48,6 +48,12 @@ type fakeEventAPI struct {
 	// namespace just created does
 	refuseSubscribes int
 	subscribeErrors  int
+	// lateSubscribe leaves the first subscribe unanswered until the next one
+	// comes, and then answers it with an error, just before the next one's
+	// success
+	lateSubscribe bool
+	lateID        interface{}
+	subscribes    int
 	// refused is how many it turned down, and closedRefused how many of those
 	// sockets the client closed
 	refused         int
@@ -138,6 +144,21 @@ func (f *fakeEventAPI) serveSocket(conn *websocket.Conn) {
 		}
 		switch msg["type"] {
 		case "subscribe":
+			f.mu.Lock()
+			f.subscribes++
+			late, lateID := f.lateSubscribe, f.lateID
+			if late {
+				f.lateSubscribe = false
+				f.lateID = msg["id"]
+			}
+			f.mu.Unlock()
+			if late {
+				continue
+			}
+			if lateID != nil {
+				conn.WriteJSON(map[string]interface{}{"type": "subscribe_error", "id": lateID,
+					"errors": []map[string]interface{}{{"errorType": "UnauthorizedException", "message": "late"}}})
+			}
 			f.mu.Lock()
 			refuse := f.refuseSubscribes > 0
 			if refuse {

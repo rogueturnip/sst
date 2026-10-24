@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -176,6 +177,9 @@ var (
 	readyInterval = 500 * time.Millisecond
 )
 
+// How long a subscribe waits for the Event API's answer
+var subscribeTimeout = 3 * time.Second
+
 // How long a connect has for its WebSocket handshake, and then for the Event
 // API's answer to it. AppSync answers in well under a second.
 var connectTimeout = 5 * time.Second
@@ -238,7 +242,7 @@ func passes(status int) bool {
 // Transient is whether a dial's error can pass on its own: an Event API that
 // can't be found yet, as a new one can't for its first second or two, a
 // throttle or a server error, a name that doesn't resolve yet, or a connection
-// refused. Credentials AppSync doesn't take, a failure to get them, a TLS
+// refused, reset or timed out. Credentials AppSync doesn't take, a failure to get them, a TLS
 // problem or a done context won't.
 func Transient(err error) bool {
 	var connectErr *ConnectError
@@ -255,7 +259,8 @@ func Transient(err error) bool {
 		errors.As(err, &dnsErr):
 		return true
 	case errors.As(err, &opErr):
-		return opErr.Op == "dial"
+		return opErr.Op == "dial" && (errors.Is(err, syscall.ECONNREFUSED) ||
+			errors.Is(err, syscall.ECONNRESET) || opErr.Timeout())
 	}
 	return false
 }
@@ -469,22 +474,25 @@ func (c *Connection) Reconnect(ctx context.Context) {
 
 func (c *Connection) Subscribe(ctx context.Context, channel string) (chan string, error) {
 	out := make(chan string, 1000)
-	subscriptionID := id.Ascending()
-	c.setSubscription(subscriptionID, SubscriptionInfo{
-		Channel: channel,
-		Out:     out,
-	})
 	// A namespace just created turns down subscribes for its first second or
 	// so, as an Event API just created does connects, so a subscribe that's
 	// turned down or not answered is tried again for up to readyTimeout. On
 	// error, out is still returned: the subscription stays registered and is
 	// retried on the next reconnect.
+	// Each try has its own ID, so a late answer to one isn't taken for the
+	// next one's.
 	deadline := time.Now().Add(readyTimeout)
 	for {
+		subscriptionID := id.Ascending()
+		c.setSubscription(subscriptionID, SubscriptionInfo{
+			Channel: channel,
+			Out:     out,
+		})
 		err := c.subscribe(ctx, channel, subscriptionID)
 		if err == nil || !errors.Is(err, ErrSubscriptionFailed) || ctx.Err() != nil || time.Now().After(deadline) {
 			return out, err
 		}
+		c.deleteSubscription(subscriptionID)
 		log.Info("subscribe failed, trying again", "channel", channel)
 		select {
 		case <-ctx.Done():
@@ -499,6 +507,12 @@ func (c *Connection) subscription(id string) (SubscriptionInfo, bool) {
 	defer c.subscriptionsLock.Unlock()
 	item, ok := c.subscriptions[id]
 	return item, ok
+}
+
+func (c *Connection) deleteSubscription(id string) {
+	c.subscriptionsLock.Lock()
+	defer c.subscriptionsLock.Unlock()
+	delete(c.subscriptions, id)
 }
 
 func (c *Connection) setSubscription(id string, item SubscriptionInfo) {
@@ -550,7 +564,7 @@ func (c *Connection) subscribe(ctx context.Context, channel string, subscription
 		}
 		log.Info("subscribed", "channel", channel, "id", subscriptionID)
 		return nil
-	case <-time.After(time.Second * 3):
+	case <-time.After(subscribeTimeout):
 		return ErrSubscriptionFailed
 	}
 }
