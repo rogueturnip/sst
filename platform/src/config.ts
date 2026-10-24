@@ -331,8 +331,9 @@ export interface App {
      *
      * An Event API costs nothing while nothing is sent through it. Running
      * `sst dev` needs `appsync:ListApis`, `appsync:GetApi`, `appsync:CreateApi`,
-     * `appsync:TagResource` and `appsync:CreateChannelNamespace`, and
-     * `sst remove` needs `appsync:ListApis` and `appsync:DeleteApi`.
+     * `appsync:TagResource`, `appsync:GetChannelNamespace` and
+     * `appsync:CreateChannelNamespace`, and `sst remove` needs
+     * `appsync:ListApis` and `appsync:DeleteApi`.
      *
      * @default `"shared"`
      *

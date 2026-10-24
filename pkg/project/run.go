@@ -810,7 +810,7 @@ func eventLogRestarted(file *os.File, read int64, previewStart []byte) bool {
 
 // how long sst remove gives AppSync to list the Event APIs and remove the
 // stage's, so one that doesn't answer can't hold the remove up
-var removeAppSyncTimeout = 30 * time.Second
+var removeAppSyncTimeout = 10 * time.Second
 
 // removeAppSync removes the stage's own Event API, which "dev.appsync" set to
 // "stage" has sst dev create. It's looked for whatever "dev.appsync" is now, as

@@ -41,6 +41,13 @@ type fakeEventAPI struct {
 	refuse int
 	// silent is how many connects to never answer
 	silent int
+	// refuseWith is the error a refused connect gets, AppSync's for an Event
+	// API it can't find yet unless it's set
+	refuseWith map[string]interface{}
+	// refuseSubscribes is how many subscribes to answer with an error, as a
+	// namespace just created does
+	refuseSubscribes int
+	subscribeErrors  int
 	// refused is how many it turned down, and closedRefused how many of those
 	// sockets the client closed
 	refused         int
@@ -97,9 +104,12 @@ func (f *fakeEventAPI) serveSocket(conn *websocket.Conn) {
 	if f.refuse > 0 {
 		f.refuse--
 		f.refused++
+		refuseWith := f.refuseWith
 		f.mu.Unlock()
-		conn.WriteJSON(map[string]interface{}{"type": "connection_error", "errors": []map[string]interface{}{
-			{"errorCode": 404, "errorType": "ResourceNotFoundException", "message": "Unable to find the Api."}}})
+		if refuseWith == nil {
+			refuseWith = map[string]interface{}{"errorCode": 404, "errorType": "ResourceNotFoundException", "message": "Unable to find the Api."}
+		}
+		conn.WriteJSON(map[string]interface{}{"type": "connection_error", "errors": []map[string]interface{}{refuseWith}})
 		// AppSync leaves the socket open, so it's the client that closes it
 		var msg map[string]interface{}
 		for conn.ReadJSON(&msg) == nil {
@@ -128,6 +138,18 @@ func (f *fakeEventAPI) serveSocket(conn *websocket.Conn) {
 		}
 		switch msg["type"] {
 		case "subscribe":
+			f.mu.Lock()
+			refuse := f.refuseSubscribes > 0
+			if refuse {
+				f.refuseSubscribes--
+				f.subscribeErrors++
+			}
+			f.mu.Unlock()
+			if refuse {
+				conn.WriteJSON(map[string]interface{}{"type": "subscribe_error", "id": msg["id"],
+					"errors": []map[string]interface{}{{"errorType": "UnauthorizedException", "message": "You are not authorized to make this call."}}})
+				continue
+			}
 			conn.WriteJSON(map[string]interface{}{"type": "subscribe_success", "id": msg["id"]})
 		case "publish":
 			f.mu.Lock()

@@ -53,6 +53,7 @@ type appsyncClient interface {
 	GetApi(context.Context, *appsyncSdk.GetApiInput, ...func(*appsyncSdk.Options)) (*appsyncSdk.GetApiOutput, error)
 	CreateApi(context.Context, *appsyncSdk.CreateApiInput, ...func(*appsyncSdk.Options)) (*appsyncSdk.CreateApiOutput, error)
 	CreateChannelNamespace(context.Context, *appsyncSdk.CreateChannelNamespaceInput, ...func(*appsyncSdk.Options)) (*appsyncSdk.CreateChannelNamespaceOutput, error)
+	GetChannelNamespace(context.Context, *appsyncSdk.GetChannelNamespaceInput, ...func(*appsyncSdk.Options)) (*appsyncSdk.GetChannelNamespaceOutput, error)
 	DeleteApi(context.Context, *appsyncSdk.DeleteApiInput, ...func(*appsyncSdk.Options)) (*appsyncSdk.DeleteApiOutput, error)
 }
 
@@ -105,6 +106,13 @@ func resolveAppSync(ctx context.Context, client appsyncClient, scope AppSyncScop
 		if err != nil {
 			return nil, err
 		}
+		// only for a stage's, as the shared API's credentials needn't read
+		// namespaces
+		if scope != (AppSyncScope{}) {
+			if err := ensureAppSyncNamespace(ctx, client, match.Api.ApiId); err != nil {
+				return nil, err
+			}
+		}
 		return appsyncResult(match.Api, scope), nil
 	}
 	return createAppSync(ctx, client, scope)
@@ -147,10 +155,7 @@ func appsyncMatches(api appsyncTypes.Api, scope AppSyncScope) bool {
 }
 
 func createAppSync(ctx context.Context, client appsyncClient, scope AppSyncScope) (*AppSync, error) {
-	authModes := []appsyncTypes.AuthMode{
-		{AuthType: appsyncTypes.AuthenticationTypeAwsIam},
-		{AuthType: appsyncTypes.AuthenticationTypeApiKey},
-	}
+	authModes := appsyncAuthModes()
 	input := &appsyncSdk.CreateApiInput{
 		Name: aws.String(appsyncName(scope)),
 		EventConfig: &appsyncTypes.EventConfig{
@@ -174,12 +179,7 @@ func createAppSync(ctx context.Context, client appsyncClient, scope AppSyncScope
 	if err != nil {
 		return nil, err
 	}
-	_, err = client.CreateChannelNamespace(ctx, &appsyncSdk.CreateChannelNamespaceInput{
-		Name:               aws.String(appsyncNamespace),
-		ApiId:              api.Api.ApiId,
-		PublishAuthModes:   authModes,
-		SubscribeAuthModes: authModes,
-	})
+	err = createAppSyncNamespace(ctx, client, api.Api.ApiId)
 	if err != nil {
 		// an API without its namespace would be found again and not work, so
 		// it goes, and the next sst dev creates it again
@@ -190,6 +190,39 @@ func createAppSync(ctx context.Context, client appsyncClient, scope AppSyncScope
 	}
 	slog.Info("created appsync event api", "name", aws.ToString(api.Api.Name), "dns", api.Api.Dns)
 	return appsyncResult(api.Api, scope), nil
+}
+
+// ensureAppSyncNamespace gives an Event API that was found its sst namespace,
+// if it's without one, as when sst dev was stopped between creating the two
+func ensureAppSyncNamespace(ctx context.Context, client appsyncClient, apiID *string) error {
+	_, err := client.GetChannelNamespace(ctx, &appsyncSdk.GetChannelNamespaceInput{
+		ApiId: apiID,
+		Name:  aws.String(appsyncNamespace),
+	})
+	var notFound *appsyncTypes.NotFoundException
+	if !errors.As(err, &notFound) {
+		return err
+	}
+	slog.Info("creating the namespace of an appsync event api without one", "api", aws.ToString(apiID))
+	return createAppSyncNamespace(ctx, client, apiID)
+}
+
+func createAppSyncNamespace(ctx context.Context, client appsyncClient, apiID *string) error {
+	authModes := appsyncAuthModes()
+	_, err := client.CreateChannelNamespace(ctx, &appsyncSdk.CreateChannelNamespaceInput{
+		Name:               aws.String(appsyncNamespace),
+		ApiId:              apiID,
+		PublishAuthModes:   authModes,
+		SubscribeAuthModes: authModes,
+	})
+	return err
+}
+
+func appsyncAuthModes() []appsyncTypes.AuthMode {
+	return []appsyncTypes.AuthMode{
+		{AuthType: appsyncTypes.AuthenticationTypeAwsIam},
+		{AuthType: appsyncTypes.AuthenticationTypeApiKey},
+	}
 }
 
 func removeAppSync(ctx context.Context, client appsyncClient, scope AppSyncScope) error {

@@ -105,6 +105,17 @@ func (f *fakeAppSync) CreateChannelNamespace(ctx context.Context, in *appsyncSdk
 	return &appsyncSdk.CreateChannelNamespaceOutput{}, nil
 }
 
+func (f *fakeAppSync) GetChannelNamespace(ctx context.Context, in *appsyncSdk.GetChannelNamespaceInput, _ ...func(*appsyncSdk.Options)) (*appsyncSdk.GetChannelNamespaceOutput, error) {
+	f.lock.Lock()
+	defer f.lock.Unlock()
+	for _, name := range f.namespaces[*in.ApiId] {
+		if name == *in.Name {
+			return &appsyncSdk.GetChannelNamespaceOutput{ChannelNamespace: &appsyncTypes.ChannelNamespace{Name: in.Name}}, nil
+		}
+	}
+	return nil, &appsyncTypes.NotFoundException{}
+}
+
 func (f *fakeAppSync) DeleteApi(ctx context.Context, in *appsyncSdk.DeleteApiInput, _ ...func(*appsyncSdk.Options)) (*appsyncSdk.DeleteApiOutput, error) {
 	f.lock.Lock()
 	defer f.lock.Unlock()
@@ -224,6 +235,43 @@ func TestResolveAppSyncStageCreatesItTagged(t *testing.T) {
 	}
 	if again.Arn != got.Arn || fake.created != 1 {
 		t.Fatalf("found %+v after creating %d", again, fake.created)
+	}
+}
+
+// A stage's API left without its namespace, as by an sst dev that was stopped
+// between creating the two, gets it when it's found.
+func TestResolveAppSyncGivesAStagesApiItsNamespace(t *testing.T) {
+	fake := &fakeAppSync{}
+	id := fake.add(appsyncName(stage), stageTags(stage.App, stage.Stage), time.Now())
+
+	if _, err := resolveAppSync(context.Background(), fake, stage); err != nil {
+		t.Fatal(err)
+	}
+	if ns := fake.namespaces[id]; len(ns) != 1 || ns[0] != "sst" {
+		t.Fatalf("namespaces %v, want [sst]", ns)
+	}
+	// and one that has it isn't given another
+	if _, err := resolveAppSync(context.Background(), fake, stage); err != nil {
+		t.Fatal(err)
+	}
+	if ns := fake.namespaces[id]; len(ns) != 1 {
+		t.Fatalf("namespaces %v after finding it again", ns)
+	}
+	if fake.created != 0 {
+		t.Fatalf("created %d apis", fake.created)
+	}
+}
+
+// The shared API's namespace isn't looked at, as its credentials needn't
+// reach it, and that's as before.
+func TestResolveAppSyncSharedDoesNotTouchItsNamespace(t *testing.T) {
+	fake := &fakeAppSync{}
+	id := fake.add("sst", nil, time.Now())
+	if _, err := resolveAppSync(context.Background(), fake, AppSyncScope{}); err != nil {
+		t.Fatal(err)
+	}
+	if ns := fake.namespaces[id]; len(ns) != 0 {
+		t.Fatalf("namespaces %v, want none made", ns)
 	}
 }
 

@@ -379,9 +379,42 @@ func TestDialWhenReadyReturnsAPermanentErrorAtOnce(t *testing.T) {
 	}
 }
 
+// Credentials AppSync doesn't take are turned down at the connect, as they
+// are, and that's returned at once, with what AppSync said.
+func TestDialWhenReadyReturnsARefusalThatWontPass(t *testing.T) {
+	setReadyTimings(t, 5*time.Second, 10*time.Millisecond)
+	f := newFakeEventAPI(t, "ack")
+	f.refuse = 1 << 30
+	f.refuseWith = map[string]interface{}{"errorCode": 403, "errorType": "UnrecognizedClientException",
+		"message": "The security token included in the request is invalid."}
+
+	start := time.Now()
+	_, err := dialFake(t, f)
+	if err == nil || !strings.Contains(err.Error(), "UnrecognizedClientException") {
+		t.Fatalf("got %v, want AppSync's error", err)
+	}
+	if !errors.Is(err, ErrConnectionFailed) {
+		t.Fatalf("%v isn't ErrConnectionFailed", err)
+	}
+	if Transient(err) {
+		t.Fatalf("%v counted as transient", err)
+	}
+	if f.refused != 1 {
+		t.Fatalf("dialed %d times, want 1", f.refused)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("took %v", elapsed)
+	}
+}
+
 func TestTransient(t *testing.T) {
 	for _, err := range []error{
 		ErrConnectionFailed,
+		&ConnectError{Code: 404, Type: "ResourceNotFoundException"},
+		&ConnectError{Code: 429, Type: "LimitExceededError"},
+		&ConnectError{Code: 503, Type: "ServiceUnavailable"},
+		&HandshakeError{Status: 404},
+		&HandshakeError{Status: 502},
 		fmt.Errorf("dial: %w", &net.DNSError{Err: "no such host", Name: "abc.appsync-realtime-api.ca-central-1.amazonaws.com", IsNotFound: true}),
 		&net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED},
 		websocket.ErrBadHandshake,
@@ -391,6 +424,10 @@ func TestTransient(t *testing.T) {
 		}
 	}
 	for _, err := range []error{
+		&ConnectError{Code: 403, Type: "UnrecognizedClientException"},
+		&ConnectError{Code: 401, Type: "UnauthorizedException"},
+		&HandshakeError{Status: 403},
+		&HandshakeError{Status: 401},
 		errors.New("token has expired"),
 		context.Canceled,
 		&tls.CertificateVerificationError{Err: errors.New("bad cert")},
@@ -439,6 +476,48 @@ func TestDialWhenReadyReturnsATLSErrorAtOnce(t *testing.T) {
 		t.Fatalf("%v (%T) counted as transient", err, err)
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("took %v", elapsed)
+	}
+}
+
+// A namespace just created turns down the first subscribes to it. Subscribe
+// tries again, so what's published to the channel arrives.
+func TestSubscribeWaitsForANewNamespace(t *testing.T) {
+	setReadyTimings(t, 5*time.Second, 10*time.Millisecond)
+	f := newFakeEventAPI(t, "ack")
+	f.refuseSubscribes = 2
+	conn := f.connection()
+
+	start := time.Now()
+	out, err := conn.Subscribe(context.Background(), "/sst/app/stage/in")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out == nil {
+		t.Fatal("no channel")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("took %v", elapsed)
+	}
+	f.mu.Lock()
+	refused := f.subscribeErrors
+	f.mu.Unlock()
+	if refused != 2 {
+		t.Fatalf("%d subscribes turned down, want 2", refused)
+	}
+}
+
+// A subscribe that's turned down for longer than readyTimeout fails.
+func TestSubscribeGivesUp(t *testing.T) {
+	setReadyTimings(t, 200*time.Millisecond, 10*time.Millisecond)
+	f := newFakeEventAPI(t, "ack")
+	f.refuseSubscribes = 1 << 30
+	conn := f.connection()
+	start := time.Now()
+	if _, err := conn.Subscribe(context.Background(), "/sst/app/stage/in"); !errors.Is(err, ErrSubscriptionFailed) {
+		t.Fatalf("got %v, want ErrSubscriptionFailed", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("took %v", elapsed)
 	}
 }
