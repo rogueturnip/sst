@@ -142,6 +142,10 @@ type fakeRuntime struct {
 	crash atomic.Bool
 	// prints is a line a worker prints before it answers each invocation
 	prints string
+	// recordedLate has Run return only once its worker has answered its first
+	// invocation and asked for its next, as on a busy machine, where sst dev
+	// records a worker it started a while after the worker is running
+	recordedLate bool
 }
 
 func (r *fakeRuntime) Match(runtime string) bool { return runtime == "fake" }
@@ -172,8 +176,16 @@ func (r *fakeRuntime) Run(ctx context.Context, input *runtime.RunInput) (runtime
 	}
 	r.starts.Add(1)
 	logs, output := io.Pipe()
-	w := &fakeWorker{runtime: r, api: "http://" + input.Server + "/2018-06-01/runtime", stop: make(chan struct{}), logs: logs}
+	w := &fakeWorker{runtime: r, api: "http://" + input.Server + "/2018-06-01/runtime", stop: make(chan struct{}), logs: logs, askedAgain: make(chan struct{})}
 	go w.run(ctx, output)
+	if r.recordedLate {
+		select {
+		case <-w.askedAgain:
+			// for the request to reach sst dev
+			time.Sleep(100 * time.Millisecond)
+		case <-time.After(2 * time.Second):
+		}
+	}
 	return w, nil
 }
 
@@ -187,6 +199,8 @@ type fakeWorker struct {
 	stop     chan struct{}
 	stopOnce sync.Once
 	logs     *io.PipeReader
+	// closed as it asks for its next invocation after answering its first
+	askedAgain chan struct{}
 }
 
 func (w *fakeWorker) Stop() { w.stopOnce.Do(func() { close(w.stop) }) }
@@ -229,6 +243,13 @@ func (w *fakeWorker) run(ctx context.Context, output *io.PipeWriter) {
 			case <-next.Done():
 			}
 		}()
+		if invoked {
+			select {
+			case <-w.askedAgain:
+			default:
+				close(w.askedAgain)
+			}
+		}
 		req, _ := http.NewRequestWithContext(next, "GET", w.api+"/invocation/next", nil)
 		resp, err := http.DefaultClient.Do(req)
 		if idle != nil {

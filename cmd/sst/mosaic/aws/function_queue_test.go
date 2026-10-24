@@ -42,6 +42,51 @@ func TestWorkerExitWithQueuedInvocation(t *testing.T) {
 	}
 }
 
+// A worker that's running before sst dev has recorded it, as on a busy
+// machine, counts what it does then: it asked for an invocation, so it started,
+// and when it exits with one queued it's started again for it. Before, its
+// requests went uncounted, it was taken for one that failed as it started, and
+// the invocation was dropped with it.
+func TestWorkerRecordedLateIsStartedAgainForItsQueue(t *testing.T) {
+	h := newHarness(t, &fakeRuntime{handle: echo, idle: 100 * time.Millisecond, exitDelay: time.Second, recordedLate: true})
+	h.addFunction("Fn")
+	b := h.bridge("Fn")
+	if _, err := b.invoke("first"); err != nil {
+		t.Fatal(err)
+	}
+	// the worker exits on idle, and sst dev hasn't noticed yet
+	time.Sleep(300 * time.Millisecond)
+	got, err := b.invoke("second")
+	if err != nil {
+		t.Fatalf("invocation after a worker recorded late exited: %v", err)
+	}
+	if got != "echo second" {
+		t.Fatalf("got %q, want %q", got, "echo second")
+	}
+}
+
+// A streamed function's worker that answers before sst dev has recorded it has
+// its answer streamed, as it would after. Before, sst dev didn't know the
+// worker yet, so it sent the answer as a whole reply.
+func TestWorkerRecordedLateStreams(t *testing.T) {
+	h := newHarness(t, &fakeRuntime{handle: echo, recordedLate: true})
+	h.addFunction("Fn")
+	responses := bus.Subscribe(&FunctionResponseEvent{})
+	defer bus.Unsubscribe(responses)
+	b := h.bridgeWithEnv("Fn", []string{"SST_FUNCTION_STREAMING=true"})
+	if _, err := b.invoke("first"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case evt := <-responses:
+		if got := string(evt.(*FunctionResponseEvent).Output); got != "[streaming response]" {
+			t.Fatalf("the first answer went as %q, want it streamed", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no response")
+	}
+}
+
 // When a worker that exits with an invocation queued can't be started again, the
 // invocation fails straight away, instead of at Lambda's timeout, and isn't
 // left queued for the next worker the bridge gets.

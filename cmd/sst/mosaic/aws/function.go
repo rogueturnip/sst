@@ -287,9 +287,6 @@ func function(ctx context.Context, input input) {
 	input.server.Mux.HandleFunc(`/lambda/{workerID}/2018-06-01/runtime/invocation/next`, func(w http.ResponseWriter, r *http.Request) {
 		log.Info("got next request", "workerID", r.PathValue("workerID"))
 		workerID := r.PathValue("workerID")
-		// A first request that comes before the worker is recorded, just after
-		// it starts, doesn't count. It still takes what's queued, and the
-		// worker asks again once it has answered, which does.
 		stateMu.Lock()
 		info, ok := workers[workerID]
 		if ok {
@@ -549,6 +546,27 @@ func function(ctx context.Context, input input) {
 		if !ok {
 			return false, "Function failed to start"
 		}
+		streaming := false
+		for _, e := range workerEnv[workerID] {
+			if e == "SST_FUNCTION_STREAMING=true" {
+				streaming = true
+				break
+			}
+		}
+		// The worker is recorded before it starts, not once it has, so what it
+		// does as soon as it runs is its own: its first request for an
+		// invocation, its answer, its error, what it prints. On a busy machine
+		// it can answer an invocation before Run returns. Its Worker is set once
+		// it has. Nothing stops a worker but this loop, which is here till then.
+		info := &WorkerInfo{
+			FunctionID: functionID,
+			WorkerID:   workerID,
+			Streaming:  streaming,
+		}
+		stateMu.Lock()
+		previous, hadPrevious := workers[workerID]
+		workers[workerID] = info
+		stateMu.Unlock()
 		worker, err := input.project.Runtime.Run(ctx, &runtime.RunInput{
 			CfgPath:    input.project.PathConfig(),
 			Runtime:    target.Runtime,
@@ -559,22 +577,21 @@ func function(ctx context.Context, input input) {
 			Env:        workerEnv[workerID],
 		})
 		if err != nil {
+			stateMu.Lock()
+			if workers[workerID] == info {
+				if hadPrevious {
+					workers[workerID] = previous
+				} else {
+					delete(workers, workerID)
+				}
+			}
+			stateMu.Unlock()
 			log.Error("failed to run worker", "error", err)
 			return false, "Function failed to start"
 		}
-		streaming := false
-		for _, e := range workerEnv[workerID] {
-			if e == "SST_FUNCTION_STREAMING=true" {
-				streaming = true
-				break
-			}
-		}
-		info := &WorkerInfo{
-			FunctionID: functionID,
-			Worker:     worker,
-			WorkerID:   workerID,
-			Streaming:  streaming,
-		}
+		stateMu.Lock()
+		info.Worker = worker
+		stateMu.Unlock()
 		go func() {
 			logs := worker.Logs()
 			onLine := func(line string) {
@@ -601,9 +618,6 @@ func function(ctx context.Context, input input) {
 			}
 			workerShutdownChan <- info
 		}()
-		stateMu.Lock()
-		workers[workerID] = info
-		stateMu.Unlock()
 		delete(stoppedAt, workerID)
 
 		return true, ""
