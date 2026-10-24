@@ -167,6 +167,10 @@ var (
 	readyInterval = 500 * time.Millisecond
 )
 
+// How long a connect has for its WebSocket handshake, and then for the Event
+// API's answer to it. AppSync answers in well under a second.
+var connectTimeout = 5 * time.Second
+
 // DialWhenReady dials an Event API, and dials it again while it turns the
 // connect down, as one just created does, for up to readyTimeout. An error
 // that won't pass on its own is returned at once.
@@ -223,8 +227,9 @@ func (c *Connection) connect(ctx context.Context) error {
 
 	// Configure WebSocket dialer with proxy support
 	dialer := websocket.Dialer{
-		Subprotocols:    []string{"aws-appsync-event-ws", "header-" + auth64},
-		TLSClientConfig: dialTLS,
+		Subprotocols:     []string{"aws-appsync-event-ws", "header-" + auth64},
+		TLSClientConfig:  dialTLS,
+		HandshakeTimeout: connectTimeout,
 	}
 
 	// Add proxy support to WebSocket dialer
@@ -248,12 +253,14 @@ func (c *Connection) connect(ctx context.Context) error {
 	c.socketLock.Unlock()
 
 	msg := map[string]interface{}{}
+	conn.SetReadDeadline(time.Now().Add(connectTimeout))
 	err = conn.ReadJSON(&msg)
 	if err != nil {
 		log.Error("write to connection failed", "err", err)
 		conn.Close()
 		return ErrConnectionFailed
 	}
+	conn.SetReadDeadline(time.Time{})
 	log.Info("connect message", "msg", msg)
 	if msg["type"] != "connection_ack" {
 		// AppSync leaves a socket it turned down open

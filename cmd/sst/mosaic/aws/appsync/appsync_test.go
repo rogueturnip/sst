@@ -400,3 +400,45 @@ func TestTransient(t *testing.T) {
 		}
 	}
 }
+
+// A connect that's never answered is given up on and dialed again, so a hung
+// one can't hold sst dev past readyTimeout.
+func TestDialWhenReadyDialsAgainAfterAConnectNobodyAnswers(t *testing.T) {
+	setReadyTimings(t, 5*time.Second, 10*time.Millisecond)
+	old := connectTimeout
+	connectTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { connectTimeout = old })
+	f := newFakeEventAPI(t, "ack")
+	f.silent = 1
+
+	start := time.Now()
+	if _, err := dialFake(t, f); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("took %v", elapsed)
+	}
+}
+
+// A certificate that isn't trusted won't pass on its own, so it's returned at
+// once, not retried for readyTimeout.
+func TestDialWhenReadyReturnsATLSErrorAtOnce(t *testing.T) {
+	setReadyTimings(t, 5*time.Second, 10*time.Millisecond)
+	f := newFakeEventAPI(t, "ack")
+	host := strings.TrimPrefix(f.srv.URL, "https://")
+	start := time.Now()
+	// without the fake's certificate, as dialFake trusts it
+	_, err := DialWhenReady(context.Background(), aws.Config{
+		Region:      "us-east-1",
+		Credentials: credentials.NewStaticCredentialsProvider("AKID", "SECRET", "TOKEN"),
+	}, host, host)
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if Transient(err) {
+		t.Fatalf("%v (%T) counted as transient", err, err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("took %v", elapsed)
+	}
+}

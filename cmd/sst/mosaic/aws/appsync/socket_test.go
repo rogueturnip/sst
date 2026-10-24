@@ -39,6 +39,8 @@ type fakeEventAPI struct {
 	mode string
 	// refuse is how many connects to turn down, as a new Event API does
 	refuse int
+	// silent is how many connects to never answer
+	silent int
 	// refused is how many it turned down, and closedRefused how many of those
 	// sockets the client closed
 	refused         int
@@ -84,6 +86,14 @@ func (f *fakeEventAPI) serveSocket(conn *websocket.Conn) {
 		return
 	}
 	f.mu.Lock()
+	if f.silent > 0 {
+		f.silent--
+		f.mu.Unlock()
+		var msg map[string]interface{}
+		for conn.ReadJSON(&msg) == nil {
+		}
+		return
+	}
 	if f.refuse > 0 {
 		f.refuse--
 		f.refused++

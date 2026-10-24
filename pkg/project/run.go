@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aws/smithy-go"
 	"github.com/pulumi/pulumi/sdk/v3/go/auto/events"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/sst/sst/v3/internal/util"
@@ -827,7 +828,15 @@ func (p *Project) removeAppSync() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), removeAppSyncTimeout)
 	defer cancel()
-	if err := aws.RemoveAppSync(ctx, p.app.Name, p.app.Stage); err != nil {
+	err := aws.RemoveAppSync(ctx, p.app.Name, p.app.Stage)
+	var apiErr smithy.APIError
+	switch {
+	case err == nil:
+	case errors.As(err, &apiErr) && apiErr.ErrorCode() == "AccessDeniedException":
+		// credentials for the shared Event API needn't reach AppSync's control
+		// plane, and a stage that never had one of its own has nothing to remove
+		slog.Info("can't look for the stage's appsync event api", "err", err)
+	default:
 		slog.Warn("failed to remove the stage's appsync event api", "err", err)
 	}
 }
