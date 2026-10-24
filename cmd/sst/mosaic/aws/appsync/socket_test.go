@@ -32,8 +32,14 @@ type fakeEventAPI struct {
 	t   *testing.T
 	srv *httptest.Server
 
-	mu              sync.Mutex
-	mode            string
+	mu   sync.Mutex
+	mode string
+	// refuse is how many connects to turn down, as a new Event API does
+	refuse int
+	// refused is how many it turned down, and closedRefused how many of those
+	// sockets the client closed
+	refused         int
+	closedRefused   int
 	socketPublishes []map[string]interface{}
 	httpPublishes   []string
 }
@@ -46,7 +52,9 @@ func newFakeEventAPI(t *testing.T, mode string) *fakeEventAPI {
 		if r.URL.Path == "/event/realtime" {
 			conn, err := upgrader.Upgrade(w, r, nil)
 			if err != nil {
-				t.Error(err)
+				// a client that gives up mid-handshake, as one whose context
+				// is done does
+				t.Log(err)
 				return
 			}
 			f.serveSocket(conn)
@@ -68,6 +76,23 @@ func (f *fakeEventAPI) serveSocket(conn *websocket.Conn) {
 	if conn.ReadJSON(&init) != nil {
 		return
 	}
+	f.mu.Lock()
+	if f.refuse > 0 {
+		f.refuse--
+		f.refused++
+		f.mu.Unlock()
+		conn.WriteJSON(map[string]interface{}{"type": "connection_error", "errors": []map[string]interface{}{
+			{"errorCode": 404, "errorType": "ResourceNotFoundException", "message": "Unable to find the Api."}}})
+		// AppSync leaves the socket open, so it's the client that closes it
+		var msg map[string]interface{}
+		for conn.ReadJSON(&msg) == nil {
+		}
+		f.mu.Lock()
+		f.closedRefused++
+		f.mu.Unlock()
+		return
+	}
+	f.mu.Unlock()
 	conn.WriteJSON(map[string]interface{}{"type": "connection_ack", "connectionTimeoutMs": 300000})
 	f.mu.Lock()
 	stall := f.mode == "stall"

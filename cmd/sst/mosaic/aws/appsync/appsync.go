@@ -157,6 +157,37 @@ func Dial(
 	return result, nil
 }
 
+// How long DialWhenReady keeps dialing an Event API that turns it down, and
+// how long it waits between dials. One just created turns down the connects of
+// its first second or two after it answers over HTTPS.
+var (
+	readyTimeout  = 10 * time.Second
+	readyInterval = 500 * time.Millisecond
+)
+
+// DialWhenReady dials an Event API, and dials it again while it turns the
+// connect down, as one just created does, for up to readyTimeout.
+func DialWhenReady(
+	ctx context.Context,
+	cfg aws.Config,
+	httpEndpoint string,
+	realtimeEndpoint string,
+) (*Connection, error) {
+	deadline := time.Now().Add(readyTimeout)
+	for {
+		conn, err := Dial(ctx, cfg, httpEndpoint, realtimeEndpoint)
+		if err == nil || ctx.Err() != nil || time.Now().After(deadline) {
+			return conn, err
+		}
+		log.Info("appsync not ready, dialing again", "err", err)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(readyInterval):
+		}
+	}
+}
+
 func (c *Connection) connect(ctx context.Context) error {
 	log.Info("connecting")
 	auth, err := c.getAuth(ctx, map[string]interface{}{})
@@ -199,10 +230,13 @@ func (c *Connection) connect(ctx context.Context) error {
 	err = conn.ReadJSON(&msg)
 	if err != nil {
 		log.Error("write to connection failed", "err", err)
+		conn.Close()
 		return ErrConnectionFailed
 	}
 	log.Info("connect message", "msg", msg)
 	if msg["type"] != "connection_ack" {
+		// AppSync leaves a socket it turned down open
+		conn.Close()
 		return ErrConnectionFailed
 	}
 	duration := time.Millisecond * time.Duration(msg["connectionTimeoutMs"].(float64))

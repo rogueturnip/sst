@@ -761,6 +761,7 @@ loop:
 	}
 
 	if input.Command == "remove" && len(complete.Resources) == 0 {
+		p.removeAppSync()
 		if p.app.State != nil && p.app.State.Purge {
 			if err := provider.Purge(p.home, p.app.Name, p.app.Stage); err != nil {
 				return err
@@ -804,4 +805,23 @@ func eventLogRestarted(file *os.File, read int64, previewStart []byte) bool {
 		return false
 	}
 	return !bytes.Equal(start, previewStart)
+}
+
+// removeAppSync removes the stage's own Event API, which "dev.appsync" set to
+// "stage" has sst dev create. It's looked for whatever "dev.appsync" is now, as
+// it may have been "stage" when sst dev ran. The remove doesn't fail without
+// it: a stage that never ran sst dev doesn't have one, and its credentials may
+// not reach AppSync.
+func (p *Project) removeAppSync() {
+	unknown, ok := p.Provider("aws")
+	if !ok {
+		return
+	}
+	aws, ok := unknown.(*provider.AwsProvider)
+	if !ok {
+		return
+	}
+	if err := aws.RemoveAppSync(context.Background(), p.app.Name, p.app.Stage); err != nil {
+		slog.Warn("failed to remove the stage's appsync event api", "err", err)
+	}
 }

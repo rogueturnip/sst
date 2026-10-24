@@ -2,6 +2,7 @@ package appsync
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -236,5 +237,109 @@ func TestPublishGivesUpAfterItsTimeout(t *testing.T) {
 	}
 	if took := time.Since(start); took > 5*time.Second {
 		t.Fatalf("Publish() took %v, want it to stop after %v", took, publishTimeout)
+	}
+}
+
+// dialFake dials the fake with DialWhenReady, as sst dev dials AppSync.
+func dialFake(t *testing.T, f *fakeEventAPI) (*Connection, error) {
+	t.Helper()
+	tlsConfig := dialTLS
+	dialTLS = f.srv.Client().Transport.(*http.Transport).TLSClientConfig
+	t.Cleanup(func() { dialTLS = tlsConfig })
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	host := strings.TrimPrefix(f.srv.URL, "https://")
+	return DialWhenReady(ctx, aws.Config{
+		Region:      "us-east-1",
+		Credentials: credentials.NewStaticCredentialsProvider("AKID", "SECRET", "TOKEN"),
+	}, host, host)
+}
+
+func setReadyTimings(t *testing.T, timeout, interval time.Duration) {
+	t.Helper()
+	oldTimeout, oldInterval := readyTimeout, readyInterval
+	readyTimeout, readyInterval = timeout, interval
+	t.Cleanup(func() { readyTimeout, readyInterval = oldTimeout, oldInterval })
+}
+
+func TestDialWhenReadyWaitsForANewEventAPI(t *testing.T) {
+	setReadyTimings(t, 5*time.Second, 10*time.Millisecond)
+	f := newFakeEventAPI(t, "ack")
+	f.refuse = 2
+
+	conn, err := dialFake(t, f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conn == nil {
+		t.Fatal("no connection")
+	}
+	// and it works
+	out, err := conn.Subscribe(context.Background(), "/sst/app/stage/x")
+	if err != nil || out == nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	waitFor(t, func() bool {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return f.closedRefused == 2
+	})
+	if f.refused != 2 {
+		t.Fatalf("refused %d connects, want 2", f.refused)
+	}
+}
+
+func TestDialWhenReadyGivesUp(t *testing.T) {
+	setReadyTimings(t, 200*time.Millisecond, 10*time.Millisecond)
+	f := newFakeEventAPI(t, "ack")
+	f.refuse = 1 << 30
+
+	start := time.Now()
+	_, err := dialFake(t, f)
+	if !errors.Is(err, ErrConnectionFailed) {
+		t.Fatalf("got %v, want ErrConnectionFailed", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("gave up after %v", elapsed)
+	}
+	// every refused socket was closed, none left open
+	waitFor(t, func() bool {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return f.refused > 1 && f.closedRefused == f.refused
+	})
+}
+
+func TestDialWhenReadyStopsWithTheContext(t *testing.T) {
+	setReadyTimings(t, time.Minute, 10*time.Millisecond)
+	f := newFakeEventAPI(t, "ack")
+	f.refuse = 1 << 30
+	tlsConfig := dialTLS
+	dialTLS = f.srv.Client().Transport.(*http.Transport).TLSClientConfig
+	t.Cleanup(func() { dialTLS = tlsConfig })
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	host := strings.TrimPrefix(f.srv.URL, "https://")
+	start := time.Now()
+	_, err := DialWhenReady(ctx, aws.Config{
+		Region:      "us-east-1",
+		Credentials: credentials.NewStaticCredentialsProvider("AKID", "SECRET", "TOKEN"),
+	}, host, host)
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("stopped after %v", elapsed)
+	}
+}
+
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
