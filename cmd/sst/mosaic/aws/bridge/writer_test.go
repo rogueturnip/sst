@@ -182,13 +182,15 @@ func (c *socketPackets) Subscribe(ctx context.Context, channel string) (chan str
 }
 
 // A message goes over the socket only when its writer is told to, and only one
-// that fits in one request. A longer one goes in requests over HTTPS, several
-// at once, which keeps the socket under AppSync's limit for the rest.
+// that holds no more than a packet: one of BUFFER_SIZE is 2 packets, the second
+// empty. A longer one goes in requests over HTTPS, several at once, so a write
+// to the socket is no larger than a packet, as its timeout is sized for, and
+// the socket stays under AppSync's limit for the rest.
 func TestWriterPublishesOverTheSocketWhenTold(t *testing.T) {
 	conn := &socketPackets{}
 	w := newWriter(conn, "source", "channel", MessageResponse)
 	w.SetOverSocket(true)
-	if _, err := w.Write(bytes.Repeat([]byte("x"), BUFFER_SIZE+5)); err != nil {
+	if _, err := w.Write(bytes.Repeat([]byte("x"), BUFFER_SIZE)); err != nil {
 		t.Fatal(err)
 	}
 	if err := w.Close(); err != nil {
@@ -196,6 +198,19 @@ func TestWriterPublishesOverTheSocketWhenTold(t *testing.T) {
 	}
 	if conn.overSocket != 2 || conn.overHTTPS != 0 {
 		t.Fatalf("published %d packets over the socket and %d over HTTPS, want 2 and 0", conn.overSocket, conn.overHTTPS)
+	}
+
+	conn = &socketPackets{}
+	w = newWriter(conn, "source", "channel", MessageResponse)
+	w.SetOverSocket(true)
+	if _, err := w.Write(bytes.Repeat([]byte("x"), BUFFER_SIZE+5)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if conn.overSocket != 0 || conn.overHTTPS != 2 {
+		t.Fatalf("a message of more than a packet went %d over the socket and %d over HTTPS, want 0 and 2", conn.overSocket, conn.overHTTPS)
 	}
 
 	conn = &socketPackets{}

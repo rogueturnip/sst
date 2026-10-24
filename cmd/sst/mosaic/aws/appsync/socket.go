@@ -116,7 +116,10 @@ func (s *socket) handle(msg map[string]interface{}) bool {
 	publishID, _ := msg["id"].(string)
 	switch msg["type"] {
 	case "publish_success":
-		// a publish has one event, so one that failed is all of it
+		// A publish that lists any of its events as failed is taken as failed
+		// whole, so PublishBatchOverSocket publishes all of them over HTTPS,
+		// the ones AppSync took as well. The bridge's receiver drops a packet it
+		// has already, as it does Publish's retries.
 		if failed, ok := msg["failed"].([]interface{}); ok && len(failed) > 0 {
 			s.resolve(publishID, fmt.Errorf("event not published: %v", failed))
 			return true
@@ -200,7 +203,8 @@ func (c *Connection) PublishOverSocket(ctx context.Context, channel string, even
 // PublishBatchOverSocket publishes several events in one message over the
 // WebSocket, as PublishOverSocket does one, or with PublishBatch over HTTPS. An
 // event over AppSync's 240 KB closes the socket, and its subscription, where
-// over HTTPS only that event fails, so it's for events well under it.
+// over HTTPS only that event fails, so it's for events well under it. A write
+// has socketWriteTimeout, so it's for a batch no larger than an event.
 func (c *Connection) PublishBatchOverSocket(ctx context.Context, channel string, events []interface{}) error {
 	err := c.publishOverSocket(ctx, channel, events)
 	if err == nil {
