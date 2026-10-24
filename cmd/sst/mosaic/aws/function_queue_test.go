@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sst/sst/v3/cmd/sst/mosaic/watcher"
 	"github.com/sst/sst/v3/pkg/bus"
 	"github.com/sst/sst/v3/pkg/project"
 )
@@ -111,6 +112,64 @@ func TestLinesAreTiedToTheirInvocationWhileTheLoopIsBusy(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("nothing was printed")
+	}
+}
+
+// A worker that takes its first invocation before sst dev has recorded it is
+// running it, so a rebuild leaves it to finish. Before, sst dev didn't know it
+// was busy, stopped it, and the invocation was never answered.
+func TestWorkerRecordedLateIsLeftToFinishThroughARebuild(t *testing.T) {
+	release := make(chan struct{})
+	h := newHarness(t, &fakeRuntime{rebuild: true, recordedAfterTaking: true, handle: func(event string) string {
+		if event == "first" {
+			<-release
+		}
+		return echo(event)
+	}})
+	h.addFunction("Fn")
+	b := h.bridge("Fn")
+	reply := make(chan error, 1)
+	go func() {
+		got, err := b.invoke("first")
+		if err == nil && got != "echo first" {
+			err = errors.New("got " + got)
+		}
+		reply <- err
+	}()
+	// the worker has the invocation, and sst dev has recorded it since
+	for start := time.Now(); h.runtime.starts.Load() == 0; time.Sleep(time.Millisecond) {
+		if time.Since(start) > 5*time.Second {
+			t.Fatal("the worker never started")
+		}
+	}
+	time.Sleep(500 * time.Millisecond)
+	bus.Publish(&watcher.FileChangedEvent{Path: "src/handler.ts"})
+	time.Sleep(500 * time.Millisecond)
+	close(release)
+	if err := <-reply; err != nil {
+		t.Fatalf("the invocation running through a rebuild: %v", err)
+	}
+}
+
+// A worker that fails an invocation before sst dev has recorded it has its error
+// shown, as after. Before, sst dev didn't know whose it was, so it published
+// none.
+func TestWorkerRecordedLateShowsItsError(t *testing.T) {
+	h := newHarness(t, &fakeRuntime{handle: echo, recordedLate: true, failInvocations: true})
+	h.addFunction("Fn")
+	errs := bus.Subscribe(&FunctionErrorEvent{})
+	defer bus.Unsubscribe(errs)
+	b := h.bridge("Fn")
+	if _, err := b.invoke("first"); err == nil {
+		t.Fatal("the invocation succeeded, want it to fail")
+	}
+	select {
+	case evt := <-errs:
+		if got := evt.(*FunctionErrorEvent); got.FunctionID != "Fn" || got.ErrorMessage != "echo first" {
+			t.Fatalf("published %+v, want Fn's error", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no error was published")
 	}
 }
 

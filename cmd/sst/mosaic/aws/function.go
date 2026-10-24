@@ -573,6 +573,10 @@ func function(ctx context.Context, input input) {
 		previous, hadPrevious := workers[workerID]
 		workers[workerID] = info
 		stateMu.Unlock()
+		// it isn't stopped while it's recorded, so it's taken out as it's
+		// recorded, and put back if it doesn't start
+		stopped, wasStopped := stoppedAt[workerID]
+		delete(stoppedAt, workerID)
 		worker, err := input.project.Runtime.Run(ctx, &runtime.RunInput{
 			CfgPath:    input.project.PathConfig(),
 			Runtime:    target.Runtime,
@@ -592,6 +596,9 @@ func function(ctx context.Context, input input) {
 				}
 			}
 			stateMu.Unlock()
+			if wasStopped {
+				stoppedAt[workerID] = stopped
+			}
 			log.Error("failed to run worker", "error", err)
 			return false, "Function failed to start"
 		}
@@ -624,7 +631,6 @@ func function(ctx context.Context, input input) {
 			}
 			workerShutdownChan <- info
 		}()
-		delete(stoppedAt, workerID)
 
 		return true, ""
 	}
