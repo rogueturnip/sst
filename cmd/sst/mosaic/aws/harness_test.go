@@ -548,7 +548,6 @@ func TestHarnessReboots(t *testing.T) {
 	}
 }
 
-// Invocations of many environments at once are each served by their own worker.
 // A reboot is counted when sst dev asks for it, though the bridge reads it only
 // with its next invocation, so a test that counts reboots between invocations
 // sees the ones asked before it counted.
@@ -559,12 +558,14 @@ func TestHarnessCountsARebootWhenItsAsked(t *testing.T) {
 	if _, err := b.invoke("first"); err != nil {
 		t.Fatal(err)
 	}
+	// the first can be asked, when it comes before the bridge said it's there
+	reboots := b.reboots.Load()
 	h.appsync.rebootDelay.Store(int64(50 * time.Millisecond))
 	writer := b.client.NewWriter(bridge.MessageReboot, h.prefix+"/"+b.workerID+"/in")
 	if err := sendJSON(writer, bridge.RebootBody{}); err != nil {
 		t.Fatal(err)
 	}
-	if n := b.reboots.Load(); n != 1 {
+	if n := b.reboots.Load() - reboots; n != 1 {
 		t.Fatalf("counted %d reboots once one was sent, want 1", n)
 	}
 	got, err := b.invoke("second")
@@ -574,11 +575,12 @@ func TestHarnessCountsARebootWhenItsAsked(t *testing.T) {
 	if got != "echo second" {
 		t.Fatalf("got %q after the reboot, want %q", got, "echo second")
 	}
-	if n := b.reboots.Load(); n != 1 {
+	if n := b.reboots.Load() - reboots; n != 1 {
 		t.Fatalf("counted %d reboots once the bridge read it, want 1", n)
 	}
 }
 
+// Invocations of many environments at once are each served by their own worker.
 func TestHarnessConcurrentEnvironments(t *testing.T) {
 	h := newHarness(t, &fakeRuntime{handle: echo})
 	h.addFunction("Fn")
