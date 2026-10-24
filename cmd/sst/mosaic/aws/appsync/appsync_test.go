@@ -141,8 +141,9 @@ func TestPublishBatchSendsItsEventsInOneRequest(t *testing.T) {
 	}
 }
 
-// More events than AppSync takes in a publish are an error, without a request.
-func TestPublishBatchTakesAtMostFive(t *testing.T) {
+// More events than AppSync takes in a publish, or none, are an error, without
+// a request.
+func TestPublishBatchTakesOneToFive(t *testing.T) {
 	if MaxBatch != 5 {
 		t.Fatalf("MaxBatch is %d, but AppSync takes 5 events in a publish", MaxBatch)
 	}
@@ -156,6 +157,12 @@ func TestPublishBatchTakesAtMostFive(t *testing.T) {
 	}
 	if err := conn.PublishBatchOverSocket(context.Background(), "c", events); err == nil {
 		t.Fatal("PublishBatchOverSocket() of 6 events = nil, want an error")
+	}
+	if got := srv.count(); got != 0 {
+		t.Fatalf("made %d requests, want none", got)
+	}
+	if err := conn.PublishBatch(context.Background(), "c", nil); err == nil {
+		t.Fatal("PublishBatch() of no events = nil, want an error")
 	}
 	if got := srv.count(); got != 0 {
 		t.Fatalf("made %d requests, want none", got)

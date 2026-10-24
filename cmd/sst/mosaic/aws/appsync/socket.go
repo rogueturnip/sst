@@ -18,8 +18,9 @@ import (
 // and drops the rest without saying which, so the socket is kept under it, and
 // every publish over it is backed by one over HTTPS.
 var (
-	// how many publishes go over the socket in any second, at most
-	socketPublishesPerSecond = 15
+	// how many events go over the socket in any second, at most, counting each
+	// event of a publish, as AppSync may count them, not the publish
+	socketEventsPerSecond = 15
 	// how long a publish waits for AppSync to acknowledge it, before it's
 	// published over HTTPS too. It's acknowledged in a round trip, so one that
 	// takes longer was dropped, or the socket is gone.
@@ -165,7 +166,7 @@ func (b *socketBudget) take(now time.Time, events int) bool {
 		}
 	}
 	b.sent = recent
-	if len(b.sent)+events > socketPublishesPerSecond {
+	if len(b.sent)+events > socketEventsPerSecond {
 		return false
 	}
 	for range events {

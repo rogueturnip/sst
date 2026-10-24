@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -454,7 +455,11 @@ func (c *Connection) getAuth(ctx context.Context, body interface{}) (interface{}
 // 875 KB at once, that's an uplink of 1.5 Mbit/s or more.
 var (
 	publishMinRate = 64 << 10 // bytes a second
-	publishRetries = []time.Duration{
+	// the most of a body that gets the time to send it, about the largest
+	// request the bridge makes, so an event that's larger can't hold a publish
+	// that stalled for minutes
+	publishMostSending = 1 << 20
+	publishRetries     = []time.Duration{
 		100 * time.Millisecond,
 		300 * time.Millisecond,
 		time.Second,
@@ -477,6 +482,9 @@ func (c *Connection) Publish(ctx context.Context, channel string, event interfac
 // Publish does one. AppSync takes up to MaxBatch in a request, so more is an
 // error, not split: the caller decides how to.
 func (c *Connection) PublishBatch(ctx context.Context, channel string, events []interface{}) error {
+	if len(events) == 0 {
+		return errors.New("a publish takes at least one event")
+	}
 	if len(events) > MaxBatch {
 		return fmt.Errorf("a publish takes at most %d events, not %d", MaxBatch, len(events))
 	}
@@ -495,7 +503,7 @@ func (c *Connection) PublishBatch(ctx context.Context, channel string, events []
 	if err != nil {
 		return err
 	}
-	sending := time.Duration(len(body)) * time.Second / time.Duration(publishMinRate)
+	sending := time.Duration(min(len(body), publishMostSending)) * time.Second / time.Duration(publishMinRate)
 	ctx, cancel := context.WithTimeout(ctx, publishTimeout+sending)
 	defer cancel()
 	for attempt := 0; ; attempt++ {

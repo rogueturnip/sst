@@ -412,8 +412,8 @@ func TestPublishOverSocketStaysUnderAppSyncsLimit(t *testing.T) {
 	}
 	wg.Wait()
 	socket, https := f.counts()
-	if socket > socketPublishesPerSecond || socket == 0 || socket+https != 40 {
-		t.Fatalf("published %d over the socket and %d over HTTPS, want at most %d over the socket and 40 in all", socket, https, socketPublishesPerSecond)
+	if socket > socketEventsPerSecond || socket == 0 || socket+https != 40 {
+		t.Fatalf("published %d over the socket and %d over HTTPS, want at most %d over the socket and 40 in all", socket, https, socketEventsPerSecond)
 	}
 }
 
@@ -459,7 +459,7 @@ func TestSocketPublishesAndSubscribesAtOnce(t *testing.T) {
 func TestSocketBudget(t *testing.T) {
 	var b socketBudget
 	now := time.Now()
-	for i := range socketPublishesPerSecond {
+	for i := range socketEventsPerSecond {
 		if !b.take(now.Add(time.Duration(i)*time.Millisecond), 1) {
 			t.Fatalf("publish %d refused, under the limit", i)
 		}
@@ -480,12 +480,12 @@ func TestSocketBudget(t *testing.T) {
 
 	// a publish of several events counts each
 	b = socketBudget{}
-	for i := range socketPublishesPerSecond / 2 {
+	for i := range socketEventsPerSecond / 2 {
 		if !b.take(now.Add(time.Duration(i)*time.Millisecond), 2) {
 			t.Fatalf("publish %d of 2 events refused, under the limit", i)
 		}
 	}
 	if b.take(now.Add(500*time.Millisecond), 2) {
-		t.Fatalf("a publish of 2 events was let through with %d of %d taken", 2*(socketPublishesPerSecond/2), socketPublishesPerSecond)
+		t.Fatalf("a publish of 2 events was let through with %d of %d taken", 2*(socketEventsPerSecond/2), socketEventsPerSecond)
 	}
 }
