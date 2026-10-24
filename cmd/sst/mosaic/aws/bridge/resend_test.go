@@ -135,6 +135,57 @@ func TestStreamGetsAPacketThatWasLost(t *testing.T) {
 	}
 }
 
+// A stream that goes on writing past a packet that was lost has it filled in
+// as it goes, a gap's wait after it was lost, not once the stream ends: a
+// stream can be long, and its caller reads it as it comes.
+func TestStreamGetsALostPacketWhileItGoesOn(t *testing.T) {
+	soon(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	appsync := newLossyAppSync(func(p Packet) bool { return p.Type == MessageResponse && p.Index == 3 })
+	dev := NewClient(ctx, appsync, "dev", "/sst/app/stage")
+	fn := NewClient(ctx, appsync, "worker", "/sst/app/stage/worker")
+	fn.AskForMissingOn("/sst/app/stage/in")
+	w := dev.NewWriter(MessageResponse, "/sst/app/stage/worker/in")
+	w.SetStreaming(true)
+	want := chunks(100)
+	written := make(chan time.Time, 1)
+	go func() {
+		// 100 writes 20 ms apart, 2 s in all, against a gap's wait of 50 ms
+		for _, chunk := range want {
+			w.Write([]byte(chunk))
+			time.Sleep(20 * time.Millisecond)
+		}
+		written <- time.Now()
+		w.Close()
+	}()
+	var msg Message
+	select {
+	case msg = <-fn.Read():
+	case <-time.After(3 * time.Second):
+		t.Fatal("the stream never started")
+	}
+	// read up to past the lost chunk, and note when
+	got := make([]byte, len(strings.Join(want[:10], "")))
+	if _, err := io.ReadFull(msg.Body, got); err != nil {
+		t.Fatal(err)
+	}
+	pastTheGap := time.Now()
+	if string(got) != strings.Join(want[:10], "") {
+		t.Fatalf("got %q, want the first 10 chunks", got)
+	}
+	rest, err := io.ReadAll(msg.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got)+string(rest) != strings.Join(want, "") {
+		t.Fatal("the stream isn't whole")
+	}
+	if done := <-written; !pastTheGap.Before(done.Add(-time.Second)) {
+		t.Fatalf("the lost chunk was filled in %v before the stream was written, want a second or more", done.Sub(pastTheGap))
+	}
+}
+
 // A streamed response that lost its last packets, its end among them, arrives
 // whole: the bridge asks for what came after the last packet it has once it's
 // heard nothing for a while.
@@ -218,7 +269,8 @@ func TestWhenAMessageAsks(t *testing.T) {
 		t.Fatal("a message nothing came of asked")
 	}
 
-	gap := &waiting{next: 2, held: map[int]Packet{4: {}, 6: {}}, lastPacket: start}
+	// the gap opened at start, and packets went on coming past it since
+	gap := &waiting{next: 2, held: map[int]Packet{4: {}, 6: {}}, gapSince: start, lastPacket: start.Add(900 * time.Millisecond)}
 	if _, ok := gap.askFor("m", at(999*time.Millisecond), timing); ok {
 		t.Fatal("asked before it waited on its gap a second")
 	}
@@ -233,6 +285,15 @@ func TestWhenAMessageAsks(t *testing.T) {
 		if _, ok := gap.askFor("m", at(again.at), timing); ok != again.ask {
 			t.Fatalf("at %v asked %v, want %v", again.at, ok, again.ask)
 		}
+	}
+
+	many := &waiting{next: 0, held: map[int]Packet{5000: {}}, gapSince: start, lastPacket: start}
+	ask, ok = many.askFor("m", at(time.Second), timing)
+	if !ok || len(ask.Missing) != askAtMostMissing || ask.Missing[0] != 0 || ask.After != 5000 {
+		t.Fatalf("asked for %d missing from %v, after %d, want the first %d, after 5000", len(ask.Missing), ask.Missing[:1], ask.After, askAtMostMissing)
+	}
+	if data, _ := json.Marshal(ask); len(data) > BUFFER_SIZE {
+		t.Fatalf("an ask is %d bytes, more than a packet", len(data))
 	}
 
 	tail := &waiting{next: 5, held: map[int]Packet{}, lastPacket: start}
@@ -259,7 +320,7 @@ func TestSentPacketsAreKeptForAWhile(t *testing.T) {
 	for i := range 3 {
 		s.keep("a/in", packet("a", i), start)
 	}
-	if channel, found := s.find(ResendBody{ID: "a", Missing: []int{1}, After: 1}); channel != "a/in" || len(found) != 2 || found[0].Index != 1 || found[1].Index != 2 {
+	if channel, found := s.find(ResendBody{ID: "a", Missing: []int{1}, After: 1}, start); channel != "a/in" || len(found) != 2 || found[0].Index != 1 || found[1].Index != 2 {
 		t.Fatalf("found %v on %q, want packets 1 and 2 on a/in", found, channel)
 	}
 	// a copy of a packet isn't kept twice
@@ -268,8 +329,16 @@ func TestSentPacketsAreKeptForAWhile(t *testing.T) {
 		t.Fatalf("kept %d bytes, want 30", s.bytes)
 	}
 
+	// one past keepSent is dropped when it's asked for, too
+	if _, found := s.find(ResendBody{ID: "a", After: -1}, start.Add(90*time.Second)); len(found) != 0 || s.bytes != 0 {
+		t.Fatalf("found %d packets, and kept %d bytes, of a message past keepSent", len(found), s.bytes)
+	}
+	for i := range 3 {
+		s.keep("a/in", packet("a", i), start)
+	}
+
 	s.keep("b/in", packet("b", 0), start.Add(2*time.Minute))
-	if _, found := s.find(ResendBody{ID: "a", After: -1}); len(found) != 0 {
+	if _, found := s.find(ResendBody{ID: "a", After: -1}, start.Add(2*time.Minute)); len(found) != 0 {
 		t.Fatalf("kept %d packets of a message past keepSent", len(found))
 	}
 
@@ -279,7 +348,7 @@ func TestSentPacketsAreKeptForAWhile(t *testing.T) {
 	if s.bytes > 100 {
 		t.Fatalf("kept %d bytes, over %d", s.bytes, 100)
 	}
-	_, found := s.find(ResendBody{ID: "b", After: -1})
+	_, found := s.find(ResendBody{ID: "b", After: -1}, start.Add(2*time.Minute))
 	if len(found) != 10 || found[0].Index != 5 {
 		t.Fatalf("kept %d packets from %d, want the last 10", len(found), found[0].Index)
 	}

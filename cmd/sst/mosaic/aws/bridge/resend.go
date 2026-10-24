@@ -27,6 +27,8 @@ var (
 	askAtMost    = 30 * time.Second
 	// how often waiting messages are looked at
 	askEvery = 250 * time.Millisecond
+	// how many missing packets an ask names at most, a few KB of JSON
+	askAtMostMissing = 1000
 )
 
 // askTiming is the ask timings as a Client started, which it keeps.
@@ -45,7 +47,9 @@ func askTimingNow() askTiming {
 }
 
 // The sender keeps a streamed message's packets for keepSent after its last
-// one, at most keepSentBytes of them, in base64, the oldest dropped first.
+// one, at most keepSentBytes of them, in base64, the oldest dropped first. One
+// past keepSent is dropped when another packet is kept, or one is asked for, so
+// what's kept after the last stream is at most keepSentBytes until then.
 var (
 	keepSent      = 2 * time.Minute
 	keepSentBytes = 32 << 20
@@ -133,9 +137,10 @@ func (s *sentPackets) forget(now time.Time) {
 
 // find gives the packets kept that an ask is for, in order, and the channel
 // they went to.
-func (s *sentPackets) find(ask ResendBody) (string, []Packet) {
+func (s *sentPackets) find(ask ResendBody, now time.Time) (string, []Packet) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.forget(now)
 	message, ok := s.messages[ask.ID]
 	if !ok {
 		return "", nil
@@ -157,7 +162,7 @@ func (s *sentPackets) find(ask ResendBody) (string, []Packet) {
 
 // resend publishes again the packets an ask is for, that the Client kept.
 func (c *Client) resend(ctx context.Context, ask ResendBody) {
-	channel, packets := c.sent.find(ask)
+	channel, packets := c.sent.find(ask, time.Now())
 	if len(packets) == 0 {
 		return
 	}
@@ -209,22 +214,25 @@ func readAsk(packet Packet) (ResendBody, bool) {
 // askFor says what a waiting message should ask for now, if anything, and
 // notes that it asked.
 func (m *waiting) askFor(id string, now time.Time, timing askTiming) (ResendBody, bool) {
-	waitedFor := timing.idle
+	// a gap since it opened, or nothing at all since the last packet
+	waitedFor, since := timing.idle, m.lastPacket
 	if len(m.held) > 0 {
-		waitedFor = timing.gap
+		waitedFor, since = timing.gap, m.gapSince
 	}
 	if m.next == 0 && len(m.held) == 0 {
 		// nothing came yet, so there's nothing to ask about
 		return ResendBody{}, false
 	}
-	if now.Sub(m.lastPacket) < waitedFor || now.Before(m.askAgain) {
+	if now.Sub(since) < waitedFor || now.Before(m.askAgain) {
 		return ResendBody{}, false
 	}
 	ask := ResendBody{ID: id, After: m.next - 1}
 	for index := range m.held {
 		ask.After = max(ask.After, index)
 	}
-	for index := m.next; index < ask.After; index++ {
+	// at most askAtMostMissing, so the ask is one packet, which is all its
+	// sender reads: the ones past it are asked for once these come
+	for index := m.next; index < ask.After && len(ask.Missing) < askAtMostMissing; index++ {
 		if _, ok := m.held[index]; !ok {
 			ask.Missing = append(ask.Missing, index)
 		}
