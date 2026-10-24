@@ -463,6 +463,9 @@ var (
 	publishTimeout        = 10 * time.Second
 )
 
+// maxBatch is how many events AppSync takes in one publish.
+const maxBatch = 5
+
 // Publish sends an event to a channel. AppSync throttles a burst of events and
 // sometimes fails a request, so a publish answered with a 429 or a 5xx, or that
 // fails to connect, is tried again. Any other error is returned as is.
@@ -471,8 +474,12 @@ func (c *Connection) Publish(ctx context.Context, channel string, event interfac
 }
 
 // PublishBatch publishes several events to a channel in one request, as
-// Publish does one. AppSync takes up to 5 in a request.
+// Publish does one. AppSync takes up to maxBatch in a request, so more is an
+// error, not split: the caller decides how to.
 func (c *Connection) PublishBatch(ctx context.Context, channel string, events []interface{}) error {
+	if len(events) > maxBatch {
+		return fmt.Errorf("a publish takes at most %d events, not %d", maxBatch, len(events))
+	}
 	encoded := make([]string, len(events))
 	for i, event := range events {
 		eventJson, err := json.Marshal(event)

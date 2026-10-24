@@ -456,10 +456,10 @@ var finishedPerSet = 10_000
 // last packet comes. One that a packet is missing from waits for it, holding
 // the packets that came after. At most maxWaiting messages are kept, the ones
 // coming in as well as the ones waiting, holding at most maxWaitingBytes of
-// packet data, as it's sent, in base64. A message's packets go several requests
-// at once, so a receiver holds a few of each that came early: a burst of 10
-// invocations of 6 MB at once held 21 MB at most. Past either, the one kept longest is
-// dropped. It isn't counted as finished, so a whole copy of it, as the CLI
+// packet data, as it's sent, in base64. A message's packets go in several
+// requests at once, so a receiver holds a few of each that came early: a burst
+// of 10 invocations of 6 MB at once held 21 MB at most. Past either, the one
+// kept longest is dropped. It isn't counted as finished, so a whole copy of it, as the CLI
 // sends of a reply, is still passed on.
 var (
 	maxWaiting      = 10_000

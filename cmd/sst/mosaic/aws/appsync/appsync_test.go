@@ -141,6 +141,21 @@ func TestPublishBatchSendsItsEventsInOneRequest(t *testing.T) {
 	}
 }
 
+// More events than AppSync takes in a publish are an error, without a request.
+func TestPublishBatchTakesAtMostFive(t *testing.T) {
+	conn, srv := connect(t)
+	events := []interface{}{1, 2, 3, 4, 5, 6}
+	if err := conn.PublishBatch(context.Background(), "c", events); err == nil {
+		t.Fatal("PublishBatch() of 6 events = nil, want an error")
+	}
+	if got := srv.count(); got != 0 {
+		t.Fatalf("made %d requests, want none", got)
+	}
+	if err := conn.PublishBatch(context.Background(), "c", events[:5]); err != nil {
+		t.Fatalf("PublishBatch() of 5 events = %v", err)
+	}
+}
+
 func TestPublishRetriesADroppedConnection(t *testing.T) {
 	conn, srv := connect(t, 0)
 	if err := conn.Publish(context.Background(), "c", "event"); err != nil {
