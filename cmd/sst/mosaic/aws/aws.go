@@ -40,6 +40,9 @@ func Start(
 		if ctx.Err() != nil {
 			return nil
 		}
+		if !appsync.Transient(err) {
+			return err
+		}
 		slog.Error("appsync not ready", "err", err)
 		return ErrAppsyncNotReady
 	}

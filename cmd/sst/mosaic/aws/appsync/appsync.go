@@ -8,10 +8,12 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"maps"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -166,7 +168,8 @@ var (
 )
 
 // DialWhenReady dials an Event API, and dials it again while it turns the
-// connect down, as one just created does, for up to readyTimeout.
+// connect down, as one just created does, for up to readyTimeout. An error
+// that won't pass on its own is returned at once.
 func DialWhenReady(
 	ctx context.Context,
 	cfg aws.Config,
@@ -176,7 +179,7 @@ func DialWhenReady(
 	deadline := time.Now().Add(readyTimeout)
 	for {
 		conn, err := Dial(ctx, cfg, httpEndpoint, realtimeEndpoint)
-		if err == nil || ctx.Err() != nil || time.Now().After(deadline) {
+		if err == nil || !Transient(err) || ctx.Err() != nil || time.Now().After(deadline) {
 			return conn, err
 		}
 		log.Info("appsync not ready, dialing again", "err", err)
@@ -186,6 +189,24 @@ func DialWhenReady(
 		case <-time.After(readyInterval):
 		}
 	}
+}
+
+// Transient is whether a dial's error can pass on its own: an Event API that
+// turns the connect down, a name that doesn't resolve yet, a connection
+// refused, or a handshake the endpoint fails, as a new Event API does. A
+// failure to get credentials, a TLS problem or a done context won't.
+func Transient(err error) bool {
+	var dnsErr *net.DNSError
+	var opErr *net.OpError
+	switch {
+	case errors.Is(err, ErrConnectionFailed),
+		errors.Is(err, websocket.ErrBadHandshake),
+		errors.As(err, &dnsErr):
+		return true
+	case errors.As(err, &opErr):
+		return opErr.Op == "dial"
+	}
+	return false
 }
 
 func (c *Connection) connect(ctx context.Context) error {

@@ -119,6 +119,12 @@ func (f *fakeAppSync) DeleteApi(ctx context.Context, in *appsyncSdk.DeleteApiInp
 }
 
 func stageTags(app, stage string) map[string]string {
+	return map[string]string{appsyncTagApp: app, appsyncTagStage: stage, appsyncTagDev: appsyncTagDevValue}
+}
+
+// appTags are the tags the provider puts on every resource of an app, which
+// an Event API the app itself deploys has
+func appTags(app, stage string) map[string]string {
 	return map[string]string{appsyncTagApp: app, appsyncTagStage: stage}
 }
 
@@ -170,6 +176,8 @@ func TestResolveAppSyncStageFindsItsOwnByTags(t *testing.T) {
 	// the same name, but another app's stage: app my-app-alice, stage x
 	fake.add("sst-my-app-alice", stageTags("my", "app-alice"), now)
 	fake.add("sst-my-app-bob", stageTags("my-app", "bob"), now)
+	// the app's own Event API, which has the app's tags, and is older
+	fake.add("my-app-alice-events", appTags("my-app", "alice"), now.Add(-time.Hour))
 	own := fake.add("renamed by hand", stageTags("my-app", "alice"), now)
 
 	got, err := resolveAppSync(context.Background(), fake, stage)
@@ -199,7 +207,7 @@ func TestResolveAppSyncStageCreatesItTagged(t *testing.T) {
 	if *api.Name != "sst-my-app-alice" {
 		t.Fatalf("name %q", *api.Name)
 	}
-	if api.Tags[appsyncTagApp] != "my-app" || api.Tags[appsyncTagStage] != "alice" {
+	if api.Tags[appsyncTagApp] != "my-app" || api.Tags[appsyncTagStage] != "alice" || api.Tags[appsyncTagDev] != appsyncTagDevValue {
 		t.Fatalf("tags %v", api.Tags)
 	}
 	if ns := fake.namespaces[*api.ApiId]; len(ns) != 1 || ns[0] != "sst" {
@@ -302,6 +310,7 @@ func TestRemoveAppSyncRemovesOnlyTheStagesOwn(t *testing.T) {
 	shared := fake.add("sst", nil, now)
 	bob := fake.add("sst-my-app-bob", stageTags("my-app", "bob"), now)
 	other := fake.add("sst-my-app-alice", stageTags("my", "app-alice"), now)
+	appOwn := fake.add("my-app-alice-events", appTags("my-app", "alice"), now)
 	own1 := fake.add("sst-my-app-alice", stageTags("my-app", "alice"), now)
 	own2 := fake.add("sst-my-app-alice", stageTags("my-app", "alice"), now.Add(time.Second))
 	p := &AwsProvider{appsync: fake}
@@ -319,7 +328,7 @@ func TestRemoveAppSyncRemovesOnlyTheStagesOwn(t *testing.T) {
 	for _, api := range fake.apis {
 		left = append(left, *api.ApiId)
 	}
-	if strings.Join(left, ",") != strings.Join([]string{shared, bob, other}, ",") {
+	if strings.Join(left, ",") != strings.Join([]string{shared, bob, other, appOwn}, ",") {
 		t.Fatalf("left %v", left)
 	}
 

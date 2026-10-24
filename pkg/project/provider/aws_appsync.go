@@ -38,6 +38,10 @@ const (
 	appsyncNamespace  = "sst"
 	appsyncTagApp     = "sst:app"
 	appsyncTagStage   = "sst:stage"
+	// every resource of an app has its app and stage tags, an Event API the
+	// app deploys too, so the one sst dev made also has this one
+	appsyncTagDev      = "sst:dev"
+	appsyncTagDevValue = "appsync"
 	// the longest name AppSync takes for an API
 	appsyncNameMax = 50
 )
@@ -54,7 +58,8 @@ type appsyncClient interface {
 
 // ResolveAppSync finds the Event API for a scope, or creates it. The shared one
 // is found by its name, and a stage's by its tags, as names needn't be unique
-// and a stage's name can be cut short. Once found, it's kept for the process.
+// and a stage's name can be cut short. An Event API the app deploys has the
+// stage's tags too, but not sst:dev. Once found, it's kept for the process.
 func (a *AwsProvider) ResolveAppSync(ctx context.Context, scope AppSyncScope) (*AppSync, error) {
 	a.appsyncLock.Lock()
 	defer a.appsyncLock.Unlock()
@@ -136,7 +141,9 @@ func appsyncMatches(api appsyncTypes.Api, scope AppSyncScope) bool {
 	if scope == (AppSyncScope{}) {
 		return aws.ToString(api.Name) == appsyncSharedName
 	}
-	return api.Tags[appsyncTagApp] == scope.App && api.Tags[appsyncTagStage] == scope.Stage
+	return api.Tags[appsyncTagDev] == appsyncTagDevValue &&
+		api.Tags[appsyncTagApp] == scope.App &&
+		api.Tags[appsyncTagStage] == scope.Stage
 }
 
 func createAppSync(ctx context.Context, client appsyncClient, scope AppSyncScope) (*AppSync, error) {
@@ -160,6 +167,7 @@ func createAppSync(ctx context.Context, client appsyncClient, scope AppSyncScope
 		input.Tags = map[string]string{
 			appsyncTagApp:   scope.App,
 			appsyncTagStage: scope.Stage,
+			appsyncTagDev:   appsyncTagDevValue,
 		}
 	}
 	api, err := client.CreateApi(ctx, input)

@@ -6,12 +6,15 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -53,8 +56,12 @@ func newFakeEventAPI(t *testing.T, mode string) *fakeEventAPI {
 			conn, err := upgrader.Upgrade(w, r, nil)
 			if err != nil {
 				// a client that gives up mid-handshake, as one whose context
-				// is done does
-				t.Log(err)
+				// is done does, closes the connection under it, and that's
+				// no failure. It can happen after the test ends, so it isn't
+				// logged either.
+				if !errors.Is(err, net.ErrClosed) && !errors.Is(err, syscall.ECONNRESET) && !errors.Is(err, syscall.EPIPE) {
+					t.Error(err)
+				}
 				return
 			}
 			f.serveSocket(conn)

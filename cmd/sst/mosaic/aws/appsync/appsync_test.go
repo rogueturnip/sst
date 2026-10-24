@@ -2,17 +2,23 @@ package appsync
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/gorilla/websocket"
 )
 
 func TestFailedEvents(t *testing.T) {
@@ -341,5 +347,56 @@ func waitFor(t *testing.T, cond func() bool) {
 			t.Fatal("timed out waiting")
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// failingCredentials can't be retrieved, as with an expired SSO session
+type failingCredentials struct{ calls atomic.Int32 }
+
+func (f *failingCredentials) Retrieve(context.Context) (aws.Credentials, error) {
+	f.calls.Add(1)
+	return aws.Credentials{}, errors.New("token has expired")
+}
+
+func TestDialWhenReadyReturnsAPermanentErrorAtOnce(t *testing.T) {
+	setReadyTimings(t, 5*time.Second, 10*time.Millisecond)
+	f := newFakeEventAPI(t, "ack")
+	creds := &failingCredentials{}
+	host := strings.TrimPrefix(f.srv.URL, "https://")
+	start := time.Now()
+	_, err := DialWhenReady(context.Background(), aws.Config{Region: "us-east-1", Credentials: creds}, host, host)
+	if err == nil || !strings.Contains(err.Error(), "token has expired") {
+		t.Fatalf("got %v, want the credentials' error", err)
+	}
+	if Transient(err) {
+		t.Fatalf("%v counted as transient", err)
+	}
+	if calls := creds.calls.Load(); calls != 1 {
+		t.Fatalf("dialed %d times, want 1", calls)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("took %v", elapsed)
+	}
+}
+
+func TestTransient(t *testing.T) {
+	for _, err := range []error{
+		ErrConnectionFailed,
+		fmt.Errorf("dial: %w", &net.DNSError{Err: "no such host", Name: "abc.appsync-realtime-api.ca-central-1.amazonaws.com", IsNotFound: true}),
+		&net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED},
+		websocket.ErrBadHandshake,
+	} {
+		if !Transient(err) {
+			t.Errorf("%v: want transient", err)
+		}
+	}
+	for _, err := range []error{
+		errors.New("token has expired"),
+		context.Canceled,
+		&tls.CertificateVerificationError{Err: errors.New("bad cert")},
+	} {
+		if Transient(err) {
+			t.Errorf("%v: want permanent", err)
+		}
 	}
 }

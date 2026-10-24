@@ -807,6 +807,10 @@ func eventLogRestarted(file *os.File, read int64, previewStart []byte) bool {
 	return !bytes.Equal(start, previewStart)
 }
 
+// how long sst remove gives AppSync to list the Event APIs and remove the
+// stage's, so one that doesn't answer can't hold the remove up
+var removeAppSyncTimeout = 30 * time.Second
+
 // removeAppSync removes the stage's own Event API, which "dev.appsync" set to
 // "stage" has sst dev create. It's looked for whatever "dev.appsync" is now, as
 // it may have been "stage" when sst dev ran. The remove doesn't fail without
@@ -821,7 +825,9 @@ func (p *Project) removeAppSync() {
 	if !ok {
 		return
 	}
-	if err := aws.RemoveAppSync(context.Background(), p.app.Name, p.app.Stage); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), removeAppSyncTimeout)
+	defer cancel()
+	if err := aws.RemoveAppSync(ctx, p.app.Name, p.app.Stage); err != nil {
 		slog.Warn("failed to remove the stage's appsync event api", "err", err)
 	}
 }
