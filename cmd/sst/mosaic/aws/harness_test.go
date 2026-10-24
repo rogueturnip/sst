@@ -68,6 +68,16 @@ func (f *fakeAppSync) Publish(ctx context.Context, channel string, event interfa
 	return nil
 }
 
+// PublishBatch publishes each event as Publish does, in one request.
+func (f *fakeAppSync) PublishBatch(ctx context.Context, channel string, events []interface{}) error {
+	for _, event := range events {
+		if err := f.Publish(ctx, channel, event); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // PublishBatchOverSocket publishes as Publish does, and counts what went this
 // way, by message type.
 func (f *fakeAppSync) PublishBatchOverSocket(ctx context.Context, channel string, events []interface{}) error {

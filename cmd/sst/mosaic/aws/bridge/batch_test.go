@@ -236,6 +236,16 @@ func TestWriterReturnsAFailedRequestsError(t *testing.T) {
 		t.Errorf("made %d requests, want 1, none after it failed", got)
 	}
 
+	// and a message of one request that failed returns its error again
+	conn = &batchPackets{fail: func(batch []Packet) error { return failure }}
+	w = newWriter(conn, "source", "channel", MessageResponse)
+	if err := w.Close(); !errors.Is(err, failure) {
+		t.Fatalf("Close returned %v, want the request's error", err)
+	}
+	if _, err := w.Write([]byte("x")); !errors.Is(err, failure) {
+		t.Fatalf("a Write after it returned %v, want the request's error", err)
+	}
+
 	// and a message whose last request fails does too
 	conn = &batchPackets{fail: func(batch []Packet) error {
 		if batch[len(batch)-1].Final {

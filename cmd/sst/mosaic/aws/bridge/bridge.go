@@ -171,6 +171,9 @@ const BUFFER_SIZE = 1024 * 128
 // Write, or by Close. The buffer grows as it's written, so a small message
 // allocates about what it holds.
 func (w *Writer) Write(p []byte) (int, error) {
+	if err := w.failed(); err != nil {
+		return 0, err
+	}
 	total := 0
 
 	for total < len(p) {
@@ -241,7 +244,10 @@ func (w *Writer) Flush(final bool) error {
 		for _, packet := range batch {
 			size += len(packet.Data)
 		}
-		return w.publish(batch, w.overSocket && size <= base64.StdEncoding.EncodedLen(BUFFER_SIZE))
+		if err := w.publish(batch, w.overSocket && size <= base64.StdEncoding.EncodedLen(BUFFER_SIZE)); err != nil {
+			w.setFailed(err)
+		}
+		return w.failed()
 	}
 	if final || w.streaming || len(w.batch) == packetsPerPublish {
 		w.send()
@@ -270,11 +276,7 @@ func (w *Writer) send() {
 	go func() {
 		defer close(done)
 		if err := w.publish(batch, false); err != nil {
-			w.errLock.Lock()
-			if w.err == nil {
-				w.err = err
-			}
-			w.errLock.Unlock()
+			w.setFailed(err)
 		}
 	}()
 }
@@ -307,6 +309,15 @@ func (w *Writer) wait() {
 		<-done
 	}
 	w.inFlight = nil
+}
+
+// setFailed keeps the first request that failed, for Write and Close to return.
+func (w *Writer) setFailed(err error) {
+	w.errLock.Lock()
+	defer w.errLock.Unlock()
+	if w.err == nil {
+		w.err = err
+	}
 }
 
 func (w *Writer) failed() error {

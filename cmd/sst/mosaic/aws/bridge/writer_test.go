@@ -84,8 +84,16 @@ func TestWriterSplitsAMessageIntoPackets(t *testing.T) {
 				t.Fatal(err)
 			}
 
+			// a message's requests go at once, so they're published in any order,
+			// but each index once, with none missing
+			seen := map[int]bool{}
+			for _, p := range conn.packets {
+				if p.Index < 0 || p.Index >= len(conn.packets) || seen[p.Index] {
+					t.Fatalf("size %d, chunk %d: packet index %d is out of range or published twice", size, chunk, p.Index)
+				}
+				seen[p.Index] = true
+			}
 			var got []byte
-			// a message's requests go at once, so they're published in any order
 			for i, p := range sortedByIndex(conn.packets) {
 				data, _ := base64.StdEncoding.DecodeString(p.Data)
 				if len(data) > BUFFER_SIZE {
