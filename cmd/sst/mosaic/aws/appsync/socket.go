@@ -194,8 +194,8 @@ func (c *Connection) webSocket() *websocket.Conn {
 // WebSocket where it can, which reaches a subscriber about 50 ms sooner. When
 // the socket is over its share of AppSync's limit, or a publish on it isn't
 // acknowledged in time, is throttled, or the socket is gone, the event is
-// published over HTTPS, with Publish. So a subscriber can get it twice, as
-// with Publish's retries.
+// published over HTTPS, with PublishBatch, as PublishBatchOverSocket does. So
+// a subscriber can get it twice, as with PublishBatch's retries.
 func (c *Connection) PublishOverSocket(ctx context.Context, channel string, event interface{}) error {
 	return c.PublishBatchOverSocket(ctx, channel, []interface{}{event})
 }
