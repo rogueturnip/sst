@@ -460,21 +460,32 @@ func TestSocketBudget(t *testing.T) {
 	var b socketBudget
 	now := time.Now()
 	for i := range socketPublishesPerSecond {
-		if !b.take(now.Add(time.Duration(i) * time.Millisecond)) {
+		if !b.take(now.Add(time.Duration(i)*time.Millisecond), 1) {
 			t.Fatalf("publish %d refused, under the limit", i)
 		}
 	}
-	if b.take(now.Add(500 * time.Millisecond)) {
+	if b.take(now.Add(500*time.Millisecond), 1) {
 		t.Fatal("a publish over the limit was let through")
 	}
-	if !b.take(now.Add(1100 * time.Millisecond)) {
+	if !b.take(now.Add(1100*time.Millisecond), 1) {
 		t.Fatal("a publish a second later was refused")
 	}
 	b.pause(now.Add(1100*time.Millisecond), time.Minute)
-	if b.take(now.Add(5 * time.Second)) {
+	if b.take(now.Add(5*time.Second), 1) {
 		t.Fatal("a publish while paused was let through")
 	}
-	if !b.take(now.Add(2 * time.Minute)) {
+	if !b.take(now.Add(2*time.Minute), 1) {
 		t.Fatal("a publish after the pause was refused")
+	}
+
+	// a publish of several events counts each
+	b = socketBudget{}
+	for i := range socketPublishesPerSecond / 2 {
+		if !b.take(now.Add(time.Duration(i)*time.Millisecond), 2) {
+			t.Fatalf("publish %d of 2 events refused, under the limit", i)
+		}
+	}
+	if b.take(now.Add(500*time.Millisecond), 2) {
+		t.Fatalf("a publish of 2 events was let through with %d of %d taken", 2*(socketPublishesPerSecond/2), socketPublishesPerSecond)
 	}
 }

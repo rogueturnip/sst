@@ -149,8 +149,10 @@ type socketBudget struct {
 	offUntil time.Time
 }
 
-// take says whether a publish can go over the socket now, and counts it if so.
-func (b *socketBudget) take(now time.Time) bool {
+// take says whether a publish of events can go over the socket now, and counts
+// them if so. AppSync may count a publish's events, not the publish, so each
+// counts.
+func (b *socketBudget) take(now time.Time, events int) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if now.Before(b.offUntil) {
@@ -163,10 +165,12 @@ func (b *socketBudget) take(now time.Time) bool {
 		}
 	}
 	b.sent = recent
-	if len(b.sent) >= socketPublishesPerSecond {
+	if len(b.sent)+events > socketPublishesPerSecond {
 		return false
 	}
-	b.sent = append(b.sent, now)
+	for range events {
+		b.sent = append(b.sent, now)
+	}
 	return true
 }
 
@@ -221,7 +225,7 @@ func (c *Connection) PublishBatchOverSocket(ctx context.Context, channel string,
 
 func (c *Connection) publishOverSocket(ctx context.Context, channel string, batch []interface{}) error {
 	s := c.currentSocket()
-	if s == nil || !s.budget.take(time.Now()) {
+	if s == nil || !s.budget.take(time.Now(), len(batch)) {
 		return errSocketUnavailable
 	}
 	events := make([]string, len(batch))
