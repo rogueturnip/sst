@@ -208,8 +208,10 @@ var (
 )
 
 // Flush publishes what's buffered as the message's next packet, or its last.
-// A message's packets are published a batch at a time, in the background, so a
-// failed one is returned by a later Flush, or by Close, which waits for them.
+// A message that fits in one request is published by its last Flush, which
+// returns its error. A longer one's packets are published a batch at a time, in
+// the background, so a failed one is returned by a later Flush, or by Close,
+// which waits for them.
 func (w *Writer) Flush(final bool) error {
 	if !final && len(w.buffer) == 0 {
 		return nil
