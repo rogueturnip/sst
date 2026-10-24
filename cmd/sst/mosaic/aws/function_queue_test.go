@@ -151,6 +151,31 @@ func TestWorkerRecordedLateIsLeftToFinishThroughARebuild(t *testing.T) {
 	}
 }
 
+// A rebuild whose worker can't be started again leaves what was recorded as it
+// was, so once a worker can start, the next invocation gets one and is
+// answered. A worker left recorded without a process would have its invocations
+// queued for good.
+func TestRebuildThatCantStartAWorkerRecoversOnTheNextInvocation(t *testing.T) {
+	h := newHarness(t, &fakeRuntime{handle: echo, rebuild: true})
+	h.addFunction("Fn")
+	b := h.bridge("Fn")
+	if _, err := b.invoke("first"); err != nil {
+		t.Fatal(err)
+	}
+	h.runtime.failRuns.Store(true)
+	bus.Publish(&watcher.FileChangedEvent{Path: "src/handler.ts"})
+	// the rebuild stops the worker, and starting it again fails
+	time.Sleep(500 * time.Millisecond)
+	h.runtime.failRuns.Store(false)
+	got, err := b.invoke("second")
+	if err != nil {
+		t.Fatalf("invocation after a worker failed to start: %v", err)
+	}
+	if got != "echo second" {
+		t.Fatalf("got %q, want %q", got, "echo second")
+	}
+}
+
 // A worker that fails an invocation before sst dev has recorded it has its error
 // shown, as after. Before, sst dev didn't know whose it was, so it published
 // none.

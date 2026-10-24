@@ -353,20 +353,21 @@ func function(ctx context.Context, input input) {
 					w.Header().Add(key, value)
 				}
 			}
-			w.WriteHeader(resp.StatusCode)
-
-			var buf bytes.Buffer
-			tee := io.TeeReader(resp.Body, &buf)
-			io.Copy(w, tee)
-			workerInfo, ok := loadWorker(workerID)
-			if ok {
+			// The invocation is published before the worker has it, so it comes
+			// before anything the worker prints for it, which is tied to it from
+			// above, and its log starts with it. Its body is in memory already,
+			// as the bridge's message.
+			body, _ := io.ReadAll(resp.Body)
+			if workerInfo, ok := loadWorker(workerID); ok {
 				bus.Publish(&FunctionInvokedEvent{
 					FunctionID: workerInfo.FunctionID,
 					WorkerID:   workerID,
 					RequestID:  requestID,
-					Input:      buf.Bytes(),
+					Input:      body,
 				})
 			}
+			w.WriteHeader(resp.StatusCode)
+			w.Write(body)
 		}
 	})
 
