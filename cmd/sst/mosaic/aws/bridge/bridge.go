@@ -513,9 +513,10 @@ type waiting struct {
 	next  int
 	held  map[int]Packet
 	bytes int
-	// when its last packet came, and when it asks again for what's missing,
-	// after how long
+	// when its last packet came, when the gap it waits on opened, if it does,
+	// and when it asks again for what's missing, after how long
 	lastPacket time.Time
+	gapSince   time.Time
 	askAgain   time.Time
 	askedAfter time.Duration
 }
@@ -571,7 +572,7 @@ func sorted(ctx context.Context, sub chan string, asks *asking) iter.Seq[Packet]
 				}
 				message.held[packet.Index] = packet
 				message.lastPacket = time.Now()
-				message.askAgain, message.askedAfter = time.Time{}, 0
+				passedOn := message.next
 				message.bytes += len(packet.Data)
 				heldBytes += len(packet.Data)
 				for {
@@ -595,6 +596,15 @@ func sorted(ctx context.Context, sub chan string, asks *asking) iter.Seq[Packet]
 						finished[envelope.ID] = true
 						break
 					}
+				}
+				// A gap is timed from when it opened, not from the last packet, as
+				// a stream goes on sending past one. Once the message moves on,
+				// it's a new gap, if any, and it asks soon again.
+				if message.next > passedOn {
+					message.gapSince, message.askAgain, message.askedAfter = time.Time{}, time.Time{}, 0
+				}
+				if len(message.held) > 0 && message.gapSince.IsZero() {
+					message.gapSince = message.lastPacket
 				}
 				if _, waits := messages[packet.ID]; waits && !known {
 					order = append(order, packet.ID)
