@@ -546,3 +546,20 @@ func TestSubscribeIgnoresALateAnswer(t *testing.T) {
 		t.Fatalf("subscribed %d times, want 2: the late error was taken for the second's answer", f.subscribes)
 	}
 }
+
+// A reconnect resubscribes from a copy of the subscriptions, which can hold an
+// ID that Subscribe has dropped since. Subscribing it fails, and doesn't put
+// it back without a channel, which the reader would block on.
+func TestSubscribeOfADroppedIDFails(t *testing.T) {
+	f := newFakeEventAPI(t, "ack")
+	conn := f.connection()
+	conn.setSubscription("dropped", SubscriptionInfo{Channel: "/sst/app/stage/in", Out: make(chan string, 1)})
+	conn.deleteSubscription("dropped")
+
+	if err := conn.subscribe(context.Background(), "/sst/app/stage/in", "dropped"); !errors.Is(err, ErrSubscriptionFailed) {
+		t.Fatalf("got %v, want ErrSubscriptionFailed", err)
+	}
+	if item, ok := conn.subscription("dropped"); ok {
+		t.Fatalf("the dropped ID is back, with %+v", item)
+	}
+}

@@ -425,3 +425,19 @@ func TestAppSyncName(t *testing.T) {
 func appsyncNameValid(name string) bool {
 	return !appsyncNameInvalid.MatchString(name) && len(name) <= appsyncNameMax
 }
+
+// RemoveAppSync is for a stage's own API, so an empty app or stage, which is
+// the shared API's scope, removes nothing.
+func TestRemoveAppSyncNeverRemovesTheShared(t *testing.T) {
+	fake := &fakeAppSync{}
+	fake.add("sst", nil, time.Now())
+	p := &AwsProvider{appsync: fake}
+	for _, args := range [][2]string{{"", ""}, {"my-app", ""}, {"", "alice"}} {
+		if err := p.RemoveAppSync(context.Background(), args[0], args[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(fake.deleted) != 0 {
+		t.Fatalf("deleted %v", fake.deleted)
+	}
+}

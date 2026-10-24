@@ -81,6 +81,9 @@ func (a *AwsProvider) ResolveAppSync(ctx context.Context, scope AppSyncScope) (*
 // RemoveAppSync removes a stage's own Event API, if it has one. The shared one
 // is never removed.
 func (a *AwsProvider) RemoveAppSync(ctx context.Context, app, stage string) error {
+	if app == "" || stage == "" {
+		return nil
+	}
 	scope := AppSyncScope{App: app, Stage: stage}
 	a.appsyncLock.Lock()
 	defer a.appsyncLock.Unlock()

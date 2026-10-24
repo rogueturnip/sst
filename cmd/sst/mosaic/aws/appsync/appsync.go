@@ -492,7 +492,11 @@ func (c *Connection) Subscribe(ctx context.Context, channel string) (chan string
 		if err == nil || !errors.Is(err, ErrSubscriptionFailed) || ctx.Err() != nil || time.Now().After(deadline) {
 			return out, err
 		}
+		// under the lock a subscribe holds, so a reconnect's can't be
+		// halfway through this one
+		c.lock.Lock()
 		c.deleteSubscription(subscriptionID)
+		c.lock.Unlock()
 		log.Info("subscribe failed, trying again", "channel", channel)
 		select {
 		case <-ctx.Done():
@@ -524,13 +528,18 @@ func (c *Connection) setSubscription(id string, item SubscriptionInfo) {
 func (c *Connection) subscribe(ctx context.Context, channel string, subscriptionID string) error {
 	c.lock.Lock()
 	defer c.lock.Unlock()
+	// a reconnect resubscribes from a copy, which can hold one Subscribe has
+	// dropped since
+	current, ok := c.subscription(subscriptionID)
+	if !ok {
+		return ErrSubscriptionFailed
+	}
 	auth, err := c.getAuth(ctx, map[string]interface{}{
 		"channel": channel,
 	})
 	if err != nil {
 		return err
 	}
-	current, _ := c.subscription(subscriptionID)
 	old := current.Out
 	tmp := make(chan string, 1)
 	defer func() {
