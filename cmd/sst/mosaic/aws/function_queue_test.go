@@ -63,6 +63,55 @@ func TestWorkerRecordedLateIsStartedAgainForItsQueue(t *testing.T) {
 	if got != "echo second" {
 		t.Fatalf("got %q, want %q", got, "echo second")
 	}
+	// by a worker started again, not the one that exited
+	if got := h.runtime.starts.Load(); got != 2 {
+		t.Fatalf("started %d workers, want 2", got)
+	}
+}
+
+// What a worker prints as it runs an invocation is tied to that invocation,
+// though sst dev's loop is held up, here building another function. Before, the
+// loop tied a worker's lines to its invocation from an event it hadn't got to,
+// so they went with the invocation before, or with none.
+func TestLinesAreTiedToTheirInvocationWhileTheLoopIsBusy(t *testing.T) {
+	slow := make(chan struct{})
+	held := make(chan string, 1)
+	h := newHarness(t, &fakeRuntime{handle: echo, prints: "working on it", builds: map[string]chan struct{}{"Slow": slow}, held: held})
+	defer close(slow)
+	h.addFunction("Fast")
+	h.addFunction("Slow")
+	lines := bus.Subscribe(&FunctionLogEvent{})
+	defer bus.Unsubscribe(lines)
+	fast := h.bridge("Fast")
+	if _, err := fast.invoke("warm"); err != nil {
+		t.Fatal(err)
+	}
+	// the warm invocation's line, so the next is the second's
+	select {
+	case <-lines:
+	case <-time.After(5 * time.Second):
+		t.Fatal("nothing was printed")
+	}
+
+	// the Slow function starts building, and holds up the loop till it's let
+	h.bridge("Slow")
+	select {
+	case <-held:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the Slow function's build never started")
+	}
+	if _, err := fast.invoke("x"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case evt := <-lines:
+		line := evt.(*FunctionLogEvent)
+		if want := fast.workerID + "-2"; line.RequestID != want {
+			t.Fatalf("%q was tied to invocation %q, want %q", line.Line, line.RequestID, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("nothing was printed")
+	}
 }
 
 // A streamed function's worker that answers before sst dev has recorded it has

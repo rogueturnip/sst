@@ -282,7 +282,7 @@ func function(ctx context.Context, input input) {
 			}
 		}()
 	}
-	evts := bus.Subscribe(&watcher.FileChangedEvent{}, &project.CompleteEvent{}, &runtime.BuildInput{}, &FunctionInvokedEvent{})
+	evts := bus.Subscribe(&watcher.FileChangedEvent{}, &project.CompleteEvent{}, &runtime.BuildInput{})
 
 	input.server.Mux.HandleFunc(`/lambda/{workerID}/2018-06-01/runtime/invocation/next`, func(w http.ResponseWriter, r *http.Request) {
 		log.Info("got next request", "workerID", r.PathValue("workerID"))
@@ -337,9 +337,15 @@ func function(ctx context.Context, input input) {
 			log.Info("worker got next request", "workerID", workerID)
 			resp, _ := http.ReadResponse(bufio.NewReader(reader), r)
 			requestID := resp.Header.Get("lambda-runtime-aws-request-id")
-			if ms, err := strconv.ParseInt(resp.Header.Get("lambda-runtime-deadline-ms"), 10, 64); err == nil && recorded {
+			if recorded {
+				// what it prints from now is this invocation's, set here and
+				// not by the loop, which can be held up, as by a build, and
+				// would tie it to the invocation before
 				stateMu.Lock()
-				current.Deadline = time.UnixMilli(ms)
+				current.CurrentRequestID = requestID
+				if ms, err := strconv.ParseInt(resp.Header.Get("lambda-runtime-deadline-ms"), 10, 64); err == nil {
+					current.Deadline = time.UnixMilli(ms)
+				}
 				stateMu.Unlock()
 			}
 			for key, values := range resp.Header {
@@ -984,14 +990,6 @@ func function(ctx context.Context, input input) {
 			}
 		case unknown := <-evts:
 			switch evt := unknown.(type) {
-			case *FunctionInvokedEvent:
-				info, ok := loadWorker(evt.WorkerID)
-				if !ok {
-					continue
-				}
-				stateMu.Lock()
-				info.CurrentRequestID = evt.RequestID
-				stateMu.Unlock()
 			case *project.CompleteEvent:
 				if evt.Old {
 					continue
