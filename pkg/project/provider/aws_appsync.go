@@ -104,7 +104,9 @@ func resolveAppSync(ctx context.Context, client appsyncClient, scope AppSyncScop
 		return nil, err
 	}
 	if len(matches) > 0 {
-		// if two sst dev sessions created one at once, both use the first
+		// if there are two, as when two sst dev sessions for the stage both
+		// created one, this and later runs use the oldest, and sst remove
+		// removes both
 		match, err := client.GetApi(ctx, &appsyncSdk.GetApiInput{ApiId: matches[0].ApiId})
 		if err != nil {
 			return nil, err

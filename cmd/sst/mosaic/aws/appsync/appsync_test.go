@@ -290,8 +290,11 @@ func TestDialWhenReadyWaitsForANewEventAPI(t *testing.T) {
 		defer f.mu.Unlock()
 		return f.closedRefused == 2
 	})
-	if f.refused != 2 {
-		t.Fatalf("refused %d connects, want 2", f.refused)
+	f.mu.Lock()
+	refused := f.refused
+	f.mu.Unlock()
+	if refused != 2 {
+		t.Fatalf("refused %d connects, want 2", refused)
 	}
 }
 
@@ -399,8 +402,11 @@ func TestDialWhenReadyReturnsARefusalThatWontPass(t *testing.T) {
 	if Transient(err) {
 		t.Fatalf("%v counted as transient", err)
 	}
-	if f.refused != 1 {
-		t.Fatalf("dialed %d times, want 1", f.refused)
+	f.mu.Lock()
+	refused := f.refused
+	f.mu.Unlock()
+	if refused != 1 {
+		t.Fatalf("dialed %d times, want 1", refused)
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("took %v", elapsed)
