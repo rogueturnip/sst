@@ -261,7 +261,8 @@ func (w *Writer) Flush(final bool) error {
 
 // send publishes the batch in the background, once the oldest batch in flight
 // is done if there are publishesInFlight. If one failed meanwhile, the batch
-// isn't published, as the message won't be whole.
+// isn't published, as the message won't be whole. That's as soon as the failure
+// is known: one still in flight can fail just after, and the batch goes.
 func (w *Writer) send() {
 	if len(w.inFlight) >= publishesInFlight {
 		<-w.inFlight[0]

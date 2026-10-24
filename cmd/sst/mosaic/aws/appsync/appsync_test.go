@@ -164,6 +164,9 @@ func TestPublishBatchTakesOneToFive(t *testing.T) {
 	if err := conn.PublishBatch(context.Background(), "c", nil); err == nil {
 		t.Fatal("PublishBatch() of no events = nil, want an error")
 	}
+	if err := conn.PublishBatchOverSocket(context.Background(), "c", nil); err == nil {
+		t.Fatal("PublishBatchOverSocket() of no events = nil, want an error")
+	}
 	if got := srv.count(); got != 0 {
 		t.Fatalf("made %d requests, want none", got)
 	}
