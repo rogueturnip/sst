@@ -54,6 +54,12 @@ func (c *batchPackets) Subscribe(ctx context.Context, channel string) (chan stri
 	return make(chan string), nil
 }
 
+func (c *batchPackets) published() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.requests)
+}
+
 func (c *batchPackets) packets() []Packet {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -239,6 +245,43 @@ func TestWriterReturnsAFailedRequestsError(t *testing.T) {
 	}}
 	if err := writeMessage(t, conn, message(3*BUFFER_SIZE)); !errors.Is(err, failure) {
 		t.Fatalf("got %v, want the last request's error", err)
+	}
+}
+
+// A request that fails while the writer waits for the oldest one in flight
+// stops the message there: no request starts after it. Here the first request
+// is held, the second fails, and the writer, wanting a 5th, waits on the first.
+func TestWriterStartsNothingAfterARequestFailed(t *testing.T) {
+	failure := errors.New("throttled")
+	held := make(chan struct{})
+	failed := make(chan struct{})
+	conn := &batchPackets{}
+	conn.fail = func(batch []Packet) error {
+		switch batch[0].Index {
+		case 0:
+			<-held
+		case packetsPerPublish:
+			// once all 4 are in flight, and the writer waits on the first
+			for conn.published() < publishesInFlight {
+				time.Sleep(time.Millisecond)
+			}
+			time.Sleep(50 * time.Millisecond)
+			defer close(failed)
+			return failure
+		}
+		return nil
+	}
+	go func() {
+		<-failed
+		// the second request's error is recorded once PublishBatch returns
+		time.Sleep(50 * time.Millisecond)
+		close(held)
+	}()
+	if err := writeMessage(t, conn, message(6<<20)); !errors.Is(err, failure) {
+		t.Fatalf("got %v, want the failed request's error", err)
+	}
+	if got := conn.published(); got != publishesInFlight {
+		t.Errorf("%d requests started, want %d, none after one failed", got, publishesInFlight)
 	}
 }
 

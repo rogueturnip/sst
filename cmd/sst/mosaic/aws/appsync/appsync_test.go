@@ -213,9 +213,9 @@ func TestPublishRetriesAnAttemptThatHangs(t *testing.T) {
 
 // A large request has longer to send, as a batch over a slow uplink needs. Here
 // the times are a tenth of what they are, and 4 batches of 875 KB, as many as a
-// message has in flight, share a link of 2.5 MB/s, so each takes about 1.4 s.
-// That's within its 0.5 s and 875 KB at 640 KB/s, though well over the 0.5 s a
-// small publish has.
+// message has in flight, share a link of 4 MB/s, so each takes about 0.9 s.
+// That's half the 1.9 s it has, 0.5 s and 875 KB at 640 KB/s, though well over
+// the 0.5 s a small publish has.
 func TestPublishGivesALargeRequestLongerToSend(t *testing.T) {
 	conn, _ := connect(t)
 	minRate := publishMinRate
@@ -227,10 +227,10 @@ func TestPublishGivesALargeRequestLongerToSend(t *testing.T) {
 		attempts.Add(1)
 		buf := make([]byte, 25<<10)
 		for {
-			// the link carries 25 KB every 10 ms, for every request at once
+			// the link carries 25 KB every 6 ms, for every request at once
 			link.Lock()
 			n, err := io.ReadFull(r.Body, buf)
-			time.Sleep(time.Duration(n) * time.Second / (5 << 19))
+			time.Sleep(time.Duration(n) * time.Second / (4 << 20))
 			link.Unlock()
 			if err != nil {
 				break

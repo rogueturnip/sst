@@ -247,7 +247,8 @@ func (w *Writer) Flush(final bool) error {
 }
 
 // send publishes the batch in the background, once the oldest batch in flight
-// is done if there are publishesInFlight.
+// is done if there are publishesInFlight. If one failed meanwhile, the batch
+// isn't published, as the message won't be whole.
 func (w *Writer) send() {
 	if len(w.inFlight) >= publishesInFlight {
 		<-w.inFlight[0]
@@ -255,6 +256,9 @@ func (w *Writer) send() {
 	}
 	batch := w.batch
 	w.batch = nil
+	if w.failed() != nil {
+		return
+	}
 	done := make(chan struct{})
 	w.inFlight = append(w.inFlight, done)
 	go func() {
