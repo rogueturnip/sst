@@ -35,7 +35,7 @@ func passedOn(t *testing.T, packets ...string) []string {
 	done := make(chan []string, 1)
 	go func() {
 		result := []string{}
-		for p := range sorted(ctx, sub) {
+		for p := range sorted(ctx, sub, nil) {
 			if p.ID == "end" {
 				break
 			}
@@ -106,7 +106,7 @@ func TestSortedPassesOnLogsFollow(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	got := map[string]bool{}
-	for p := range sorted(ctx, sub) {
+	for p := range sorted(ctx, sub, nil) {
 		got[p.ID] = p.LogsFollow
 		if len(got) == 2 {
 			break
