@@ -208,6 +208,28 @@ func TestWriterReturnsAFailedRequestsError(t *testing.T) {
 		t.Errorf("all %d requests went after one failed", len(conn.requests))
 	}
 
+	// and a Write after the request failed returns its error, without
+	// publishing more
+	conn = &batchPackets{delay: time.Millisecond, fail: func(batch []Packet) error { return failure }}
+	w := newWriter(conn, "source", "channel", MessageResponse)
+	if _, err := w.Write(message(packetsPerPublish * BUFFER_SIZE)); err != nil {
+		t.Fatalf("the first Write returned %v, before its request answered", err)
+	}
+	for start := time.Now(); w.failed() == nil; time.Sleep(time.Millisecond) {
+		if time.Since(start) > 5*time.Second {
+			t.Fatal("the request never finished")
+		}
+	}
+	if _, err := w.Write(message(packetsPerPublish * BUFFER_SIZE)); !errors.Is(err, failure) {
+		t.Fatalf("the next Write returned %v, want the failed request's error", err)
+	}
+	if err := w.Close(); !errors.Is(err, failure) {
+		t.Fatalf("Close returned %v, want the failed request's error", err)
+	}
+	if got := len(conn.requests); got != 1 {
+		t.Errorf("made %d requests, want 1, none after it failed", got)
+	}
+
 	// and a message whose last request fails does too
 	conn = &batchPackets{fail: func(batch []Packet) error {
 		if batch[len(batch)-1].Final {

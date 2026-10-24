@@ -155,16 +155,20 @@ func (w *Writer) SetLogsFollow(logsFollow bool) {
 }
 
 // SetOverSocket publishes the message over the AppSync connection's WebSocket
-// where it can, which reaches the bridge sooner, and over HTTPS otherwise. See
-// appsync.Connection.PublishOverSocket.
+// where it can, which reaches the bridge sooner, and over HTTPS otherwise. Only
+// a message that fits in one request goes over it: a longer one, or one that's
+// streamed, goes in requests over HTTPS, several at once. See
+// appsync.Connection.PublishBatchOverSocket.
 func (w *Writer) SetOverSocket(overSocket bool) {
 	w.overSocket = overSocket
 }
 
 const BUFFER_SIZE = 1024 * 128
 
-// Write adds p to the message, publishing a packet each time BUFFER_SIZE
-// bytes are waiting. The buffer grows as it's written, so a small message
+// Write adds p to the message, making a packet each time BUFFER_SIZE bytes are
+// waiting, and publishing them packetsPerPublish at a time in the background,
+// or each one when it's streamed. A request that failed is returned by the next
+// Write, or by Close. The buffer grows as it's written, so a small message
 // allocates about what it holds.
 func (w *Writer) Write(p []byte) (int, error) {
 	total := 0

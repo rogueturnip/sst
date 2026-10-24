@@ -446,10 +446,14 @@ func (c *Connection) getAuth(ctx context.Context, body interface{}) (interface{}
 
 // How long Publish waits before each retry of a publish that was throttled or
 // failed with a server or network error, 1.4 seconds in all, how long one
-// attempt can take, and how long a publish can take with its retries. The
-// bridge sends at most 128 KB at a time, and AppSync answers in well under a
-// second, so an attempt that takes longer has most likely hung.
+// attempt can take, and how long a publish can take with its retries. AppSync
+// answers in well under a second, so an attempt that takes longer has most
+// likely hung. But the bridge sends up to 5 packets, about 875 KB, in a
+// request, and several at once, which takes a while on a slow uplink, so both
+// get as long again as the body takes at publishMinRate. With 4 requests of
+// 875 KB at once, that's an uplink of 1.5 Mbit/s or more.
 var (
+	publishMinRate = 64 << 10 // bytes a second
 	publishRetries = []time.Duration{
 		100 * time.Millisecond,
 		300 * time.Millisecond,
@@ -484,10 +488,11 @@ func (c *Connection) PublishBatch(ctx context.Context, channel string, events []
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(ctx, publishTimeout)
+	sending := time.Duration(len(body)) * time.Second / time.Duration(publishMinRate)
+	ctx, cancel := context.WithTimeout(ctx, publishTimeout+sending)
 	defer cancel()
 	for attempt := 0; ; attempt++ {
-		retry, err := c.publish(ctx, channel, body)
+		retry, err := c.publish(ctx, channel, body, publishAttemptTimeout+sending)
 		if err == nil || !retry || attempt == len(publishRetries) {
 			return err
 		}
@@ -502,12 +507,12 @@ func (c *Connection) PublishBatch(ctx context.Context, channel string, events []
 
 // publish makes one attempt at a publish, and says whether a failed one is worth
 // trying again. Each attempt is signed again, as a signature is for one time.
-func (c *Connection) publish(ctx context.Context, channel string, body []byte) (bool, error) {
+func (c *Connection) publish(ctx context.Context, channel string, body []byte, timeout time.Duration) (bool, error) {
 	credentials, err := c.cfg.Credentials.Retrieve(ctx)
 	if err != nil {
 		return false, err
 	}
-	attemptCtx, cancel := context.WithTimeout(ctx, publishAttemptTimeout)
+	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(attemptCtx, "POST", "https://"+c.httpEndpoint+"/event", bytes.NewReader(body))
 	if err != nil {

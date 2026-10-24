@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -171,10 +172,16 @@ func TestPublishOverSocket(t *testing.T) {
 	if id, _ := msg["id"].(string); !regexp.MustCompile(`^[a-zA-Z0-9-_+]{1,128}$`).MatchString(id) {
 		t.Fatalf("the publish's id %q isn't one AppSync takes", msg["id"])
 	}
-	// AppSync checks the signature against the channel and the events
+	checkSigned(t, conn, msg, "/sst/app/stage/in", []string{`{"a":"b"}`})
+}
+
+// checkSigned checks a socket publish's authorization is signed over the
+// channel and the events, as AppSync checks it.
+func checkSigned(t *testing.T, conn *Connection, msg map[string]interface{}, channel string, events []string) {
+	t.Helper()
 	auth, _ := msg["authorization"].(map[string]interface{})
 	date, _ := time.Parse("20060102T150405Z", auth["x-amz-date"].(string))
-	body, _ := json.Marshal(map[string]interface{}{"channel": "/sst/app/stage/in", "events": []string{`{"a":"b"}`}})
+	body, _ := json.Marshal(map[string]interface{}{"channel": channel, "events": events})
 	req, _ := http.NewRequest("POST", "https://"+conn.httpEndpoint+"/event", bytes.NewReader(body))
 	req.Header.Set("accept", "application/json, text/javascript")
 	req.Header.Set("content-encoding", "amz-1.0")
@@ -186,6 +193,50 @@ func TestPublishOverSocket(t *testing.T) {
 	}
 	if auth["Authorization"] != req.Header.Get("Authorization") || auth["X-Amz-Security-Token"] != "TOKEN" {
 		t.Fatalf("authorization %v isn't signed over the channel and the events", auth)
+	}
+}
+
+// A batch over the socket is one publish, with every event, in order, and its
+// authorization covers all of them. When AppSync turns it down, the whole
+// batch goes over HTTPS.
+func TestPublishBatchOverSocket(t *testing.T) {
+	f := newFakeEventAPI(t, "ack")
+	conn := f.connection()
+	batch := []interface{}{"one", "two", "three"}
+	want := []string{`"one"`, `"two"`, `"three"`}
+	if err := conn.PublishBatchOverSocket(context.Background(), "c", batch); err != nil {
+		t.Fatal(err)
+	}
+	if socket, https := f.counts(); socket != 1 || https != 0 {
+		t.Fatalf("published %d over the socket and %d over HTTPS, want 1 and 0", socket, https)
+	}
+	msg := f.socketPublishes[0]
+	events, _ := msg["events"].([]interface{})
+	if len(events) != len(want) {
+		t.Fatalf("published %v, want %d events", events, len(want))
+	}
+	for i := range want {
+		if events[i] != want[i] {
+			t.Fatalf("published %v, want %v", events, want)
+		}
+	}
+	checkSigned(t, conn, msg, "c", want)
+
+	f.setMode("error")
+	if err := conn.PublishBatchOverSocket(context.Background(), "c", batch); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.httpPublishes) != 1 {
+		t.Fatalf("published %d over HTTPS after an error, want 1", len(f.httpPublishes))
+	}
+	var body struct {
+		Events []string `json:"events"`
+	}
+	json.Unmarshal([]byte(f.httpPublishes[0]), &body)
+	if !slices.Equal(body.Events, want) {
+		t.Fatalf("published %q over HTTPS, want the whole batch, %q", body.Events, want)
 	}
 }
 
