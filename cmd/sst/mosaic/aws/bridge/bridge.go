@@ -8,6 +8,7 @@ import (
 	"iter"
 	"log/slog"
 	"slices"
+	"sync"
 
 	"github.com/sst/sst/v3/cmd/sst/mosaic/aws/appsync"
 	"github.com/sst/sst/v3/pkg/id"
@@ -68,10 +69,17 @@ var _ Conn = (*appsync.Connection)(nil)
 
 // socketConn is a Conn that can publish over its WebSocket, which is faster.
 type socketConn interface {
-	PublishOverSocket(ctx context.Context, channel string, event interface{}) error
+	PublishBatchOverSocket(ctx context.Context, channel string, events []interface{}) error
 }
 
 var _ socketConn = (*appsync.Connection)(nil)
+
+// batchConn is a Conn that can publish several events in one request.
+type batchConn interface {
+	PublishBatch(ctx context.Context, channel string, events []interface{}) error
+}
+
+var _ batchConn = (*appsync.Connection)(nil)
 
 type Writer struct {
 	conn      Conn
@@ -87,6 +95,13 @@ type Writer struct {
 	logsFollow bool
 	// publish over the connection's WebSocket where it can
 	overSocket bool
+
+	// the packets waiting to be published together
+	batch []Packet
+	// the batches in flight, the oldest first, each closed when it's done
+	inFlight []chan struct{}
+	errLock  sync.Mutex
+	err      error
 }
 
 // LogsBody is the body of a MessageLogs: the lines a worker printed up to the
@@ -172,32 +187,118 @@ func (w *Writer) Write(p []byte) (int, error) {
 	return total, nil
 }
 
+// A message of more than one packet is published packetsPerPublish packets to a
+// request, which is as many events as AppSync takes in one, with up to
+// publishesInFlight requests at once. The receiver puts the packets back in
+// order, as it does when AppSync delivers them out of order. A request waits
+// for the one publishesInFlight before it, not only for any to finish, so the
+// packets that arrive ahead of one that's late, and that the receiver holds,
+// are at most that many requests' worth.
+var (
+	packetsPerPublish = 5
+	publishesInFlight = 4
+)
+
+// Flush publishes what's buffered as the message's next packet, or its last.
+// A message's packets are published a batch at a time, in the background, so a
+// failed one is returned by a later Flush, or by Close, which waits for them.
 func (w *Writer) Flush(final bool) error {
 	if !final && len(w.buffer) == 0 {
 		return nil
 	}
-	encoded := base64.StdEncoding.EncodeToString(w.buffer)
-	publish := w.conn.Publish
-	if conn, ok := w.conn.(socketConn); ok && w.overSocket {
-		publish = conn.PublishOverSocket
+	if err := w.failed(); err != nil {
+		if final {
+			w.wait()
+		}
+		return err
 	}
-	err := publish(context.Background(), w.channel, Packet{
+	w.batch = append(w.batch, Packet{
 		ID:     w.id,
 		Index:  w.index,
 		Type:   w.message,
 		Source: w.source,
-		Data:   encoded,
+		Data:   base64.StdEncoding.EncodeToString(w.buffer),
 		Final:  final,
 
 		LogsFollow: w.logsFollow,
 	})
 	w.index++
-	if err != nil {
-		return err
-	}
 	// the packet holds its own copy, so the buffer is reused for the next one
 	w.buffer = w.buffer[:0]
+	if final && len(w.inFlight) == 0 {
+		// A message that fits in one request, as nearly every one does, is
+		// published in it now, and over the socket when told. A packet is at
+		// most 175 KB in base64, so it's well under AppSync's 240 KB.
+		batch := w.batch
+		w.batch = nil
+		return w.publish(batch, w.overSocket)
+	}
+	if final || w.streaming || len(w.batch) == packetsPerPublish {
+		w.send()
+	}
+	if final {
+		w.wait()
+	}
+	return w.failed()
+}
+
+// send publishes the batch in the background, once the oldest batch in flight
+// is done if there are publishesInFlight.
+func (w *Writer) send() {
+	if len(w.inFlight) >= publishesInFlight {
+		<-w.inFlight[0]
+		w.inFlight = w.inFlight[1:]
+	}
+	batch := w.batch
+	w.batch = nil
+	done := make(chan struct{})
+	w.inFlight = append(w.inFlight, done)
+	go func() {
+		defer close(done)
+		if err := w.publish(batch, false); err != nil {
+			w.errLock.Lock()
+			if w.err == nil {
+				w.err = err
+			}
+			w.errLock.Unlock()
+		}
+	}()
+}
+
+// publish publishes the packets in one request, over the connection's
+// WebSocket where it can if overSocket, or one after another with a connection
+// that can't.
+func (w *Writer) publish(batch []Packet, overSocket bool) error {
+	events := make([]interface{}, len(batch))
+	for i, packet := range batch {
+		events[i] = packet
+	}
+	if conn, ok := w.conn.(socketConn); ok && overSocket {
+		return conn.PublishBatchOverSocket(context.Background(), w.channel, events)
+	}
+	if conn, ok := w.conn.(batchConn); ok {
+		return conn.PublishBatch(context.Background(), w.channel, events)
+	}
+	for _, packet := range batch {
+		if err := w.conn.Publish(context.Background(), w.channel, packet); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// wait waits for every batch in flight.
+func (w *Writer) wait() {
+	for _, done := range w.inFlight {
+		<-done
+	}
+	w.inFlight = nil
+}
+
+func (w *Writer) failed() error {
+	w.errLock.Lock()
+	defer w.errLock.Unlock()
+	return w.err
 }
 
 func (w *Writer) Close() error {
@@ -330,12 +431,14 @@ var finishedPerSet = 10_000
 // last packet comes. One that a packet is missing from waits for it, holding
 // the packets that came after. At most maxWaiting messages are kept, the ones
 // coming in as well as the ones waiting, holding at most maxWaitingBytes of
-// packet data, as it's sent, in base64. Past either, the one kept longest is
+// packet data, as it's sent, in base64. A message's packets go several requests
+// at once, so a receiver holds a few of each that came early: a burst of 10
+// invocations of 6 MB at once held 21 MB at most. Past either, the one kept longest is
 // dropped. It isn't counted as finished, so a whole copy of it, as the CLI
 // sends of a reply, is still passed on.
 var (
 	maxWaiting      = 10_000
-	maxWaitingBytes = 8 << 20
+	maxWaitingBytes = 64 << 20
 )
 
 // waiting is a message that's being passed on, or waits for a packet.

@@ -463,13 +463,23 @@ var (
 // sometimes fails a request, so a publish answered with a 429 or a 5xx, or that
 // fails to connect, is tried again. Any other error is returned as is.
 func (c *Connection) Publish(ctx context.Context, channel string, event interface{}) error {
-	eventJson, err := json.Marshal(event)
-	if err != nil {
-		return err
+	return c.PublishBatch(ctx, channel, []interface{}{event})
+}
+
+// PublishBatch publishes several events to a channel in one request, as
+// Publish does one. AppSync takes up to 5 in a request.
+func (c *Connection) PublishBatch(ctx context.Context, channel string, events []interface{}) error {
+	encoded := make([]string, len(events))
+	for i, event := range events {
+		eventJson, err := json.Marshal(event)
+		if err != nil {
+			return err
+		}
+		encoded[i] = string(eventJson)
 	}
 	body, err := json.Marshal(map[string]interface{}{
 		"channel": channel,
-		"events":  []string{string(eventJson)},
+		"events":  encoded,
 	})
 	if err != nil {
 		return err

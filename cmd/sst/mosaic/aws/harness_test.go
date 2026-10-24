@@ -68,18 +68,23 @@ func (f *fakeAppSync) Publish(ctx context.Context, channel string, event interfa
 	return nil
 }
 
-// PublishOverSocket publishes as Publish does, and counts what went this way,
-// by message type.
-func (f *fakeAppSync) PublishOverSocket(ctx context.Context, channel string, event interface{}) error {
-	if p, ok := event.(bridge.Packet); ok {
-		f.mu.Lock()
-		if f.overSocket == nil {
-			f.overSocket = map[bridge.MessageType]int{}
+// PublishBatchOverSocket publishes as Publish does, and counts what went this
+// way, by message type.
+func (f *fakeAppSync) PublishBatchOverSocket(ctx context.Context, channel string, events []interface{}) error {
+	for _, event := range events {
+		if p, ok := event.(bridge.Packet); ok {
+			f.mu.Lock()
+			if f.overSocket == nil {
+				f.overSocket = map[bridge.MessageType]int{}
+			}
+			f.overSocket[p.Type]++
+			f.mu.Unlock()
 		}
-		f.overSocket[p.Type]++
-		f.mu.Unlock()
+		if err := f.Publish(ctx, channel, event); err != nil {
+			return err
+		}
 	}
-	return f.Publish(ctx, channel, event)
+	return nil
 }
 
 // unsubscribe removes the channel's subscribers, as when a bridge's Lambda

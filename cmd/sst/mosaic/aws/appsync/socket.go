@@ -194,26 +194,37 @@ func (c *Connection) webSocket() *websocket.Conn {
 // published over HTTPS, with Publish. So a subscriber can get it twice, as
 // with Publish's retries.
 func (c *Connection) PublishOverSocket(ctx context.Context, channel string, event interface{}) error {
-	err := c.publishOverSocket(ctx, channel, event)
+	return c.PublishBatchOverSocket(ctx, channel, []interface{}{event})
+}
+
+// PublishBatchOverSocket publishes several events in one message over the
+// WebSocket, as PublishOverSocket does one, or with PublishBatch over HTTPS. An
+// event over AppSync's 240 KB closes the socket, and its subscription, where
+// over HTTPS only that event fails, so it's for events well under it.
+func (c *Connection) PublishBatchOverSocket(ctx context.Context, channel string, events []interface{}) error {
+	err := c.publishOverSocket(ctx, channel, events)
 	if err == nil {
 		return nil
 	}
 	if err != errSocketUnavailable {
 		log.Info("publishing over HTTPS instead", "channel", channel, "err", err)
 	}
-	return c.Publish(ctx, channel, event)
+	return c.PublishBatch(ctx, channel, events)
 }
 
-func (c *Connection) publishOverSocket(ctx context.Context, channel string, event interface{}) error {
+func (c *Connection) publishOverSocket(ctx context.Context, channel string, batch []interface{}) error {
 	s := c.currentSocket()
 	if s == nil || !s.budget.take(time.Now()) {
 		return errSocketUnavailable
 	}
-	eventJson, err := json.Marshal(event)
-	if err != nil {
-		return err
+	events := make([]string, len(batch))
+	for i, event := range batch {
+		eventJson, err := json.Marshal(event)
+		if err != nil {
+			return err
+		}
+		events[i] = string(eventJson)
 	}
-	events := []string{string(eventJson)}
 	// signed the same way as the HTTPS request's body
 	auth, err := c.getAuth(ctx, map[string]interface{}{
 		"channel": channel,

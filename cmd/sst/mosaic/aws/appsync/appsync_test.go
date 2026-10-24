@@ -2,9 +2,11 @@ package appsync
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -110,6 +112,31 @@ func TestPublishRetriesThrottlesAndServerErrors(t *testing.T) {
 	}
 	if !strings.Contains(srv.bodies[0], `"channel":"/sst/app/stage/in"`) {
 		t.Errorf("body %q doesn't name the channel", srv.bodies[0])
+	}
+}
+
+// A batch is one request, holding each event as a string of JSON, in order, and
+// a retry sends it whole again.
+func TestPublishBatchSendsItsEventsInOneRequest(t *testing.T) {
+	conn, srv := connect(t, 429)
+	events := []interface{}{map[string]int{"index": 0}, map[string]int{"index": 1}, map[string]int{"index": 2}}
+	if err := conn.PublishBatch(context.Background(), "c", events); err != nil {
+		t.Fatal(err)
+	}
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if len(srv.bodies) != 2 || srv.bodies[1] != srv.bodies[0] {
+		t.Fatalf("made %d attempts, want 2 with the same body", len(srv.bodies))
+	}
+	var body struct {
+		Events []string `json:"events"`
+	}
+	if err := json.Unmarshal([]byte(srv.bodies[0]), &body); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{`{"index":0}`, `{"index":1}`, `{"index":2}`}
+	if !slices.Equal(body.Events, want) {
+		t.Errorf("sent events %q, want %q", body.Events, want)
 	}
 }
 
