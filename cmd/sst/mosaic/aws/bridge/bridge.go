@@ -311,18 +311,22 @@ func (w *Writer) send() {
 // WebSocket where it can if overSocket, or one after another with a connection
 // that can't.
 func (w *Writer) publish(batch []Packet, overSocket bool) error {
+	return publishPackets(context.Background(), w.conn, w.channel, batch, overSocket)
+}
+
+func publishPackets(ctx context.Context, as Conn, channel string, batch []Packet, overSocket bool) error {
 	events := make([]interface{}, len(batch))
 	for i, packet := range batch {
 		events[i] = packet
 	}
-	if conn, ok := w.conn.(socketConn); ok && overSocket {
-		return conn.PublishBatchOverSocket(context.Background(), w.channel, events)
+	if conn, ok := as.(socketConn); ok && overSocket {
+		return conn.PublishBatchOverSocket(ctx, channel, events)
 	}
-	if conn, ok := w.conn.(batchConn); ok {
-		return conn.PublishBatch(context.Background(), w.channel, events)
+	if conn, ok := as.(batchConn); ok {
+		return conn.PublishBatch(ctx, channel, events)
 	}
 	for _, packet := range batch {
-		if err := w.conn.Publish(context.Background(), w.channel, packet); err != nil {
+		if err := as.Publish(ctx, channel, packet); err != nil {
 			return err
 		}
 	}
@@ -371,6 +375,9 @@ type Client struct {
 	// message it gets is missing, if it does
 	sent  *sentPackets
 	askOn atomic.Pointer[string]
+	// the IDs of the messages it's sending again, so an ask that comes
+	// meanwhile doesn't start another
+	resending sync.Map
 }
 
 func NewClient(ctx context.Context, as Conn, source string, prefix string) *Client {
@@ -505,8 +512,9 @@ var finishedPerSet = 10_000
 // packet data, as it's sent, in base64. A message's packets go in several
 // requests at once, so a receiver holds a few of each that came early: a burst
 // of 10 invocations of 6 MB at once held 21 MB at most. Past either, the one
-// kept longest is dropped. It isn't counted as finished, so a whole copy of it, as the CLI
-// sends of a reply, is still passed on.
+// kept longest is dropped. A reply isn't counted as finished, so a whole copy
+// of it, as the CLI sends, is still passed on. A stream is, as nothing sends it
+// again whole.
 var (
 	maxWaiting      = 10_000
 	maxWaitingBytes = 64 << 20
@@ -538,6 +546,12 @@ func sorted(ctx context.Context, sub chan string, asks *asking) iter.Seq[Packet]
 		// the messages that have waited, the first first, some since finished
 		order := []string{}
 		heldBytes := 0
+		finish := func(id string) {
+			if len(finished) >= perSet {
+				finished, finishedBefore = map[string]bool{}, finished
+			}
+			finished[id] = true
+		}
 		var tick <-chan time.Time
 		if asks != nil {
 			ticker := time.NewTicker(asks.timing.every)
@@ -603,10 +617,7 @@ func sorted(ctx context.Context, sub chan string, asks *asking) iter.Seq[Packet]
 					if envelope.Final {
 						heldBytes -= message.bytes
 						delete(messages, envelope.ID)
-						if len(finished) >= perSet {
-							finished, finishedBefore = map[string]bool{}, finished
-						}
-						finished[envelope.ID] = true
+						finish(envelope.ID)
 						break
 					}
 				}
@@ -638,6 +649,12 @@ func sorted(ctx context.Context, sub chan string, asks *asking) iter.Seq[Packet]
 					// its first packets were passed on, so it's ended, as one that
 					// won't be whole
 					if message.next > 0 {
+						// Nothing sends a stream again whole, so what comes of it
+						// later, its next packets or an answer to an ask, would only
+						// start it again as a new message, that nothing reads.
+						if message.streamed {
+							finish(id)
+						}
 						if !yield(Packet{ID: id, dropped: true}) {
 							return
 						}

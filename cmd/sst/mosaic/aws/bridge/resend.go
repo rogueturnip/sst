@@ -73,6 +73,9 @@ type sentMessage struct {
 	packets map[int]Packet
 	bytes   int
 	last    time.Time
+	// the indexes of its packets kept are between first and top, top not
+	// among them, as a Writer numbers them one after another
+	first, top int
 }
 
 // sentPackets keeps the packets of the streamed messages a Client sent.
@@ -101,8 +104,9 @@ func (s *sentPackets) keep(channel string, packet Packet, now time.Time) {
 		s.order = slices.DeleteFunc(s.order, func(id string) bool { return id == packet.ID })
 	}
 	s.order = append(s.order, packet.ID)
-	if _, kept := message.packets[packet.Index]; !kept {
+	if _, kept := message.packets[packet.Index]; !kept && packet.Index >= message.first {
 		message.packets[packet.Index] = packet
+		message.top = max(message.top, packet.Index+1)
 		message.bytes += len(packet.Data)
 		s.bytes += len(packet.Data)
 	}
@@ -126,19 +130,12 @@ func (s *sentPackets) forget(now time.Time) {
 	}
 	if len(s.order) == 1 && s.bytes > keepSentBytes {
 		message := s.messages[s.order[0]]
-		indexes := make([]int, 0, len(message.packets))
-		for index := range message.packets {
-			indexes = append(indexes, index)
-		}
-		slices.Sort(indexes)
-		for _, index := range indexes {
-			if s.bytes <= keepSentBytes {
-				break
+		for ; s.bytes > keepSentBytes && message.first < message.top; message.first++ {
+			if packet, ok := message.packets[message.first]; ok {
+				delete(message.packets, message.first)
+				message.bytes -= len(packet.Data)
+				s.bytes -= len(packet.Data)
 			}
-			size := len(message.packets[index].Data)
-			delete(message.packets, index)
-			message.bytes -= size
-			s.bytes -= size
 		}
 	}
 }
@@ -168,15 +165,22 @@ func (s *sentPackets) find(ask ResendBody, now time.Time) (string, []Packet) {
 	return message.channel, found
 }
 
-// resend publishes again the packets an ask is for, that the Client kept.
+// resend publishes again the packets an ask is for, that the Client kept,
+// packetsPerPublish to a request. An ask for a message it's sending again
+// already is dropped: what that sends is all it has, and the receiver asks
+// again for what it doesn't get.
 func (c *Client) resend(ctx context.Context, ask ResendBody) {
+	if _, busy := c.resending.LoadOrStore(ask.ID, true); busy {
+		return
+	}
+	defer c.resending.Delete(ask.ID)
 	channel, packets := c.sent.find(ask, time.Now())
 	if len(packets) == 0 {
 		return
 	}
 	slog.Info("sending packets again", "id", ask.ID, "packets", len(packets))
-	for _, packet := range packets {
-		if err := c.as.Publish(ctx, channel, packet); err != nil {
+	for batch := range slices.Chunk(packets, packetsPerPublish) {
+		if err := publishPackets(ctx, c.as, channel, batch, false); err != nil {
 			slog.Warn("failed to send packets again", "id", ask.ID, "err", err)
 			return
 		}

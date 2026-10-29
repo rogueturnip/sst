@@ -3,11 +3,13 @@ package bridge
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -481,6 +483,45 @@ func TestAsksAreFewAtOnce(t *testing.T) {
 	}
 }
 
+// A stream that's dropped, as it held too much past a gap, isn't started again
+// as a new message by what comes of it after: its next packets, or the answer
+// to an ask for the ones before them. Nothing would read that one, and once it
+// held 100 packets the Client would stop passing anything on.
+func TestDroppedStreamDoesNotComeBack(t *testing.T) {
+	soon(t)
+	// a packet's data, in base64, is 16 bytes, so 7 held past the gap drop it
+	with(t, &maxWaitingBytes, 100)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	appsync := newLossyAppSync(func(p Packet) bool { return p.Type == MessageResponse && p.Index == 1 })
+	dev := NewClient(ctx, appsync, "dev", "/sst/app/stage")
+	fn := NewClient(ctx, appsync, "worker", "/sst/app/stage/worker")
+	fn.AskForMissingOn("/sst/app/stage/in")
+	w := dev.NewWriter(MessageResponse, "/sst/app/stage/worker/in")
+	w.SetStreaming(true)
+	for _, chunk := range chunks(20) {
+		if _, err := w.Write([]byte(chunk)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case msg := <-fn.Read():
+		if _, err := io.ReadAll(msg.Body); err != io.ErrUnexpectedEOF {
+			t.Fatalf("reading the dropped stream gave %v, want io.ErrUnexpectedEOF", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the stream never started")
+	}
+	select {
+	case msg := <-fn.Read():
+		t.Fatalf("the dropped stream came back as message %q", msg.ID)
+	case <-time.After(4 * askAfterIdle):
+	}
+}
+
 // A message that isn't streamed doesn't ask for what it's missing: it's sent
 // again whole, and its sender didn't keep it.
 func TestReplyThatLostAPacketDoesNotAsk(t *testing.T) {
@@ -518,5 +559,109 @@ func TestOnlyAStreamIsKept(t *testing.T) {
 	}
 	if dev.sent.bytes != 0 {
 		t.Fatalf("kept %d bytes of a message that wasn't streamed", dev.sent.bytes)
+	}
+}
+
+// slowConn holds each publish until it's let go, and counts the events.
+type slowConn struct {
+	fakeConn
+	go_    chan struct{}
+	events atomic.Int32
+}
+
+func (c *slowConn) PublishBatch(ctx context.Context, channel string, events []interface{}) error {
+	<-c.go_
+	c.events.Add(int32(len(events)))
+	return nil
+}
+
+// An ask that comes while sst dev is still sending a message again, as one
+// whose answer was slow does, doesn't start sending it a second time.
+func TestAskWhileSendingAgainIsDropped(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn := &slowConn{fakeConn: fakeConn{sub: make(chan string)}, go_: make(chan struct{})}
+	dev := NewClient(ctx, conn, "dev", "/sst/app/stage")
+	for i := range 3 * packetsPerPublish {
+		dev.sent.keep("worker/in", Packet{ID: "m", Index: i, Data: "eA=="}, time.Now())
+	}
+	ask := ResendBody{ID: "m", After: -1}
+	done := make(chan struct{})
+	go func() {
+		dev.resend(ctx, ask)
+		close(done)
+	}()
+	// the first is publishing its first batch when the second comes
+	select {
+	case conn.go_ <- struct{}{}:
+	case <-time.After(3 * time.Second):
+		t.Fatal("sending again didn't publish a batch")
+	}
+	second := make(chan struct{})
+	go func() {
+		dev.resend(ctx, ask)
+		close(second)
+	}()
+	select {
+	case <-second:
+	case <-time.After(time.Second):
+		// it's sending a second time, held by the conn until let go
+	}
+	close(conn.go_)
+	<-done
+	<-second
+	if n := conn.events.Load(); n != int32(3*packetsPerPublish) {
+		t.Fatalf("sent %d packets again, want each of the %d once", n, 3*packetsPerPublish)
+	}
+}
+
+// failingConn fails the publish of the packet with index fail, a while after,
+// as a slow request does, so the packets after it are written meanwhile.
+type failingConn struct {
+	fakeConn
+	fail int
+}
+
+func (c *failingConn) PublishBatch(ctx context.Context, channel string, events []interface{}) error {
+	for _, event := range events {
+		if event.(Packet).Index == c.fail {
+			time.Sleep(100 * time.Millisecond)
+			return fmt.Errorf("publish failed")
+		}
+	}
+	return nil
+}
+
+// A streamed chunk whose publish failed isn't sent again in the packet after
+// it. It's kept, to send again when asked, so the bridge would read it twice.
+func TestFailedStreamPacketIsNotSentAgain(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn := &failingConn{fakeConn: fakeConn{sub: make(chan string)}, fail: 1}
+	dev := NewClient(ctx, conn, "dev", "/sst/app/stage")
+	w := dev.NewWriter(MessageResponse, "worker/in")
+	w.SetStreaming(true)
+	want := chunks(5)
+	for _, chunk := range want {
+		if _, err := w.Write([]byte(chunk)); err != nil {
+			break
+		}
+	}
+	if err := w.Close(); err == nil {
+		t.Fatal("the stream didn't fail")
+	}
+	var kept strings.Builder
+	dev.sent.mu.Lock()
+	for _, message := range dev.sent.messages {
+		for _, packet := range message.packets {
+			data, _ := base64.StdEncoding.DecodeString(packet.Data)
+			kept.Write(data)
+		}
+	}
+	dev.sent.mu.Unlock()
+	for _, chunk := range want {
+		if n := strings.Count(kept.String(), chunk); n > 1 {
+			t.Errorf("%q is in %d packets, want one", chunk, n)
+		}
 	}
 }
