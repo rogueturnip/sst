@@ -1,7 +1,9 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -14,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/sst/sst/v3/pkg/flag"
 	"github.com/sst/sst/v3/pkg/global"
@@ -24,10 +27,11 @@ import (
 )
 
 type Server struct {
-	Port  int
-	Mux   *http.ServeMux
-	Rpc   *rpc.Server
-	Ready chan struct{}
+	project *project.Project
+	Port    int
+	Mux     *http.ServeMux
+	Rpc     *rpc.Server
+	Ready   chan struct{}
 }
 
 func New() (*Server, error) {
@@ -46,6 +50,23 @@ func New() (*Server, error) {
 		if r.Method != "POST" {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
+		}
+		if result.project != nil && result.project.FlociPreflight() {
+			data, err := io.ReadAll(io.LimitReader(r.Body, 16<<20))
+			if err != nil {
+				http.Error(w, err.Error(), 400)
+				return
+			}
+			var request struct{ Method string }
+			if json.Unmarshal(data, &request) != nil {
+				http.Error(w, "invalid RPC", 400)
+				return
+			}
+			if strings.HasSuffix(request.Method, ".Create") || strings.HasSuffix(request.Method, ".Update") || strings.HasSuffix(request.Method, ".Delete") {
+				http.Error(w, "Floci preflight refuses mutations", 403)
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(data))
 		}
 		slog.Info("rpc request", "method", r.Method, "url", r.URL.String())
 		result.Rpc.ServeCodec(jsonrpc.NewServerCodec(&HttpConn{Reader: r.Body, Writer: w}))
@@ -73,6 +94,7 @@ func New() (*Server, error) {
 }
 
 func (s *Server) Start(ctx context.Context, p *project.Project) error {
+	s.project = p
 	log := slog.Default().With("service", "server")
 	log.Info("starting")
 	defer log.Info("server done")
@@ -87,6 +109,9 @@ func (s *Server) Start(ctx context.Context, p *project.Project) error {
 	server.Addr = fmt.Sprintf("0.0.0.0:%d", s.Port)
 	log.Info("server", "addr", server.Addr)
 	serverPath := resolveServerFile(p.PathConfig(), p.App().Stage)
+	if p.Floci() {
+		serverPath = resolveFlociServerFile(p.PathConfig(), p.App().Stage, p.Env()["SST_FLOCI_ENDPOINT"])
+	}
 	u, _ := url.Parse("http://" + server.Addr)
 	os.WriteFile(serverPath, []byte(u.String()), 0644)
 	defer os.Remove(serverPath)

@@ -1,6 +1,6 @@
 # Floci compatibility spike
 
-This is the first implementation step for #172. It is **not** `sst dev --floci` support. The only production change in this branch is the prerequisite fix that passes boolean and numeric provider settings to Pulumi. No SST command selects Floci yet.
+This directory preserves the initial compatibility spike for #172. The production dev backend is now implemented separately; see the [Floci guide](../../www/src/content/docs/docs/floci.mdx) for `sst dev --floci` and `sst floci`. The results below describe the original spike, not the full backend verification.
 
 The spike uses Floci **2.3.0**, pinned to Docker manifest digest `sha256:e0b292df4dc9559b7b1bf4f51bdda4bb8e269276236438cd03cae661260ea8a9`, and the AWS provider version in `platform/package.json` (**7.48.0** when tested).
 
@@ -48,7 +48,7 @@ Verified on macOS arm64 with Docker 29.8.0:
 
 Configuration references: [Floci 2.3.0 Compose](https://github.com/floci-io/floci/blob/2.3.0/docker-compose.yml), [environment variables](https://github.com/floci-io/floci/blob/2.3.0/docs/configuration/environment-variables.md).
 
-## Still required before shipping
+## Follow-on work identified by the original spike
 
 - Production transport interface and actual SST bridge stream/resend tests. The HTTP callback proves connectivity only.
 - SST components (rather than only raw Pulumi resources), component options, regional providers, custom resources and invokes; versioned compatibility profile and preview enforcement.
@@ -59,3 +59,61 @@ Configuration references: [Floci 2.3.0 Compose](https://github.com/floci-io/floc
 - `sst floci` install/start/stop/status/reset commands, auto-start, documentation and CI integration. No supported compatibility matrix should be published from this spike alone.
 
 During this session the initial exploratory container remains at port 4566 (`sst-floci-spike`, memory mode). The corrected persistent instance remains at port 4567 (`sst-floci-spike-verified`); its successful result is `.sst/floci-spike-4567/result.json`. These manually started containers are not owned by Compose. Use a fresh Docker environment for the Compose instructions, or explicitly reconcile the existing container names before running them. Neither instance is an SST stage.
+
+## Full SST integration harness
+
+`integration.sh` exercises the actual `sst dev --floci` command. It prepares
+Node, Bun, Pulumi, plugins, app dependencies, and Docker runtime images online,
+then puts Floci, the CLI, and Lambda containers on a Docker internal network.
+The CLI shares Floci's network namespace, so its endpoint stays loopback. No
+Floci API port is published; the ECR sidecar publishes its loopback registry port.
+Existing spike or managed instances are untouched.
+
+Build the platform and SDK first, then a Linux amd64 CLI:
+
+```sh
+bun run build:platform
+bun run build:sdk
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /tmp/sst-floci-dev ./cmd/sst
+SST_TEST_CLI=/tmp/sst-floci-dev scripts/floci/integration.sh
+```
+
+The harness checks external HTTPS denial; rejects unsupported components,
+options, raw resources, and invokes without creating bootstrap or first-set
+resources; rejects `deploy`, `diff`, and `refresh`; invokes the real live
+function URL; verifies S3 and DynamoDB writes plus the SQS subscriber; and
+changes source to verify live reload. Logs and `result.json` go to the temporary
+directory printed at exit. Every process and readiness wait has a deadline.
+
+Resources are retained by default. CI uses `CI=true integration.sh --cleanup`
+to remove only the uniquely named containers/network/image created by that
+invocation, including its Lambda containers. It keeps logs for artifact upload.
+`--cleanup` is refused outside CI. The GitHub Actions workflow is
+`.github/workflows/floci.yml` and does not need AWS credentials or secrets.
+
+## Opt-in development round trip: Floci → AWS → Floci
+
+`roundtrip.mjs` tests the same copied `examples/aws-floci` application and stage through three sequential `sst dev` sessions. **It creates real AWS resources and retains them.** Use a dedicated AWS test profile and a disposable stage. The runner will not start any test work unless all three required opt-ins are set:
+
+```sh
+# First build the local SDK, platform and CLI using the repository commands.
+# Requirements: Node.js 24.5+, npm, AWS CLI v2, Docker, and an authenticated AWS test profile.
+SST_TEST_AWS_PROFILE=my-test-account \
+SST_TEST_STAGE=floci-roundtrip-myname \
+SST_TEST_CLI=/absolute/path/to/built/sst \
+node scripts/floci/roundtrip.mjs
+```
+
+To use an already running custom Floci instance, also set `SST_TEST_FLOCI_ENDPOINT=http://127.0.0.1:4567`. Otherwise `sst dev --floci` manages its normal local instance. Both targets use `us-east-1`. The AWS profile needs permissions for the example's S3, DynamoDB, SQS, Lambda, IAM and live-dev AppSync/bootstrap resources; authenticate it before running. The script does not choose or discover an AWS profile automatically.
+
+The runner copies the app into a new temporary directory, points its `sst` dependency at this checkout's `sdk/js`, installs dependencies, and runs local → AWS → local. It removes the previous `.sst/outputs.json` before each session, checks the function URL belongs to the expected target, invokes it, reads its S3 object and DynamoDB record, and waits for a fresh queue subscriber record. It changes the copied API handler and repeats these checks to verify Lambda live reload. It then changes the copied queue subscriber to prepend a unique marker, sends fresh invocations until that rebuilt subscriber processes a message, and verifies the transformed DynamoDB value. Each target starts with the original subscriber source, and successful results record both `hotReload` and `subscriberHotReload`. Returning to Floci must preserve the instance UUID and all resource output identifiers from the first session. Cloud child processes receive only the explicitly selected AWS profile, with inherited Floci settings, direct credentials, endpoint overrides and proxy settings removed.
+
+The printed temporary directory retains the copied app, logs for all three sessions, S3 response snapshots, and `results.json`. Successful sessions are recorded as they finish. Only the spawned dev sessions and their local worker processes are stopped; neither AWS nor Floci resources are removed. Cleanup is a separate, deliberate action using the retained app and matching target/stage. Re-running creates a new inspection directory but uses the same explicitly selected stage.
+
+The safety and environment tests run offline and do not need AWS or Docker:
+
+```sh
+node --test scripts/floci/roundtrip.test.mjs
+```
+
+These test missing opt-ins, credential/endpoint/proxy leakage across targets, stale-target URL detection and HTTP verification failures. A passing offline suite does not establish that the real three-session round trip passed; run the opt-in command to produce that evidence.

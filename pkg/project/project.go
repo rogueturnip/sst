@@ -10,12 +10,14 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
 
 	"github.com/Masterminds/semver/v3"
 	"github.com/evanw/esbuild/pkg/api"
 	"github.com/sst/sst/v3/internal/fs"
 	"github.com/sst/sst/v3/internal/util"
 	"github.com/sst/sst/v3/pkg/flag"
+	"github.com/sst/sst/v3/pkg/floci"
 	"github.com/sst/sst/v3/pkg/js"
 	"github.com/sst/sst/v3/pkg/process"
 	"github.com/sst/sst/v3/pkg/project/provider"
@@ -128,6 +130,8 @@ func (w *Watch) UnmarshalJSON(data []byte) error {
 }
 
 type Project struct {
+	floci           *floci.Config
+	flociChecking   atomic.Bool
 	version         string
 	lock            ProviderLock
 	root            string
@@ -169,6 +173,7 @@ func ResolveLogDir(cfgPath string) string {
 }
 
 type ProjectConfig struct {
+	Floci   *floci.Config
 	Version string
 	Stage   string
 	Config  string
@@ -212,6 +217,7 @@ func New(input *ProjectConfig) (*Project, error) {
 	pythonRuntime := python.New()
 
 	proj := &Project{
+		floci:   input.Floci,
 		version: input.Version,
 		root:    rootPath,
 		config:  input.Config,
@@ -271,6 +277,10 @@ console.log("~j" + JSON.stringify(await mod.app({
 
 	slog.Info("evaluating config")
 	node := process.Command("node", "--no-warnings", string(buildResult.OutputFiles[1].Path))
+	if proj.Floci() {
+		node = process.Command("node", "--use-env-proxy", "--no-warnings", string(buildResult.OutputFiles[1].Path))
+	}
+	node.Env = proj.commandEnv()
 	output, err := node.CombinedOutput()
 	slog.Info("config evaluated")
 	if err != nil {
@@ -403,6 +413,9 @@ console.log("~j" + JSON.stringify(await mod.app({
 }
 
 func (proj *Project) LoadHome() error {
+	if proj.Floci() {
+		return proj.loadFlociHome()
+	}
 	slog.Info("loading home")
 	loadedProviders := make(map[string]provider.Provider)
 

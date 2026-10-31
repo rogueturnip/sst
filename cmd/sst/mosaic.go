@@ -25,9 +25,11 @@ import (
 	"github.com/sst/sst/v3/internal/util"
 	"github.com/sst/sst/v3/pkg/bus"
 	"github.com/sst/sst/v3/pkg/flag"
+	"github.com/sst/sst/v3/pkg/floci"
 	"github.com/sst/sst/v3/pkg/process"
 	"github.com/sst/sst/v3/pkg/project"
 	"github.com/sst/sst/v3/pkg/project/path"
+	"github.com/sst/sst/v3/pkg/project/provider"
 	"github.com/sst/sst/v3/pkg/runtime"
 	"github.com/sst/sst/v3/pkg/server"
 	"golang.org/x/sync/errgroup"
@@ -48,6 +50,13 @@ func CmdMosaic(c *cli.Cli) error {
 			return err
 		}
 		url, err := server.Discover(cfgPath, stage)
+		if c.Bool("floci") || os.Getenv("SST_FLOCI") != "" {
+			endpoint := os.Getenv("SST_FLOCI_ENDPOINT")
+			if endpoint == "" {
+				endpoint = floci.DefaultEndpoint
+			}
+			url, err = server.DiscoverFloci(cfgPath, stage, endpoint)
+		}
 		if err != nil {
 			return err
 		}
@@ -102,6 +111,12 @@ func CmdMosaic(c *cli.Cli) error {
 				if err != nil {
 					return err
 				}
+				if c.Bool("floci") && nextEnv.Env["SST_FLOCI"] != "1" {
+					return fmt.Errorf("The running dev session is not targeting Floci")
+				}
+				if c.Bool("floci") && os.Getenv("SST_FLOCI_ENDPOINT") != "" && os.Getenv("SST_FLOCI_ENDPOINT") != nextEnv.Env["SST_FLOCI_ENDPOINT"] {
+					return fmt.Errorf("The running dev session targets a different Floci instance")
+				}
 				if accessKeyID := nextEnv.Env["AWS_ACCESS_KEY_ID"]; accessKeyID != "" && timeout != time.Minute*45 {
 					timeout = time.Minute * 45
 					if !timer.Stop() {
@@ -130,6 +145,9 @@ func CmdMosaic(c *cli.Cli) error {
 					cmd.Env = append(cmd.Env, "FORCE_COLOR=1")
 					for k, v := range nextEnv.Env {
 						cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
+					}
+					if endpoint := nextEnv.Env["SST_FLOCI_ENDPOINT"]; endpoint != "" {
+						cmd.Env = provider.FlociEnvironment(cmd.Env, endpoint)
 					}
 					process.DetachSession(cmd)
 					cmd.Stdin = os.Stdin

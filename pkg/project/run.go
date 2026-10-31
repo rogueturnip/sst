@@ -35,7 +35,7 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-func (p *Project) Run(ctx context.Context, input *StackInput) error {
+func (p *Project) runStack(ctx context.Context, input *StackInput) error {
 	log := slog.Default().With("service", "project.run")
 	log.Info("running stack command", "cmd", input.Command)
 
@@ -109,7 +109,7 @@ func (p *Project) Run(ctx context.Context, input *StackInput) error {
 			cmd.Stdout = pulumiStdout
 			cmd.Stderr = pulumiStderr
 			cmd.Dir = workdir.path
-			cmd.Env = os.Environ()
+			cmd.Env = p.commandEnv()
 			cmd.Env = append(cmd.Env,
 				"PULUMI_BACKEND_URL="+filepath.ToSlash("file://"+workdir.Backend()),
 				"PULUMI_CONFIG_PASSPHRASE="+passphrase,
@@ -249,7 +249,7 @@ func (p *Project) Run(ctx context.Context, input *StackInput) error {
 		return err
 	}
 
-	env := os.Environ()
+	env := p.commandEnv()
 	for key, value := range p.Env() {
 		env = append(env, fmt.Sprintf("%v=%v", key, value))
 	}
@@ -277,6 +277,12 @@ func (p *Project) Run(ctx context.Context, input *StackInput) error {
 	)
 	if input.ServerPort != 0 {
 		env = append(env, "SST_SERVER=http://127.0.0.1:"+fmt.Sprint(input.ServerPort))
+	}
+	if p.Floci() {
+		env = provider.FlociEnvironment(env, p.floci.Endpoint)
+		if p.FlociPreflight() {
+			env = append(env, "SST_FLOCI_PREFLIGHT=1")
+		}
 	}
 	pulumiPath := global.PulumiPath()
 	if flag.SST_PULUMI_PATH != "" {
@@ -694,6 +700,12 @@ loop:
 		}
 	}
 
+	if p.FlociPreflight() {
+		if cmd.ProcessState.ExitCode() > 0 {
+			return ErrStackRunFailed
+		}
+		return nil
+	}
 	log.Info("parsing state")
 	complete, err := getCompletedEvent(context.Background(), passphrase, workdir)
 	if err != nil {
