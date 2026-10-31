@@ -468,45 +468,45 @@ func (proj *Project) LoadHome() error {
 	return nil
 }
 
-func (p Project) getPath(path ...string) string {
+func (p *Project) getPath(path ...string) string {
 	paths := append([]string{p.PathWorkingDir()}, path...)
 	return filepath.Join(paths...)
 }
 
-func (p Project) PathWorkingDir() string {
+func (p *Project) PathWorkingDir() string {
 	return filepath.Join(p.root, ".sst")
 }
 
-func (p Project) PathPlatformDir() string {
+func (p *Project) PathPlatformDir() string {
 	return filepath.Join(p.PathWorkingDir(), "platform")
 }
 
-func (p Project) PathRoot() string {
+func (p *Project) PathRoot() string {
 	return p.root
 }
 
-func (p Project) PathConfig() string {
+func (p *Project) PathConfig() string {
 	return p.config
 }
 
-func (p Project) Version() string {
+func (p *Project) Version() string {
 	return p.version
 }
 
-func (p Project) App() *App {
+func (p *Project) App() *App {
 	return p.app
 }
 
 // NodeVersion is the version of the Node.js that evaluated the config.
-func (p Project) NodeVersion() string {
+func (p *Project) NodeVersion() string {
 	return p.nodeVersion
 }
 
-func (p Project) Backend() provider.Home {
+func (p *Project) Backend() provider.Home {
 	return p.home
 }
 
-func (p Project) Env() map[string]string {
+func (p *Project) Env() map[string]string {
 	return p.env
 }
 

@@ -167,7 +167,7 @@ func start(ctx context.Context, run dockerRunner) error {
 	}
 	if info != nil {
 		if info.Config.Image != Image {
-			return fmt.Errorf("managed Floci image differs from %s; use sst floci reset to replace it", Image)
+			return fmt.Errorf("managed Floci image differs from %s; stop and recreate only the sst-floci container, retaining the sst-floci-data volume, then run sst floci start", Image)
 		}
 		if info.State.Running {
 			if err := checkPublishedPort(info); err != nil {
@@ -342,6 +342,7 @@ func checkVolume(ctx context.Context, run dockerRunner) error {
 	return nil
 }
 
+// Floci 2.3.0 prefixes the configured registry container name with "floci-aws-".
 const registryName = "floci-aws-sst-floci-ecr"
 
 // Floci labels and network membership establish ownership of its ECR child.

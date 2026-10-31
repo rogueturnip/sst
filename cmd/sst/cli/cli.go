@@ -81,9 +81,6 @@ func (c *Cli) Run() error {
 	if len(c.path) > 1 && c.path[1].Name == "floci" {
 		command = "floci"
 	}
-	if err := flociCommandAllowed(command, c.Bool("floci"), os.Getenv("SST_FLOCI") != "" || os.Getenv("SST_FLOCI_ENDPOINT") != ""); err != nil {
-		return util.NewReadableError(err, err.Error())
-	}
 	required := 0
 	for _, arg := range active.Args {
 		if !arg.Required {
@@ -94,6 +91,9 @@ func (c *Cli) Run() error {
 	if c.Bool("help") || active.Run == nil || len(c.arguments) < required {
 		return c.PrintHelp()
 	} else {
+		if err := flociCommandAllowed(command, c.Bool("floci"), os.Getenv("SST_FLOCI") != "" || os.Getenv("SST_FLOCI_ENDPOINT") != ""); err != nil {
+			return util.NewReadableError(err, err.Error())
+		}
 		err := active.Run(c)
 		if command == "floci" && err != nil {
 			return util.NewReadableError(err, err.Error())
@@ -106,7 +106,7 @@ func flociCommandAllowed(command string, flag, inherited bool) error {
 	if flag && command != "dev" {
 		return fmt.Errorf("Floci is only for sst dev")
 	}
-	if inherited && command != "dev" && command != "shell" && command != "remove" && command != "unlock" && command != "floci" && command != "ui" {
+	if inherited && command != "dev" && command != "shell" && command != "remove" && command != "unlock" && command != "floci" && command != "ui" && command != "version" {
 		return fmt.Errorf("Floci is only for sst dev")
 	}
 	return nil

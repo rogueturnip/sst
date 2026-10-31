@@ -64,3 +64,28 @@ func TestFlociCommandGuard(t *testing.T) {
 		}
 	}
 }
+
+func TestFlociInheritedHelpAndVersion(t *testing.T) {
+	t.Setenv("SST_FLOCI", "1")
+	for _, name := range []string{"sst", "deploy", "version"} {
+		t.Run(name, func(t *testing.T) {
+			help := name == "deploy"
+			called := false
+			command := Command{Name: name}
+			if name != "sst" {
+				command.Run = func(*Cli) error { called = true; return nil }
+			}
+			c := &Cli{flags: map[string]interface{}{"help": &help}, path: CommandPath{command}}
+			wantErr := error(nil)
+			if name != "version" {
+				wantErr = ErrHelp
+			}
+			if err := c.Run(); err != wantErr {
+				t.Fatalf("got %v, want %v", err, wantErr)
+			}
+			if called != (name == "version") {
+				t.Fatalf("unexpected command execution: %v", called)
+			}
+		})
+	}
+}

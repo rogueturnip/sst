@@ -157,10 +157,15 @@ func (p *Project) Run(ctx context.Context, input *StackInput) error {
 	return nil
 }
 
+// FlociUpdateError carries local recovery guidance through CLI error presentation.
+type FlociUpdateError struct {
+	*util.ReadableError
+}
+
 func (p *Project) flociUpdateError(err error) error {
 	recovery := "Fix the error and rerun sst dev --floci. Existing local resources are retained."
 	if errors.Is(err, provider.ErrLockExists) {
 		recovery = fmt.Sprintf("Stop all dev/update processes for this app and stage first. Then run SST_FLOCI_ENDPOINT=%s sst unlock --stage %s and retry sst dev --floci. Unlocking retains resources; never unlock an active update.", p.floci.Endpoint, p.app.Stage)
 	}
-	return util.NewReadableError(err, fmt.Sprintf("Floci update stopped. Local state: %s. %s No AWS fallback was attempted.", p.floci.StateRoot, recovery))
+	return &FlociUpdateError{util.NewReadableError(err, fmt.Sprintf("Floci update stopped. Local state: %s. %s No AWS fallback was attempted.", p.floci.StateRoot, recovery))}
 }

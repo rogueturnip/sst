@@ -34,5 +34,3 @@ This is sst-community, a fork of SST. `MAINTAINING.md` covers merging an SST rel
 4. Verify with `curl` or AWS CLI
 5. Don't clean up unless told to
 6. `sst dev --mode=basic` for dev mode
-7. Complete a code review and a security review of implementation changes. Resolve actionable findings and rerun affected checks before calling the work complete.
-8. Do not leave completed implementation plans in the repository. Keep the resulting user documentation and tests.

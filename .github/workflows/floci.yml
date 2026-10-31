@@ -18,6 +18,8 @@ on:
   push:
     branches: [main]
     paths:
+      - "cmd/sst/**"
+      - "examples/aws-floci/**"
       - "pkg/floci/**"
       - "pkg/project/**"
       - "platform/src/floci/**"

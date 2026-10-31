@@ -391,3 +391,21 @@ func TestRegistryVolumeOwnership(t *testing.T) {
 		}
 	}
 }
+
+func TestImageMismatchPreservesData(t *testing.T) {
+	calls := 0
+	err := start(context.Background(), func(_ context.Context, args ...string) ([]byte, error) {
+		calls++
+		if calls == 1 {
+			return []byte(containerName), nil
+		}
+		if calls == 2 {
+			return []byte(strings.ReplaceAll(string(managedInspect(true, true)), Image, "floci/floci:old")), nil
+		}
+		t.Fatalf("unexpected mutation: %v", args)
+		return nil, nil
+	})
+	if err == nil || strings.Contains(err.Error(), "reset") || !strings.Contains(err.Error(), "retaining the sst-floci-data volume") {
+		t.Fatalf("unsafe image recovery: %v", err)
+	}
+}
