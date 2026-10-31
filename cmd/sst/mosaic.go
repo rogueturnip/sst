@@ -35,6 +35,13 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+func flociSessionEndpoint(endpoint string) string {
+	if endpoint == "" {
+		return floci.DefaultEndpoint
+	}
+	return strings.TrimRight(endpoint, "/")
+}
+
 func CmdMosaic(c *cli.Cli) error {
 	cwd, _ := os.Getwd()
 	var wg errgroup.Group
@@ -50,11 +57,8 @@ func CmdMosaic(c *cli.Cli) error {
 			return err
 		}
 		url, err := server.Discover(cfgPath, stage)
-		if c.Bool("floci") || os.Getenv("SST_FLOCI") != "" {
-			endpoint := os.Getenv("SST_FLOCI_ENDPOINT")
-			if endpoint == "" {
-				endpoint = floci.DefaultEndpoint
-			}
+		if c.Bool("floci") || os.Getenv("SST_FLOCI") != "" || os.Getenv("SST_FLOCI_ENDPOINT") != "" {
+			endpoint := flociSessionEndpoint(os.Getenv("SST_FLOCI_ENDPOINT"))
 			url, err = server.DiscoverFloci(cfgPath, stage, endpoint)
 		}
 		if err != nil {
@@ -114,7 +118,7 @@ func CmdMosaic(c *cli.Cli) error {
 				if c.Bool("floci") && nextEnv.Env["SST_FLOCI"] != "1" {
 					return fmt.Errorf("The running dev session is not targeting Floci")
 				}
-				if c.Bool("floci") && os.Getenv("SST_FLOCI_ENDPOINT") != "" && os.Getenv("SST_FLOCI_ENDPOINT") != nextEnv.Env["SST_FLOCI_ENDPOINT"] {
+				if c.Bool("floci") && os.Getenv("SST_FLOCI_ENDPOINT") != "" && flociSessionEndpoint(os.Getenv("SST_FLOCI_ENDPOINT")) != flociSessionEndpoint(nextEnv.Env["SST_FLOCI_ENDPOINT"]) {
 					return fmt.Errorf("The running dev session targets a different Floci instance")
 				}
 				if accessKeyID := nextEnv.Env["AWS_ACCESS_KEY_ID"]; accessKeyID != "" && timeout != time.Minute*45 {

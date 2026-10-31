@@ -150,6 +150,9 @@ func EnsureIdentity(ctx context.Context, cfg *Config, app, stage string) error {
 func Reset(ctx context.Context, stage string) error { return reset(ctx, stage, docker) }
 
 func reset(ctx context.Context, stage string, run dockerRunner) error {
+	if stage != "" && !validSegment(stage) {
+		return fmt.Errorf("invalid Floci stage: %q", stage)
+	}
 	cfg, err := endpointConfig()
 	if err != nil {
 		return err

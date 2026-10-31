@@ -443,3 +443,15 @@ func TestStartRejectsUnownedNetwork(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestResetRejectsInvalidStageBeforeDocker(t *testing.T) {
+	for _, stage := range []string{".", "..", "../other", "a/b"} {
+		err := reset(context.Background(), stage, func(context.Context, ...string) ([]byte, error) {
+			t.Fatal("Docker called for invalid stage")
+			return nil, nil
+		})
+		if err == nil || !strings.Contains(err.Error(), "invalid Floci stage") {
+			t.Fatalf("stage %q: %v", stage, err)
+		}
+	}
+}

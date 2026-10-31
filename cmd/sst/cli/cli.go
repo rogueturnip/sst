@@ -104,7 +104,7 @@ func (c *Cli) Run() error {
 
 func flociCommandAllowed(command string, flag, inherited bool) error {
 	if flag && command != "dev" {
-		return fmt.Errorf("Floci is only for sst dev")
+		return fmt.Errorf("--floci is only for sst dev; for local shell, remove, or unlock, set SST_FLOCI_ENDPOINT to the local emulator endpoint")
 	}
 	if inherited && command != "dev" && command != "shell" && command != "remove" && command != "unlock" && command != "floci" && command != "ui" && command != "version" {
 		return fmt.Errorf("Floci is only for sst dev")

@@ -167,7 +167,7 @@ func start(ctx context.Context, run dockerRunner) error {
 	}
 	if info != nil {
 		if info.Config.Image != Image {
-			return fmt.Errorf("managed Floci image differs from %s; stop and recreate only the sst-floci container, retaining the sst-floci-data volume, then run sst floci start", Image)
+			return fmt.Errorf("managed Floci image differs from %s; stop and remove only the container with docker stop sst-floci && docker rm sst-floci, retaining the sst-floci-data volume, then run sst floci start", Image)
 		}
 		if info.State.Running {
 			if err := checkPublishedPort(info); err != nil {
@@ -244,7 +244,7 @@ func managedEnvironment() []string {
 func checkManagedEnvironment(info *containerInfo) error {
 	for _, env := range managedEnvironment() {
 		if !slices.Contains(info.Config.Env, env) {
-			return fmt.Errorf("managed Floci configuration is outdated (%s); stop and recreate only the sst-floci container, retaining the sst-floci-data volume, then run sst floci start", strings.SplitN(env, "=", 2)[0])
+			return fmt.Errorf("managed Floci configuration is outdated (%s); stop and remove only the container with docker stop sst-floci && docker rm sst-floci, retaining the sst-floci-data volume, then run sst floci start", strings.SplitN(env, "=", 2)[0])
 		}
 	}
 	return nil
