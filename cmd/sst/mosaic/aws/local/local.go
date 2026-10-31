@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -82,15 +83,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid batch", 400)
 			return
 		}
-		// Slow or frozen Lambda subscribers must not stall every worker. Missing
-		// packets are recovered by the existing bridge resend protocol.
+		// Reject the whole batch before enqueueing anything, including control
+		// messages that the streaming resend protocol does not retain.
 		s.mu.Lock()
 		for subscriber := range s.subscribers[channel] {
+			if cap(subscriber)-len(subscriber) < len(events) {
+				s.mu.Unlock()
+				http.Error(w, "subscriber queue full", http.StatusServiceUnavailable)
+				return
+			}
+		}
+		for subscriber := range s.subscribers[channel] {
 			for _, event := range events {
-				select {
-				case subscriber <- string(event):
-				default:
-				}
+				subscriber <- string(event)
 			}
 		}
 		s.mu.Unlock()
@@ -99,6 +104,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 	}
 }
+
+type statusError int
+
+func (e statusError) Error() string { return fmt.Sprintf("Floci bridge returned HTTP %d", e) }
 
 type Connection struct {
 	endpoint, token string
@@ -131,7 +140,7 @@ func (c *Connection) request(ctx context.Context, method, path, channel string, 
 	}
 	if resp.StatusCode >= 300 {
 		resp.Body.Close()
-		return nil, fmt.Errorf("Floci bridge returned HTTP %d", resp.StatusCode)
+		return nil, statusError(resp.StatusCode)
 	}
 	return resp, nil
 }
@@ -146,12 +155,25 @@ func (c *Connection) PublishBatch(ctx context.Context, channel string, events []
 	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	resp, err := c.request(ctx, "POST", "/publish", channel, bytes.NewReader(body))
-	if err != nil {
-		return err
+	for {
+		resp, err := c.request(ctx, "POST", "/publish", channel, bytes.NewReader(body))
+		if err == nil {
+			resp.Body.Close()
+			return nil
+		}
+		var status statusError
+		if !errors.As(err, &status) || status != http.StatusServiceUnavailable {
+			return err
+		}
+		// Only retry explicit rejection: transport errors can follow delivery.
+		timer := time.NewTimer(50 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
 	}
-	resp.Body.Close()
-	return nil
 }
 
 func (c *Connection) Subscribe(ctx context.Context, channel string) (chan string, error) {

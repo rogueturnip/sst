@@ -5,24 +5,31 @@ on:
   pull_request:
     branches: [main]
     paths:
-      - "pkg/**"
       - "cmd/sst/**"
+      - "examples/aws-floci/**"
+      - "pkg/server/**"
+      - "pkg/floci/**"
+      - "pkg/project/**"
       - "platform/**"
       - "sdk/js/**"
-      - "examples/aws-floci/**"
-      - "scripts/floci/**"
       - "go.mod"
       - "go.sum"
       - "bun.lockb"
+      - "scripts/floci/**"
       - ".github/workflows/floci.yml"
   push:
     branches: [main]
     paths:
       - "cmd/sst/**"
       - "examples/aws-floci/**"
+      - "pkg/server/**"
       - "pkg/floci/**"
       - "pkg/project/**"
-      - "platform/src/floci/**"
+      - "platform/**"
+      - "sdk/js/**"
+      - "go.mod"
+      - "go.sum"
+      - "bun.lockb"
       - "scripts/floci/**"
       - ".github/workflows/floci.yml"
 

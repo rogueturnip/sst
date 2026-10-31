@@ -194,9 +194,16 @@ func start(ctx context.Context, run dockerRunner) error {
 		}
 	}
 	if _, err = run(ctx, "network", "inspect", networkName); err != nil {
-		if _, err = run(ctx, "network", "create", networkName); err != nil {
+		if _, err = run(ctx, "network", "create", "--label", ownershipLabel+"=true", networkName); err != nil {
 			return err
 		}
+	}
+	labels, err := run(ctx, "network", "inspect", "--format", `{{index .Labels "dev.sst.floci"}}`, networkName)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(string(labels)) != "true" {
+		return fmt.Errorf("network %s is not managed by SST; refusing to reuse it", networkName)
 	}
 	if _, err = run(ctx, "volume", "inspect", volumeName); err != nil {
 		if _, err = run(ctx, "volume", "create", "--label", ownershipLabel+"=true", volumeName); err != nil {
@@ -305,18 +312,23 @@ func Stop(ctx context.Context) error {
 	_, err = docker(ctx, "stop", containerName)
 	return err
 }
-func Status(ctx context.Context) error {
+func Status(ctx context.Context) error { return status(ctx, docker) }
+
+func status(ctx context.Context, run dockerRunner) error {
 	cfg, err := endpointConfig()
 	if err != nil {
 		return err
 	}
 	if os.Getenv("SST_FLOCI_ENDPOINT") == "" {
-		info, err := inspect(ctx, docker)
+		info, err := inspect(ctx, run)
 		if err != nil {
 			return err
 		}
 		if info == nil {
 			return fmt.Errorf("managed Floci is not installed; run sst floci start")
+		}
+		if !info.State.Running {
+			return fmt.Errorf("managed Floci is stopped; run sst floci start")
 		}
 		if err = checkPublishedPort(info); err != nil {
 			return err

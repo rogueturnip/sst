@@ -116,7 +116,7 @@ func TestStartPersistentConfiguration(t *testing.T) {
 			}
 			return managedInspect(true, true), nil
 		}
-		if args[0] == "volume" && len(args) > 2 && args[2] == "--format" {
+		if (args[0] == "volume" || args[0] == "network") && len(args) > 2 && args[2] == "--format" {
 			return []byte("true"), nil
 		}
 		if args[0] == "run" {
@@ -407,5 +407,39 @@ func TestImageMismatchPreservesData(t *testing.T) {
 	})
 	if err == nil || strings.Contains(err.Error(), "reset") || !strings.Contains(err.Error(), "retaining the sst-floci-data volume") {
 		t.Fatalf("unsafe image recovery: %v", err)
+	}
+}
+
+func TestStatusStoppedContainer(t *testing.T) {
+	t.Setenv("SST_FLOCI_ENDPOINT", "")
+	calls := 0
+	err := status(context.Background(), func(_ context.Context, args ...string) ([]byte, error) {
+		calls++
+		if calls == 1 {
+			return []byte(containerName), nil
+		}
+		return managedInspect(false, true), nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "is stopped") || !strings.Contains(err.Error(), "sst floci start") {
+		t.Fatal(err)
+	}
+}
+
+func TestStartRejectsUnownedNetwork(t *testing.T) {
+	err := start(context.Background(), func(_ context.Context, args ...string) ([]byte, error) {
+		switch args[0] {
+		case "container":
+			return nil, nil
+		case "image":
+			return nil, nil
+		case "network":
+			return []byte("<no value>"), nil
+		default:
+			t.Fatalf("unexpected mutation: %v", args)
+			return nil, nil
+		}
+	})
+	if err == nil || !strings.Contains(err.Error(), "network sst-floci is not managed") {
+		t.Fatal(err)
 	}
 }
