@@ -127,3 +127,35 @@ func TestReconnect(t *testing.T) {
 		}
 	}
 }
+
+// net/http clears the read deadline before its background read on bodyless GETs.
+// Keep this regression to distinguish request-body timeouts from stream lifetime.
+func TestSubscriptionSurvivesServerReadTimeout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	handler, _ := local.NewServer(token)
+	srv := httptest.NewUnstartedServer(handler)
+	srv.Config.ReadTimeout = 50 * time.Millisecond
+	srv.Start()
+	defer func() { cancel(); srv.Close() }()
+	req, _ := http.NewRequestWithContext(ctx, "GET", srv.URL+"/subscribe?channel=/sst/timeout", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	// Use the original response, without Connection.Subscribe's reconnect loop.
+	time.Sleep(150 * time.Millisecond)
+	conn, _ := local.Dial(srv.URL, token)
+	if err := conn.Publish(ctx, "/sst/timeout", "still connected"); err != nil {
+		t.Fatal(err)
+	}
+	line := make([]byte, len("\"still connected\"\n"))
+	if _, err := io.ReadFull(resp.Body, line); err != nil {
+		t.Fatalf("subscription ended: %v", err)
+	}
+	if string(line) != "\"still connected\"\n" {
+		t.Fatalf("unexpected event: %s", line)
+	}
+}

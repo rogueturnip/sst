@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -208,16 +209,21 @@ func (c *Connection) Subscribe(ctx context.Context, channel string) (chan string
 			c.mu.Lock()
 			delete(c.streams, resp)
 			c.mu.Unlock()
+			retryDelay := 100 * time.Millisecond
 			for {
 				select {
 				case <-ctx.Done():
 					return
-				case <-time.After(100 * time.Millisecond):
+				case <-time.After(retryDelay):
 				}
 				resp, err = c.request(ctx, "GET", "/subscribe", channel, nil)
 				if err == nil {
 					break
 				}
+				if retryDelay == 100*time.Millisecond {
+					slog.Warn("Floci bridge reconnect failed; retrying with backoff", "error", err)
+				}
+				retryDelay = min(retryDelay*2, 5*time.Second)
 			}
 		}
 	}()

@@ -313,7 +313,8 @@ func managedInspect(running, bound bool) []byte {
 	data, _ := json.Marshal([]any{map[string]any{
 		"State":           map[string]any{"Running": running},
 		"Config":          map[string]any{"Image": Image, "Labels": map[string]string{ownershipLabel: "true"}, "Env": managedEnvironment()},
-		"NetworkSettings": map[string]any{"Ports": map[string]any{"4566/tcp": ports}},
+		"NetworkSettings": map[string]any{"Ports": map[string]any{"4566/tcp": ports}, "Networks": map[string]any{networkName: map[string]any{}}},
+		"Mounts":          []map[string]any{{"Type": "volume", "Name": volumeName, "Destination": "/app/data", "RW": true}, {"Type": "bind", "Source": "/var/run/docker.sock", "Destination": "/var/run/docker.sock", "RW": true}},
 	}})
 	return data
 }
@@ -453,5 +454,41 @@ func TestResetRejectsInvalidStageBeforeDocker(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "invalid Floci stage") {
 			t.Fatalf("stage %q: %v", stage, err)
 		}
+	}
+}
+
+func TestManagedContainerRejectsWrongMountsAndNetworks(t *testing.T) {
+	for _, kind := range []string{"volume", "socket", "network", "extra-network"} {
+		t.Run(kind, func(t *testing.T) {
+			var infos []containerInfo
+			if err := json.Unmarshal(managedInspect(true, true), &infos); err != nil {
+				t.Fatal(err)
+			}
+			info := &infos[0]
+			switch kind {
+			case "volume":
+				info.Mounts[0].Name = "foreign-data"
+			case "socket":
+				info.Mounts[1].Source = "/other/socket"
+			case "network":
+				delete(info.NetworkSettings.Networks, networkName)
+			case "extra-network":
+				info.NetworkSettings.Networks["foreign"] = json.RawMessage(`{}`)
+			}
+			if err := checkManagedEnvironment(info); err == nil {
+				t.Fatal("accepted unexpected container configuration")
+			}
+		})
+	}
+}
+
+func TestManagedContainerAcceptsDockerDesktopSocket(t *testing.T) {
+	var infos []containerInfo
+	if err := json.Unmarshal(managedInspect(true, true), &infos); err != nil {
+		t.Fatal(err)
+	}
+	infos[0].Mounts[1].Source = "/run/host-services/docker.proxy.sock"
+	if err := checkManagedEnvironment(&infos[0]); err != nil {
+		t.Fatal(err)
 	}
 }

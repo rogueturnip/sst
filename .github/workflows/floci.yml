@@ -55,7 +55,7 @@ jobs:
           cache: true
       - uses: actions/setup-node@v4
         with:
-          node-version: "26"
+          node-version: "24.5.0"
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - name: Install dependencies
@@ -68,7 +68,7 @@ jobs:
           DOCKER_PUSH: "false"
       - name: Unit tests and types
         run: |
-          go test ./pkg/floci ./pkg/project/... ./pkg/server/... ./cmd/sst/cli ./cmd/sst/mosaic/errors ./cmd/sst/mosaic/aws/...
+          go test ./cmd/sst ./pkg/floci ./pkg/project/... ./pkg/server/... ./cmd/sst/cli ./cmd/sst/mosaic/errors ./cmd/sst/mosaic/aws/...
           bun run test:platform
           bun run typecheck
           node --test scripts/floci/roundtrip.test.mjs

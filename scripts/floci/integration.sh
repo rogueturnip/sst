@@ -38,7 +38,7 @@ cp "$repo/scripts/floci/integration.mjs" "$work/integration.mjs"
 mkdir "$work/app"
 cp "$repo/examples/aws-floci/"*.ts "$repo/examples/aws-floci/package.json" "$work/app/"
 cat > "$work/Dockerfile" <<'DOCKERFILE'
-FROM node:26-bookworm
+FROM node:24.5.0-bookworm
 RUN npm install --global bun@1.4.2
 ENV SST_BUN_PATH=/usr/local/bin/bun SST_SKIP_LOCAL=true SST_TELEMETRY_DISABLED=true XDG_CONFIG_HOME=/work/config PULUMI_HOME=/work/config/sst
 WORKDIR /work

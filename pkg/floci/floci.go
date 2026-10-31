@@ -120,6 +120,10 @@ func docker(ctx context.Context, args ...string) ([]byte, error) {
 func Install(ctx context.Context) error { _, err := docker(ctx, "pull", Image); return err }
 
 type containerInfo struct {
+	Mounts []struct {
+		Type, Name, Source, Destination string
+		RW                              bool
+	}
 	State  struct{ Running bool }
 	Config struct {
 		Image  string
@@ -242,6 +246,25 @@ func managedEnvironment() []string {
 	}
 }
 func checkManagedEnvironment(info *containerInfo) error {
+	if len(info.NetworkSettings.Networks) != 1 {
+		return fmt.Errorf("managed Floci must use only the sst-floci network")
+	}
+	if _, ok := info.NetworkSettings.Networks[networkName]; !ok {
+		return fmt.Errorf("managed Floci is not attached to the sst-floci network")
+	}
+	data, socket := false, false
+	for _, mount := range info.Mounts {
+		if mount.Destination == "/app/data" {
+			data = mount.Type == "volume" && mount.Name == volumeName && mount.RW
+		}
+		if mount.Destination == "/var/run/docker.sock" {
+			socket = mount.Type == "bind" && (mount.Source == "/var/run/docker.sock" || mount.Source == "/run/host-services/docker.proxy.sock") && mount.RW
+		}
+	}
+	if !data || !socket {
+		return fmt.Errorf("managed Floci mounts differ from the expected sst-floci-data volume and Docker socket; recreate only the container, retaining the data volume")
+	}
+
 	for _, env := range managedEnvironment() {
 		if !slices.Contains(info.Config.Env, env) {
 			return fmt.Errorf("managed Floci configuration is outdated (%s); stop and remove only the container with docker stop sst-floci && docker rm sst-floci, retaining the sst-floci-data volume, then run sst floci start", strings.SplitN(env, "=", 2)[0])
