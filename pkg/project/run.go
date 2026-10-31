@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -303,30 +304,11 @@ func (p *Project) Run(ctx context.Context, input *StackInput) error {
 	}
 
 	if input.Command == "deploy" || input.Command == "diff" || input.Command == "refresh" {
-		for provider, opts := range p.app.Providers {
-			for key, value := range opts.(map[string]interface{}) {
-				// Skip SST-only fields that Pulumi doesn't understand
-				if key == "package" {
-					continue
-				}
-				switch v := value.(type) {
-				case map[string]interface{}:
-					bytes, err := json.Marshal(v)
-					if err != nil {
-						return err
-					}
-					args = append(args, "--config", fmt.Sprintf("%v:%v=%v", provider, key, string(bytes)))
-				case []interface{}:
-					bytes, err := json.Marshal(v)
-					if err != nil {
-						return err
-					}
-					args = append(args, "--config", fmt.Sprintf("%v:%v=%v", provider, key, string(bytes)))
-				case string:
-					args = append(args, "--config", fmt.Sprintf("%v:%v=%v", provider, key, v))
-				}
-			}
+		configArgs, err := providerConfigArgs(p.app.Providers)
+		if err != nil {
+			return err
 		}
+		args = append(args, configArgs...)
 	}
 
 	switch input.Command {
@@ -852,4 +834,29 @@ func (p *Project) removeAppSync() {
 // be rewritten empty, and the developer still needs the types they had.
 func generatesTypes(input *StackInput, complete *CompleteEvent) bool {
 	return !(input.Command == "remove" && len(complete.Links) == 0)
+}
+
+func providerConfigArgs(providers map[string]interface{}) ([]string, error) {
+	var args []string
+	for provider, opts := range providers {
+		for key, value := range opts.(map[string]interface{}) {
+			// Skip SST-only fields that Pulumi doesn't understand
+			if key == "package" {
+				continue
+			}
+			switch v := value.(type) {
+			case map[string]interface{}, []interface{}:
+				bytes, err := json.Marshal(v)
+				if err != nil {
+					return nil, err
+				}
+				args = append(args, "--config", fmt.Sprintf("%v:%v=%v", provider, key, string(bytes)))
+			case string, bool:
+				args = append(args, "--config", fmt.Sprintf("%v:%v=%v", provider, key, v))
+			case float64:
+				args = append(args, "--config", fmt.Sprintf("%v:%v=%s", provider, key, strconv.FormatFloat(v, 'f', -1, 64)))
+			}
+		}
+	}
+	return args, nil
 }
