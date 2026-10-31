@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -19,6 +20,19 @@ import (
 
 func (p *Project) Floci() bool          { return p.floci != nil }
 func (p *Project) FlociPreflight() bool { return p.flociChecking.Load() }
+
+// ListenFlociBridge reserves the advertised callback until dev shuts down.
+func (p *Project) ListenFlociBridge() (net.Listener, error) {
+	if !p.Floci() {
+		return nil, nil
+	}
+	listener, err := net.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		return nil, err
+	}
+	p.env["SST_FLOCI_BRIDGE"] = fmt.Sprintf("http://host.docker.internal:%d", listener.Addr().(*net.TCPAddr).Port)
+	return listener, nil
+}
 
 func (p *Project) commandEnv() []string {
 	var env []string
@@ -64,17 +78,10 @@ func (p *Project) loadFlociHome() error {
 		k, v, _ := strings.Cut(entry, "=")
 		p.env[k] = v
 	}
-	listener, err := net.Listen("tcp", "0.0.0.0:0")
-	if err != nil {
-		return err
-	}
-	port := listener.Addr().(*net.TCPAddr).Port
-	listener.Close()
 	token := make([]byte, 32)
 	if _, err := rand.Read(token); err != nil {
 		return err
 	}
-	p.env["SST_FLOCI_BRIDGE"] = fmt.Sprintf("http://host.docker.internal:%d", port)
 	p.env["SST_FLOCI_TOKEN"] = hex.EncodeToString(token)
 	p.env["SST_FLOCI_REPORT"] = filepath.Join(p.PathWorkingDir(), "floci-preflight-"+hex.EncodeToString(token[:8])+".json")
 	root := p.floci.StateRoot
@@ -145,7 +152,15 @@ func (p *Project) Run(ctx context.Context, input *StackInput) error {
 	fmt.Fprintf(os.Stderr, "Floci state: %s (instance %s)\n", p.floci.StateRoot, p.floci.Instance)
 	err = p.runStack(ctx, input)
 	if err != nil {
-		return util.NewReadableError(err, fmt.Sprintf("Floci update stopped. Partial local state: %s. Fix the error and rerun, or use sst floci reset --stage %s to recover. No AWS fallback was attempted.", p.floci.StateRoot, p.app.Stage))
+		return p.flociUpdateError(err)
 	}
 	return nil
+}
+
+func (p *Project) flociUpdateError(err error) error {
+	recovery := "Fix the error and rerun sst dev --floci. Existing local resources are retained."
+	if errors.Is(err, provider.ErrLockExists) {
+		recovery = fmt.Sprintf("Stop all dev/update processes for this app and stage first. Then run SST_FLOCI_ENDPOINT=%s sst unlock --stage %s and retry sst dev --floci. Unlocking retains resources; never unlock an active update.", p.floci.Endpoint, p.app.Stage)
+	}
+	return util.NewReadableError(err, fmt.Sprintf("Floci update stopped. Local state: %s. %s No AWS fallback was attempted.", p.floci.StateRoot, recovery))
 }

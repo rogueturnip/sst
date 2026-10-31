@@ -42,11 +42,19 @@ function negativeConfig(body) {
 for (const body of Object.values(negativeRuns))
   new Function(negativeConfig(body).replace("export default ", "return "));
 if (process.argv[2] === "prepare") {
+  assert.match(
+    await readFile(`${app}/sst.config.ts`, "utf8"),
+    /    return \{\n      url: fn.url,/,
+    "interruption fixture needs the example run output",
+  );
   const pkg = JSON.parse(await readFile(`${app}/package.json`, "utf8"));
   pkg.dependencies.sst = "file:/repo/sdk/js";
   await writeFile(`${app}/package.json`, JSON.stringify(pkg));
   await mkdir(negative, { recursive: true });
-  await cp(app, negative, { recursive: true });
+  for (const file of await readdir(app)) {
+    if (file.endsWith(".ts") || file === "package.json")
+      await cp(`${app}/${file}`, `${negative}/${file}`);
+  }
   await writeFile(
     `${negative}/sst.config.ts`,
     negativeConfig(negativeRuns.resource),
@@ -69,12 +77,15 @@ if (process.argv[2] === "prepare") {
   }
   process.exit(0);
 }
-assert.equal(process.argv[2], "verify", "use prepare or verify");
+assert.ok(
+  ["verify", "verify-restart"].includes(process.argv[2]),
+  "use prepare, verify or verify-restart",
+);
 // Bound SDK/socket stalls too, not only readiness polling and child shutdown.
 setTimeout(() => {
-  console.error("Floci integration exceeded its 12 minute deadline");
+  console.error("Floci integration exceeded its 20 minute deadline");
   process.exit(1);
-}, 12 * 60_000).unref();
+}, 20 * 60_000).unref();
 
 async function until(label, test, timeout = 120_000) {
   const deadline = Date.now() + timeout;
@@ -215,9 +226,9 @@ async function start(cwd, label) {
       if (exit !== undefined)
         throw new Error(`sst dev exited (${exit}): ${output.slice(-4000)}`);
     },
-    async stop() {
+    async stop(signal = "SIGINT") {
       try {
-        process.kill(-child.pid, "SIGINT");
+        process.kill(-child.pid, signal);
       } catch (error) {
         if (error.code !== "ESRCH") throw error;
       }
@@ -234,147 +245,293 @@ async function start(cwd, label) {
     },
   };
 }
-const before = await inventory();
-assert.deepEqual(
-  before,
-  { buckets: [], tables: [], queues: [], functions: [], parameters: [] },
-  "CI requires a fresh isolated emulator",
-);
-for (const [kind, body] of Object.entries(negativeRuns)) {
-  for (const name of await readdir(`${negative}/.sst`)) {
-    if (name.startsWith("floci-preflight") && name.endsWith(".json"))
-      await rm(`${negative}/.sst/${name}`);
+if (process.argv[2] === "verify") {
+  const before = await inventory();
+  assert.deepEqual(
+    before,
+    { buckets: [], tables: [], queues: [], functions: [], parameters: [] },
+    "CI requires a fresh isolated emulator",
+  );
+  for (const [kind, body] of Object.entries(negativeRuns)) {
+    for (const name of await readdir(`${negative}/.sst`)) {
+      if (name.startsWith("floci-preflight") && name.endsWith(".json"))
+        await rm(`${negative}/.sst/${name}`);
+    }
+    await writeFile(`${negative}/sst.config.ts`, negativeConfig(body));
+    const dev = await start(negative, `negative-${kind}`);
+    try {
+      await until(
+        `negative ${kind} rejection`,
+        () => /No AWS fallback was attempted/.test(dev.output()),
+        90_000,
+      );
+      const reports = (await readdir(`${negative}/.sst`)).filter(
+        (name) => name.startsWith("floci-preflight") && name.endsWith(".json"),
+      );
+      assert.ok(reports.length > 0, "preflight produced no report");
+      const report = JSON.parse(
+        await readFile(`${negative}/.sst/${reports[0]}`, "utf8"),
+      );
+      assert.ok(
+        report.violations?.length > 0,
+        `negative ${kind} did not report a profile violation`,
+      );
+    } finally {
+      await dev.stop();
+    }
+    assert.deepEqual(
+      await inventory(),
+      before,
+      `negative ${kind} created emulator resources`,
+    );
   }
-  await writeFile(`${negative}/sst.config.ts`, negativeConfig(body));
-  const dev = await start(negative, `negative-${kind}`);
+  for (const forbidden of ["deploy", "diff", "refresh"]) {
+    const result = spawnSync(cli, [forbidden, "--stage", stage], {
+      cwd: app,
+      env: process.env,
+      encoding: "utf8",
+      timeout: 30_000,
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(
+      `${result.stdout}${result.stderr}`,
+      /Floci is only for sst dev/,
+    );
+  }
+  await rm(`${app}/.sst/outputs.json`, { force: true });
+  const dev = await start(app, "positive");
   try {
-    await until(
-      `negative ${kind} rejection`,
-      () => /No AWS fallback was attempted/.test(dev.output()),
-      90_000,
+    const outputs = await until(
+      "app outputs",
+      async () => {
+        dev.check();
+        const value = JSON.parse(
+          await readFile(`${app}/.sst/outputs.json`, "utf8"),
+        );
+        return (
+          typeof value.url === "string" &&
+          value.url.startsWith("http") &&
+          value.bucket &&
+          value.table &&
+          value
+        );
+      },
+      180_000,
     );
-    const reports = (await readdir(`${negative}/.sst`)).filter(
-      (name) => name.startsWith("floci-preflight") && name.endsWith(".json"),
+    // The function host is virtual; route it over loopback while retaining Host.
+    const functionURL = new URL(outputs.url);
+    const localURL = new URL(outputs.url);
+    localURL.hostname = "127.0.0.1";
+    async function invoke() {
+      const response = await request(localURL, {
+        headers: { Host: functionURL.host },
+      });
+      assert.equal(response.status, 200, await response.clone().text());
+      return response.json();
+    }
+    await until("live function response", async () => {
+      dev.check();
+      return (await invoke()).message === "hello from local SST";
+    });
+    const object = await s3.send(
+      new GetObjectCommand({ Bucket: outputs.bucket, Key: "hello.txt" }),
     );
-    assert.ok(reports.length > 0, "preflight produced no report");
-    const report = JSON.parse(
-      await readFile(`${negative}/.sst/${reports[0]}`, "utf8"),
+    assert.equal(await object.Body.transformToString(), "hello from local SST");
+    for (const id of ["request", "subscriber"]) {
+      await until(`${id} DynamoDB write`, async () => {
+        dev.check();
+        const item = await dynamo.send(
+          new GetItemCommand({
+            TableName: outputs.table,
+            Key: { id: { S: id } },
+          }),
+        );
+        return item.Item?.message?.S === "hello from local SST";
+      });
+    }
+    const original = await readFile(`${app}/api.ts`, "utf8");
+    await writeFile(
+      `${app}/api.ts`,
+      original.replaceAll("hello from local SST", "hello after reload"),
     );
-    assert.ok(
-      report.violations?.length > 0,
-      `negative ${kind} did not report a profile violation`,
+    await until("live source reload", async () => {
+      dev.check();
+      return (await invoke()).message === "hello after reload";
+    });
+    const subscriber = await readFile(`${app}/subscriber.ts`, "utf8");
+    await writeFile(
+      `${app}/subscriber.ts`,
+      subscriber.replace(
+        "message: { S: record.body }",
+        'message: { S: "subscriber reloaded: " + record.body }',
+      ),
+    );
+    await until("subscriber hot reload", async () => {
+      dev.check();
+      await invoke();
+      const item = await dynamo.send(
+        new GetItemCommand({
+          TableName: outputs.table,
+          Key: { id: { S: "subscriber" } },
+        }),
+      );
+      return (
+        item.Item?.message?.S === "subscriber reloaded: hello after reload"
+      );
+    });
+    const errorOffset = dev.output().length;
+    await writeFile(
+      `${app}/api.ts`,
+      "export async function handler( { SYNTAX_ERROR\n",
+    );
+    // Invoke to trigger lazy rebuilds too; compilation failure must be visible.
+    void invoke().catch(() => {});
+    await until("syntax error diagnostic", () => {
+      dev.check();
+      return /(?:ERROR|error|Expected|Unexpected)/.test(
+        dev.output().slice(errorOffset),
+      );
+    });
+    await writeFile(
+      `${app}/api.ts`,
+      original.replaceAll("hello from local SST", "hello after correction"),
+    );
+    await until("syntax error correction", async () => {
+      dev.check();
+      return (await invoke()).message === "hello after correction";
+    });
+    await writeFile(
+      "/work/result.json",
+      JSON.stringify(
+        {
+          outputs,
+          resources: await inventory(),
+          negativeCases: Object.keys(negativeRuns),
+          egressDenied: true,
+          liveReload: true,
+          subscriberReload: true,
+          syntaxRecovery: true,
+        },
+        null,
+        2,
+      ),
+    );
+    console.log(
+      "Floci integration passed: preflight, isolation, live function, S3, DynamoDB, SQS subscriber, reload.",
     );
   } finally {
     await dev.stop();
   }
-  assert.deepEqual(
-    await inventory(),
-    before,
-    `negative ${kind} created emulator resources`,
+
+  const identity = await ssm.send(
+    new GetParameterCommand({ Name: "/sst/floci/instance" }),
   );
-}
-for (const forbidden of ["deploy", "diff", "refresh"]) {
-  const result = spawnSync(cli, [forbidden, "--stage", stage], {
-    cwd: app,
-    env: process.env,
-    encoding: "utf8",
-    timeout: 30_000,
-  });
-  assert.notEqual(result.status, 0);
-  assert.match(`${result.stdout}${result.stderr}`, /Floci is only for sst dev/);
-}
-await rm(`${app}/.sst/outputs.json`, {force:true});
-const dev = await start(app, "positive");
-try {
-  const outputs = await until(
-    "app outputs",
-    async () => {
-      dev.check();
-      const value = JSON.parse(
-        await readFile(`${app}/.sst/outputs.json`, "utf8"),
-      );
-      return (
-        typeof value.url === "string" &&
-        value.url.startsWith("http") &&
-        value.bucket &&
-        value.table &&
-        value
-      );
-    },
-    180_000,
+  const saved = JSON.parse(await readFile("/work/result.json", "utf8"));
+  saved.identity = identity.Parameter.Value;
+  await writeFile("/work/result.json", JSON.stringify(saved, null, 2));
+
+  // Hold an actual update after a resource output resolves, then kill its process
+  // group. The gate is test fixture code, never a production fault-injection flag.
+  const configPath = `${app}/sst.config.ts`;
+  const originalConfig = (await readFile(configPath, "utf8")).replace(
+    "      url: fn.url,",
+    '      recovery: "completed",\n      url: fn.url,',
   );
-  // The function host is virtual; route it over loopback while retaining Host.
-  const functionURL = new URL(outputs.url);
-  const localURL = new URL(outputs.url);
-  localURL.hostname = "127.0.0.1";
-  async function invoke() {
-    const response = await request(localURL, {
-      headers: { Host: functionURL.host },
-    });
-    assert.equal(response.status, 200, await response.clone().text());
-    return response.json();
-  }
-  await until("live function response", async () => {
-    dev.check();
-    return (await invoke()).message === "hello from local SST";
-  });
-  const object = await s3.send(
-    new GetObjectCommand({ Bucket: outputs.bucket, Key: "hello.txt" }),
+  const gate =
+    '    if (process.env.SST_FLOCI_PREFLIGHT !== "1") bucket.name.apply(async () => { console.log("INTERRUPTED_UPDATE_READY"); await new Promise(() => {}); });\n';
+  const interruptedConfig = originalConfig.replace(
+    '    return {\n      recovery: "completed",',
+    gate + '    return {\n      recovery: "completed",',
   );
-  assert.equal(await object.Body.transformToString(), "hello from local SST");
-  for (const id of ["request", "subscriber"]) {
-    await until(`${id} DynamoDB write`, async () => {
-      dev.check();
-      const item = await dynamo.send(
-        new GetItemCommand({
-          TableName: outputs.table,
-          Key: { id: { S: id } },
-        }),
-      );
-      return item.Item?.message?.S === "hello from local SST";
-    });
-  }
-  const original = await readFile(`${app}/api.ts`, "utf8");
-  await writeFile(
-    `${app}/api.ts`,
-    original.replaceAll("hello from local SST", "hello after reload"),
+  assert.notEqual(
+    interruptedConfig,
+    originalConfig,
+    "interruption gate was not inserted",
   );
-  await until("live source reload", async () => {
-    dev.check();
-    return (await invoke()).message === "hello after reload";
-  });
-  await writeFile(
-    "/work/result.json",
-    JSON.stringify(
-      {
-        outputs,
-        resources: await inventory(),
-        negativeCases: Object.keys(negativeRuns),
-        egressDenied: true,
-        liveReload: true,
+  await writeFile(configPath, interruptedConfig);
+  const interrupted = await start(app, "interrupted-update");
+  try {
+    await until(
+      "update interruption gate",
+      () => {
+        interrupted.check();
+        return interrupted.output().includes("INTERRUPTED_UPDATE_READY");
       },
-      null,
-      2,
-    ),
-  );
-  console.log(
-    "Floci integration passed: preflight, isolation, live function, S3, DynamoDB, SQS subscriber, reload.",
-  );
-} finally {
-  await dev.stop();
+      180_000,
+    );
+  } finally {
+    await interrupted.stop("SIGKILL");
+    await writeFile(configPath, originalConfig);
+  }
+  const retry = await start(app, "interrupted-retry");
+  try {
+    await until(
+      "interrupted update lock",
+      () => {
+        return (
+          retry
+            .output()
+            .includes(
+              `SST_FLOCI_ENDPOINT=${endpoint} sst unlock --stage ${stage}`,
+            ) &&
+          retry.output().includes("Stop all dev/update processes") &&
+          retry.output().includes("never unlock an active update")
+        );
+      },
+      120_000,
+    );
+  } finally {
+    await retry.stop();
+  }
+  // The first retry must explain how to release the stale lock; unlock must use
+  // the Floci endpoint and preserve all state, not reset the emulator.
+  command(cli, ["unlock", "--stage", stage]);
+  saved.interruptedUpdate = "recovered with sst unlock";
+  await writeFile("/work/result.json", JSON.stringify(saved, null, 2));
 }
 
 // Returning to Floci must reuse its instance and stage state.
-const identityBefore = await ssm.send(
-  new GetParameterCommand({ Name: "/sst/floci/instance" }),
-);
 const result = JSON.parse(await readFile("/work/result.json", "utf8"));
-const restarted = await start(app, "restart");
+if (process.argv[2] === "verify-restart") {
+  assert.deepEqual(
+    await inventory(),
+    result.resources,
+    "Docker restart lost resource metadata",
+  );
+  const object = await s3.send(
+    new GetObjectCommand({ Bucket: result.outputs.bucket, Key: "hello.txt" }),
+  );
+  assert.equal(
+    await object.Body.transformToString(),
+    "hello after correction",
+    "Docker restart lost S3 data",
+  );
+  const item = await dynamo.send(
+    new GetItemCommand({
+      TableName: result.outputs.table,
+      Key: { id: { S: "subscriber" } },
+    }),
+  );
+  assert.equal(
+    item.Item?.message?.S,
+    "subscriber reloaded: hello after correction",
+    "Docker restart lost DynamoDB data",
+  );
+}
+await rm(`${app}/.sst/outputs.json`, { force: true });
+const restarted = await start(
+  app,
+  process.argv[2] === "verify-restart" ? "docker-restart" : "restart",
+);
 try {
   await until(
     "return to Floci",
     async () => {
       restarted.check();
+      const outputs = JSON.parse(
+        await readFile(`${app}/.sst/outputs.json`, "utf8"),
+      );
+      if (outputs.recovery !== "completed") return false;
       const originalURL = new URL(result.outputs.url);
       const localURL = new URL(originalURL);
       localURL.hostname = "127.0.0.1";
@@ -382,7 +539,8 @@ try {
         headers: { Host: originalURL.host },
       });
       return (
-        response.ok && (await response.json()).message === "hello after reload"
+        response.ok &&
+        (await response.json()).message === "hello after correction"
       );
     },
     180_000,
@@ -390,13 +548,32 @@ try {
   const identityAfter = await ssm.send(
     new GetParameterCommand({ Name: "/sst/floci/instance" }),
   );
-  assert.equal(identityAfter.Parameter.Value, identityBefore.Parameter.Value);
+  assert.equal(identityAfter.Parameter.Value, result.identity);
   assert.deepEqual(
     await inventory(),
     result.resources,
     "returning to Floci replaced resources",
   );
+  const persisted = await s3.send(
+    new GetObjectCommand({ Bucket: result.outputs.bucket, Key: "hello.txt" }),
+  );
+  assert.equal(
+    await persisted.Body.transformToString(),
+    "hello after correction",
+  );
+  await until("recovered subscriber", async () => {
+    const item = await dynamo.send(
+      new GetItemCommand({
+        TableName: result.outputs.table,
+        Key: { id: { S: "subscriber" } },
+      }),
+    );
+    return (
+      item.Item?.message?.S === "subscriber reloaded: hello after correction"
+    );
+  });
   result.restart = true;
+  if (process.argv[2] === "verify-restart") result.dockerRestart = true;
   await writeFile("/work/result.json", JSON.stringify(result, null, 2));
   console.log(
     "Floci restart passed: instance identity, stage state, and live function reused.",

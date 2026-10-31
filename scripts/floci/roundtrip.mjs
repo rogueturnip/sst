@@ -171,6 +171,41 @@ async function stop(child) {
   await exited;
 }
 
+// Await each phase, including its process cleanup, before starting the next.
+export async function runPhases(run) {
+  for (const [index, [target, mode]] of [
+    ["floci", "dev"],
+    ["aws", "dev"],
+    ["aws", "deploy"],
+    ["floci", "dev"],
+  ].entries())
+    await run({ index, target, mode });
+}
+
+export async function deployFresh(directory, deploy) {
+  const file = path.join(directory, ".sst/outputs.json");
+  await rm(file, { force: true });
+  await deploy(); // A failed deploy must never fall through to verification.
+  const outputs = JSON.parse(await readFile(file, "utf8"));
+  assert.equal(classifyURL(outputs.url), "aws");
+  return outputs;
+}
+
+export function assertPackagedFunction(config) {
+  assert.match(
+    config.Runtime || "",
+    /^nodejs\d+\.x$/,
+    "expected packaged Node.js runtime",
+  );
+  assert.equal(config.State, "Active");
+  assert.equal(config.LastUpdateStatus, "Successful");
+  for (const key of Object.keys(config.Environment?.Variables || {}))
+    assert(
+      !/^(SST_APPSYNC|SST_FLOCI|SST_FUNCTION_ID)/.test(key),
+      `live bridge environment remains: ${key}`,
+    );
+}
+
 export async function main(base = process.env) {
   const opts = options(base); // Validate every opt-in before filesystem or process work.
   await access(opts.cli, constants.X_OK);
@@ -182,6 +217,14 @@ export async function main(base = process.env) {
       path.join(root, "examples/aws-floci", file),
       path.join(directory, file),
     );
+  // Add an inspection output without changing the resources or application behavior.
+  const configFile = path.join(directory, "sst.config.ts");
+  const config = await readFile(configFile, "utf8");
+  assert(config.includes("url: fn.url,"), "example function output changed");
+  await writeFile(
+    configFile,
+    config.replace("url: fn.url,", "url: fn.url, functionName: fn.name,"),
+  );
   const pkg = JSON.parse(
     await readFile(path.join(root, "examples/aws-floci/package.json"), "utf8"),
   );
@@ -218,9 +261,9 @@ export async function main(base = process.env) {
   process.once("SIGINT", interrupt);
   process.once("SIGTERM", interrupt);
   try {
-    for (const [index, target] of ["floci", "aws", "floci"].entries()) {
+    await runPhases(async ({ index, target, mode }) => {
       abort.signal.throwIfAborted();
-      const label = `${index + 1}-${target}`;
+      const label = `${index + 1}-${target}-${mode}`;
       const env = targetEnvironment(base, target, opts);
       const initialMessage = `roundtrip ${label} initial ${Date.now()}`;
       await writeFile(
@@ -235,52 +278,81 @@ export async function main(base = process.env) {
       await rm(path.join(directory, ".sst/outputs.json"), { force: true });
       const log = await open(path.join(directory, `${label}.log`), "w");
       const args = [
-        "dev",
-        "--mode=basic",
+        mode,
+        ...(mode === "dev" ? ["--mode=basic"] : []),
         "--stage",
         opts.stage,
         ...(target === "floci" ? ["--floci"] : []),
       ];
       console.log(`Starting ${label}: ${opts.cli} ${args.join(" ")}`);
-      active = spawn(opts.cli, args, {
-        cwd: directory,
-        env,
-        detached: true,
-        stdio: ["ignore", log.fd, log.fd],
-      });
+      let deployedOutputs;
+      if (mode === "dev")
+        active = spawn(opts.cli, args, {
+          cwd: directory,
+          env,
+          detached: true,
+          stdio: ["ignore", log.fd, log.fd],
+        });
       let startError;
-      active.on("error", (error) => {
+      active?.on("error", (error) => {
         startError = error;
       });
       const child = active;
       const checkRunning = () => {
         abort.signal.throwIfAborted();
         if (startError) throw Object.assign(startError, { fatal: true });
-        if (child.exitCode !== null || child.signalCode !== null)
+        if (child && (child.exitCode !== null || child.signalCode !== null))
           throw Object.assign(
             new Error(`${label} exited; inspect ${label}.log`),
             { fatal: true },
           );
       };
       try {
-        const outputs = await until(
-          async () => {
-            checkRunning();
-            const outputs = JSON.parse(
-              await readFile(path.join(directory, ".sst/outputs.json"), "utf8"),
-            );
-            for (const key of ["url", "bucket", "table", "queue"])
-              assert(outputs[key], `missing output ${key}`);
-            assert.equal(
-              classifyURL(outputs.url),
-              target,
-              "outputs belong to the wrong target",
-            );
-            return outputs;
-          },
-          600_000,
-          abort.signal,
-        );
+        if (mode === "deploy") {
+          assert.equal(
+            active,
+            undefined,
+            "dev process must stop before deployment",
+          );
+          deployedOutputs = await deployFresh(directory, async () => {
+            try {
+              const result = await exec(opts.cli, args, {
+                cwd: directory,
+                env,
+                timeout: 600_000,
+                signal: abort.signal,
+                maxBuffer: 20 * 1024 * 1024,
+              });
+              await log.write(result.stdout + result.stderr);
+            } catch (error) {
+              await log.write((error.stdout || "") + (error.stderr || ""));
+              throw error;
+            }
+          });
+        }
+        const outputs =
+          deployedOutputs ||
+          (await until(
+            async () => {
+              checkRunning();
+              const outputs = JSON.parse(
+                await readFile(
+                  path.join(directory, ".sst/outputs.json"),
+                  "utf8",
+                ),
+              );
+              for (const key of ["url", "bucket", "table", "queue"])
+                assert(outputs[key], `missing output ${key}`);
+              assert.equal(
+                classifyURL(outputs.url),
+                target,
+                "outputs belong to the wrong target",
+              );
+              return outputs;
+            },
+            600_000,
+            abort.signal,
+          ));
         const awsEnv =
           target === "aws"
             ? env
@@ -400,39 +472,53 @@ export async function main(base = process.env) {
               abort.signal,
             );
         };
+        if (mode === "deploy") {
+          assertPackagedFunction(
+            await aws(
+              "lambda",
+              "get-function-configuration",
+              "--function-name",
+              outputs.functionName,
+            ),
+          );
+        }
         await verify(initialMessage);
-        const reloaded = `roundtrip ${label} ${Date.now()}`;
-        await writeFile(
-          path.join(directory, "api.ts"),
-          original.replaceAll("hello from local SST", reloaded),
-        );
-        await verify(reloaded);
-        const subscriberPrefix = `subscriber reloaded ${label} ${Date.now()}: `;
-        await writeFile(
-          path.join(directory, "subscriber.ts"),
-          originalSubscriber.replaceAll(
-            "record.body",
-            `${JSON.stringify(subscriberPrefix)} + record.body`,
-          ),
-        );
-        await verify(reloaded, subscriberPrefix + reloaded);
+        if (mode === "dev") {
+          const reloaded = `roundtrip ${label} ${Date.now()}`;
+          await writeFile(
+            path.join(directory, "api.ts"),
+            original.replaceAll("hello from local SST", reloaded),
+          );
+          await verify(reloaded);
+          const subscriberPrefix = `subscriber reloaded ${label} ${Date.now()}: `;
+          await writeFile(
+            path.join(directory, "subscriber.ts"),
+            originalSubscriber.replaceAll(
+              "record.body",
+              `${JSON.stringify(subscriberPrefix)} + record.body`,
+            ),
+          );
+          await verify(reloaded, subscriberPrefix + reloaded);
+        }
         const result = {
           target,
+          mode,
           identity,
           outputs,
-          hotReload: true,
-          subscriberHotReload: true,
+          hotReload: mode === "dev",
+          subscriberHotReload: mode === "dev",
+          packagedFunction: mode === "deploy",
         };
-        if (index === 2) {
+        if (index === 3) {
           assert.equal(
             identity,
             results[0].identity,
-            "Floci instance identity changed across cloud dev",
+            "Floci instance identity changed across cloud dev and deploy",
           );
           assert.deepEqual(
             outputs,
             results[0].outputs,
-            "Floci resource IDs changed across cloud dev",
+            "Floci resource IDs changed across cloud dev and deploy",
           );
         }
         results.push(result);
@@ -441,14 +527,18 @@ export async function main(base = process.env) {
           JSON.stringify(results, null, 2),
         );
         console.log(
-          `${label}: function URL, S3, DynamoDB, queue subscriber, API hot reload and subscriber hot reload passed`,
+          `${label}: function URL, S3, DynamoDB and queue subscriber passed; ${
+            mode === "dev"
+              ? "API and subscriber hot reload"
+              : "packaged Lambda execution"
+          } verified`,
         );
       } finally {
-        await stop(child);
+        if (child) await stop(child);
         active = undefined;
         await log.close();
       }
-    }
+    });
   } finally {
     process.removeListener("SIGINT", interrupt);
     process.removeListener("SIGTERM", interrupt);

@@ -191,6 +191,13 @@ func CmdMosaic(c *cli.Cli) error {
 		}
 	}
 	os.Setenv("SST_STAGE", p.App().Stage)
+	flociListener, err := p.ListenFlociBridge()
+	if err != nil {
+		return util.NewReadableError(err, "Could not reserve the Floci live-development bridge port")
+	}
+	if flociListener != nil {
+		defer flociListener.Close()
+	}
 	slog.Info("mosaic", "project", p.PathRoot())
 
 	wg.Go(func() error {
@@ -241,7 +248,7 @@ func CmdMosaic(c *cli.Cli) error {
 			}
 			wg.Go(func() error {
 				defer c.Cancel()
-				return aws.Start(c.Context, p, server, args.(map[string]interface{}))
+				return aws.Start(c.Context, p, server, args.(map[string]interface{}), flociListener)
 			})
 		case "cloudflare":
 			wg.Go(func() error {

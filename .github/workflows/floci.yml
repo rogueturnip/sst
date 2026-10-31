@@ -59,7 +59,7 @@ jobs:
           DOCKER_PUSH: "false"
       - name: Unit tests and types
         run: |
-          go test ./pkg/floci ./pkg/project/... ./cmd/sst/mosaic/aws/...
+          go test ./pkg/floci ./pkg/project/... ./pkg/server/... ./cmd/sst/cli ./cmd/sst/mosaic/errors ./cmd/sst/mosaic/aws/...
           bun run test:platform
           bun run typecheck
           node --test scripts/floci/roundtrip.test.mjs

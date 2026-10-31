@@ -58,7 +58,7 @@ func (p *Project) runStack(ctx context.Context, input *StackInput) error {
 	if input.Command != "diff" {
 		update, err = p.Lock(input.Command)
 		if err != nil {
-			if err == provider.ErrLockExists {
+			if err == provider.ErrLockExists && !p.Floci() {
 				bus.Publish(&ConcurrentUpdateEvent{})
 			}
 			return err

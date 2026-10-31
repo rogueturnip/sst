@@ -82,7 +82,12 @@ The harness checks external HTTPS denial; rejects unsupported components,
 options, raw resources, and invokes without creating bootstrap or first-set
 resources; rejects `deploy`, `diff`, and `refresh`; invokes the real live
 function URL; verifies S3 and DynamoDB writes plus the SQS subscriber; and
-changes source to verify live reload. Logs and `result.json` go to the temporary
+changes API and subscriber source to verify live reload. It also checks syntax-error
+correction, recovery from a killed update with an explicitly local unlock, and a real
+Docker restart with persisted identity, resource inventory, S3 data, and DynamoDB data.
+The killed-update fixture pauses config evaluation after the update lock is held;
+it does not simulate a provider being killed halfway through creating a resource.
+Logs and `result.json` go to the temporary
 directory printed at exit. Every process and readiness wait has a deadline.
 
 Resources are retained by default. CI uses `CI=true integration.sh --cleanup`
@@ -91,9 +96,9 @@ invocation, including its Lambda containers. It keeps logs for artifact upload.
 `--cleanup` is refused outside CI. The GitHub Actions workflow is
 `.github/workflows/floci.yml` and does not need AWS credentials or secrets.
 
-## Opt-in development round trip: Floci → AWS → Floci
+## Opt-in round trip: Floci dev → AWS dev → AWS deploy → Floci dev
 
-`roundtrip.mjs` tests the same copied `examples/aws-floci` application and stage through three sequential `sst dev` sessions. **It creates real AWS resources and retains them.** Use a dedicated AWS test profile and a disposable stage. The runner will not start any test work unless all three required opt-ins are set:
+`roundtrip.mjs` tests the same copied `examples/aws-floci` application and stage through three sequential `sst dev` sessions and an AWS `sst deploy` between the AWS and final Floci dev sessions. **It creates real AWS resources and retains them.** Use a dedicated AWS test profile and a disposable stage. The runner will not start any test work unless all three required opt-ins are set:
 
 ```sh
 # First build the local SDK, platform and CLI using the repository commands.
@@ -106,9 +111,9 @@ node scripts/floci/roundtrip.mjs
 
 To use an already running custom Floci instance, also set `SST_TEST_FLOCI_ENDPOINT=http://127.0.0.1:4567`. Otherwise `sst dev --floci` manages its normal local instance. Both targets use `us-east-1`. The AWS profile needs permissions for the example's S3, DynamoDB, SQS, Lambda, IAM and live-dev AppSync/bootstrap resources; authenticate it before running. The script does not choose or discover an AWS profile automatically.
 
-The runner copies the app into a new temporary directory, points its `sst` dependency at this checkout's `sdk/js`, installs dependencies, and runs local → AWS → local. It removes the previous `.sst/outputs.json` before each session, checks the function URL belongs to the expected target, invokes it, reads its S3 object and DynamoDB record, and waits for a fresh queue subscriber record. It changes the copied API handler and repeats these checks to verify Lambda live reload. It then changes the copied queue subscriber to prepend a unique marker, sends fresh invocations until that rebuilt subscriber processes a message, and verifies the transformed DynamoDB value. Each target starts with the original subscriber source, and successful results record both `hotReload` and `subscriberHotReload`. Returning to Floci must preserve the instance UUID and all resource output identifiers from the first session. Cloud child processes receive only the explicitly selected AWS profile, with inherited Floci settings, direct credentials, endpoint overrides and proxy settings removed.
+The runner copies the app into a new temporary directory, points its `sst` dependency at this checkout's `sdk/js`, installs dependencies, and runs Floci dev → AWS dev → AWS deploy → Floci dev. It removes the previous `.sst/outputs.json` before each session, checks the function URL belongs to the expected target, invokes it, reads its S3 object and DynamoDB record, and waits for a fresh queue subscriber record. It changes the copied API handler and repeats these checks to verify Lambda live reload. It then changes the copied queue subscriber to prepend a unique marker, sends fresh invocations until that rebuilt subscriber processes a message, and verifies the transformed DynamoDB value. Each target starts with the original subscriber source, and successful results record both `hotReload` and `subscriberHotReload`. Before AWS deployment, the AWS dev process and its workers are stopped. The runner resets both handler sources, removes stale outputs, and waits for `sst deploy` to succeed. It checks Lambda configuration for an active, successfully updated Node.js runtime with no SST bridge/AppSync environment variables, then invokes the deployed function URL and verifies fresh S3, DynamoDB and SQS subscriber delivery without any dev process. The copied config adds only a function-name output for this inspection; all phases use that same config. Deploy results record `packagedFunction: true` and do not claim hot reload. Returning to Floci must preserve the instance UUID and all resource output identifiers from the first session. Cloud child processes receive only the explicitly selected AWS profile, with inherited Floci settings, direct credentials, endpoint overrides and proxy settings removed.
 
-The printed temporary directory retains the copied app, logs for all three sessions, S3 response snapshots, and `results.json`. Successful sessions are recorded as they finish. Only the spawned dev sessions and their local worker processes are stopped; neither AWS nor Floci resources are removed. Cleanup is a separate, deliberate action using the retained app and matching target/stage. Re-running creates a new inspection directory but uses the same explicitly selected stage.
+The printed temporary directory retains the copied app, logs for all four phases, S3 response snapshots, and `results.json`. Successful sessions are recorded as they finish. Only the spawned dev sessions and their local worker processes are stopped; neither AWS nor Floci resources are removed. Cleanup is a separate, deliberate action using the retained app and matching target/stage. Re-running creates a new inspection directory but uses the same explicitly selected stage.
 
 The safety and environment tests run offline and do not need AWS or Docker:
 
@@ -116,4 +121,4 @@ The safety and environment tests run offline and do not need AWS or Docker:
 node --test scripts/floci/roundtrip.test.mjs
 ```
 
-These test missing opt-ins, credential/endpoint/proxy leakage across targets, stale-target URL detection and HTTP verification failures. A passing offline suite does not establish that the real three-session round trip passed; run the opt-in command to produce that evidence.
+These test missing opt-ins, credential/endpoint/proxy leakage across targets, stale-target URL detection, HTTP verification failures, sequential phase cleanup, failed-deploy short circuiting, missing or stale deployment outputs, and rejection of live bridge Lambda configuration. A passing offline suite does not establish that the real round trip or AWS deployment passed; run the opt-in command to produce that evidence.

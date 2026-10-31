@@ -23,7 +23,7 @@ finish() {
     # Only names allocated by this invocation; never sst-floci or spike instances.
     owned=$(docker ps -aq --filter "network=$name")
     if [[ -n "$owned" ]]; then docker rm -f $owned >/dev/null 2>&1 || true; fi
-    docker rm -f "$name-tests" "$name" >/dev/null 2>&1 || true
+    docker rm -f "$name-tests" "$name-recovery" "$name" >/dev/null 2>&1 || true
     volumes=$(docker volume ls -q --filter "label=io.floci.owner=$name/4566")
     if [[ -n "$volumes" ]]; then docker volume rm $volumes >/dev/null 2>&1 || true; fi
     docker network rm "$name" >/dev/null 2>&1 || true
@@ -51,12 +51,14 @@ done
 docker run --platform linux/amd64 --rm --volume "$work:/work" --volume "$repo:/repo:ro" \
   --volume "$cli:/usr/local/bin/sst:ro" "$image" node /work/integration.mjs prepare
 docker network create --internal "$name"
+docker volume create --label "io.floci.owner=$name/4566" "$name-data"
 gateway=$(docker network inspect --format '{{(index .IPAM.Config 0).Gateway}}' "$name")
 floci_ip="${gateway%.*}.10"
 docker run --platform linux/amd64 --detach --name "$name" --network "$name" --ip "$floci_ip" \
   --network-alias localhost.floci.io \
   --volume /var/run/docker.sock:/var/run/docker.sock \
-  --env FLOCI_STORAGE_MODE=memory \
+  --volume "$name-data:/app/data" \
+  --env FLOCI_STORAGE_MODE=persistent \
   --env "FLOCI_DOCKER_RESOURCE_NAMESPACE=$name" \
   --env "FLOCI_SERVICES_LAMBDA_CONTAINER_NAME_PREFIX=$name" \
   --env FLOCI_BASE_URL=http://localhost.floci.io:4566 \
@@ -74,3 +76,13 @@ docker run --platform linux/amd64 --name "$name-tests" --network "container:$nam
   --env SST_FLOCI_ENDPOINT=http://127.0.0.1:4566 \
   --env SST_SKIP_DEPENDENCY_CHECK=true \
   "$image" node /work/integration.mjs verify
+
+# Restart the actual emulator while preserving its owned data volume. A new
+# runner joins its new network namespace; no existing native instance is touched.
+docker restart "$name"
+docker run --platform linux/amd64 --name "$name-recovery" --network "container:$name" \
+  --volume "$work:/work" --volume "$repo:/repo:ro" \
+  --volume "$cli:/usr/local/bin/sst:ro" \
+  --env SST_FLOCI_ENDPOINT=http://127.0.0.1:4566 \
+  --env SST_SKIP_DEPENDENCY_CHECK=true \
+  "$image" node /work/integration.mjs verify-restart

@@ -73,7 +73,10 @@ func (c *Cli) InitProject() (*project.Project, error) {
 
 	var local *floci.Config
 	command := c.path[len(c.path)-1].Name
-	if c.Bool("floci") || ((os.Getenv("SST_FLOCI") != "" || os.Getenv("SST_FLOCI_ENDPOINT") != "") && (command == "shell" || command == "remove")) {
+	if c.Bool("floci") || ((os.Getenv("SST_FLOCI") != "" || os.Getenv("SST_FLOCI_ENDPOINT") != "") && (command == "shell" || command == "remove" || command == "unlock")) {
+		if err := floci.CheckNode(c.Context); err != nil {
+			return nil, util.NewReadableError(err, err.Error())
+		}
 		local, err = floci.Ensure(c.Context)
 		if err != nil {
 			return nil, util.NewReadableError(err, err.Error())

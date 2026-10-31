@@ -25,6 +25,7 @@ func Start(
 	p *project.Project,
 	s *server.Server,
 	args map[string]interface{},
+	flociListener net.Listener,
 ) error {
 	uncasted, _ := p.Provider("aws")
 	prov := uncasted.(*provider.AwsProvider)
@@ -46,13 +47,12 @@ func Start(
 		if handlerErr != nil {
 			return handlerErr
 		}
-		listener, listenErr := net.Listen("tcp", net.JoinHostPort("", endpoint.Port()))
-		if listenErr != nil {
-			return fmt.Errorf("start Floci bridge: %w", listenErr)
+		if flociListener == nil {
+			return fmt.Errorf("Floci bridge listener was not reserved")
 		}
 		srv := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second}
 		defer srv.Close()
-		go srv.Serve(listener)
+		go srv.Serve(flociListener)
 		conn, err = local.Dial("http://127.0.0.1:"+endpoint.Port(), p.Env()["SST_FLOCI_TOKEN"])
 		if err != nil {
 			return err

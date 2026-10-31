@@ -2,11 +2,74 @@ package project
 
 import (
 	"context"
+	"errors"
+	"net"
+	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 
 	"github.com/sst/sst/v3/pkg/floci"
+	"github.com/sst/sst/v3/pkg/project/provider"
 )
+
+func TestFlociRecoveryPreservesResources(t *testing.T) {
+	p := &Project{floci: &floci.Config{Endpoint: "http://127.0.0.1:4567", StateRoot: "/local-state"}, app: &App{Stage: "dev"}}
+	locked := p.flociUpdateError(provider.ErrLockExists).Error()
+	if !strings.Contains(locked, "SST_FLOCI_ENDPOINT=http://127.0.0.1:4567 sst unlock --stage dev") || !strings.Contains(locked, "Stop") {
+		t.Fatal(locked)
+	}
+	failed := p.flociUpdateError(errors.New("provider failed")).Error()
+	if strings.Contains(failed, "reset") || !strings.Contains(failed, "retained") {
+		t.Fatal(failed)
+	}
+}
+
+func TestFlociBridgeListenerRemainsReserved(t *testing.T) {
+	p := &Project{floci: &floci.Config{}, env: map[string]string{}}
+	listener, err := p.ListenFlociBridge()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	endpoint, err := url.Parse(p.env["SST_FLOCI_BRIDGE"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := net.JoinHostPort("127.0.0.1", endpoint.Port())
+	// Compete for the same wildcard binding; macOS permits separate per-IP binds.
+	competing, err := net.Listen("tcp", listener.Addr().String())
+	if err == nil {
+		competing.Close()
+		t.Fatal("another process can take the advertised bridge port")
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })}
+	defer server.Close()
+	go server.Serve(listener)
+	client := &http.Client{Transport: &http.Transport{Proxy: nil}}
+	response, err := client.Get("http://" + address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatal(response.Status)
+	}
+	server.Close()
+	replacement, err := net.Listen("tcp", address)
+	if err != nil {
+		t.Fatalf("port not released on shutdown: %v", err)
+	}
+	replacement.Close()
+}
+
+func TestCloudDoesNotReserveFlociBridge(t *testing.T) {
+	p := &Project{env: map[string]string{}}
+	listener, err := p.ListenFlociBridge()
+	if err != nil || listener != nil || p.env["SST_FLOCI_BRIDGE"] != "" {
+		t.Fatal("cloud reserved a local bridge")
+	}
+}
 
 func TestFlociRejectsUnverifiedProviderBeforeConnecting(t *testing.T) {
 	p := &Project{

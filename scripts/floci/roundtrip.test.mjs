@@ -130,3 +130,120 @@ test("invocation checks actual HTTP success and body rather than stale files", a
     await new Promise((resolve) => server.close(resolve));
   }
 });
+
+test("round trip waits for dev shutdown before AWS deploy and returns to Floci", async () => {
+  const { runPhases } = await import("./roundtrip.mjs");
+  const events = [];
+  let active = false;
+  await runPhases(async ({ target, mode }) => {
+    assert.equal(active, false, "previous phase is still running");
+    events.push(`${target}:${mode}`);
+    active = true;
+    // Model asynchronous dev cleanup: the next callback must await it.
+    await new Promise((resolve) => setImmediate(resolve));
+    active = false;
+  });
+  assert.deepEqual(events, ["floci:dev", "aws:dev", "aws:deploy", "floci:dev"]);
+});
+
+test("failed AWS deploy prevents verification and the return to Floci", async () => {
+  const { runPhases, deployFresh } = await import("./roundtrip.mjs");
+  const { mkdtemp, mkdir, writeFile, rm, access } = await import(
+    "node:fs/promises"
+  );
+  const { tmpdir } = await import("node:os");
+  const path = await import("node:path");
+  const directory = await mkdtemp(path.join(tmpdir(), "roundtrip-test-"));
+  const file = path.join(directory, ".sst/outputs.json");
+  const events = [];
+  try {
+    await mkdir(path.dirname(file));
+    await writeFile(
+      file,
+      JSON.stringify({ url: "https://old.lambda-url.us-east-1.on.aws/" }),
+    );
+    await assert.rejects(
+      runPhases(async ({ target, mode }) => {
+        events.push(`${target}:${mode}`);
+        if (mode === "deploy") {
+          await deployFresh(directory, async () => {
+            await assert.rejects(access(file), { code: "ENOENT" });
+            throw new Error("deployment failed");
+          });
+          events.push("verified");
+        }
+      }),
+      /deployment failed/,
+    );
+    assert.deepEqual(events, ["floci:dev", "aws:dev", "aws:deploy"]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("deploy requires fresh AWS outputs even when old outputs already point at AWS", async () => {
+  const { deployFresh } = await import("./roundtrip.mjs");
+  const { mkdtemp, mkdir, writeFile, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const path = await import("node:path");
+  const directory = await mkdtemp(path.join(tmpdir(), "roundtrip-test-"));
+  const file = path.join(directory, ".sst/outputs.json");
+  try {
+    await mkdir(path.dirname(file));
+    await writeFile(
+      file,
+      JSON.stringify({ url: "https://old.lambda-url.us-east-1.on.aws/" }),
+    );
+    await assert.rejects(
+      deployFresh(directory, async () => {}),
+      { code: "ENOENT" },
+    );
+    await assert.rejects(
+      deployFresh(directory, async () => {
+        await writeFile(
+          file,
+          JSON.stringify({ url: "http://localhost:4566/" }),
+        );
+      }),
+    );
+    const outputs = { url: "https://new.lambda-url.us-east-1.on.aws/" };
+    assert.deepEqual(
+      await deployFresh(directory, async () => {
+        await writeFile(file, JSON.stringify(outputs));
+      }),
+      outputs,
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("packaged Lambda check rejects live bridge runtimes and environment", async () => {
+  const { assertPackagedFunction } = await import("./roundtrip.mjs");
+  const config = {
+    Runtime: "nodejs22.x",
+    State: "Active",
+    LastUpdateStatus: "Successful",
+  };
+  assertPackagedFunction(config);
+  assert.throws(() =>
+    assertPackagedFunction({ ...config, Runtime: "provided.al2023" }),
+  );
+  assert.throws(() =>
+    assertPackagedFunction({ ...config, LastUpdateStatus: "InProgress" }),
+  );
+  for (const key of [
+    "SST_APPSYNC_HTTP",
+    "SST_APPSYNC_REALTIME",
+    "SST_FLOCI_BRIDGE",
+    "SST_FUNCTION_ID",
+  ])
+    assert.throws(
+      () =>
+        assertPackagedFunction({
+          ...config,
+          Environment: { Variables: { [key]: "bridge" } },
+        }),
+      /live bridge environment/,
+    );
+});

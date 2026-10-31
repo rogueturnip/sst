@@ -106,7 +106,7 @@ func flociCommandAllowed(command string, flag, inherited bool) error {
 	if flag && command != "dev" {
 		return fmt.Errorf("Floci is only for sst dev")
 	}
-	if inherited && command != "dev" && command != "shell" && command != "remove" && command != "floci" && command != "ui" {
+	if inherited && command != "dev" && command != "shell" && command != "remove" && command != "unlock" && command != "floci" && command != "ui" {
 		return fmt.Errorf("Floci is only for sst dev")
 	}
 	return nil

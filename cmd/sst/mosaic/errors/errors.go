@@ -71,6 +71,10 @@ var transformers = []ErrorTransformer{
 }
 
 func Transform(err error) error {
+	var readable *util.ReadableError
+	if errors.As(err, &readable) && readable.Error() != "" {
+		return readable
+	}
 	for _, t := range transformers {
 		if ok, err := t(err); ok {
 			return err

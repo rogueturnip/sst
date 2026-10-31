@@ -106,7 +106,7 @@ func (s *Server) Start(ctx context.Context, p *project.Project) error {
 	server := &http.Server{
 		Handler: s.Mux,
 	}
-	server.Addr = fmt.Sprintf("0.0.0.0:%d", s.Port)
+	server.Addr = serverAddress(p.Floci(), s.Port)
 	log.Info("server", "addr", server.Addr)
 	serverPath := resolveServerFile(p.PathConfig(), p.App().Stage)
 	if p.Floci() {
@@ -135,7 +135,7 @@ func (s *Server) Start(ctx context.Context, p *project.Project) error {
 		log.Info("https enabled")
 		proxy := httputil.NewSingleHostReverseProxy(u)
 		go http.ListenAndServeTLS(
-			fmt.Sprintf("0.0.0.0:%d", s.Port+1000),
+			serverAddress(p.Floci(), s.Port+1000),
 			certPath,
 			keyPath,
 			proxy,
@@ -150,6 +150,16 @@ func (s *Server) Start(ctx context.Context, p *project.Project) error {
 	log.Info("shutting down server")
 	go server.Shutdown(ctx)
 	return nil
+}
+
+// The authenticated Floci bridge has its own Docker-reachable listener. The
+// dev APIs expose decrypted state and RPCs, so they must stay on the host.
+func serverAddress(local bool, port int) string {
+	host := "0.0.0.0"
+	if local {
+		host = "127.0.0.1"
+	}
+	return net.JoinHostPort(host, fmt.Sprint(port))
 }
 
 func port() (int, error) {
