@@ -1,0 +1,5 @@
+{
+  "name": "aws-api-shared-handler",
+  "private": true,
+  "type": "module"
+}
