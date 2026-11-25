@@ -5,7 +5,7 @@ import { matchesTrigger, type Definition } from "./definition.js";
 import { fat, slim } from "./blobs.js";
 import { checkEvent, checkSignal, cleanEvent, DEDUP_MS, MESSAGE_TTL_MS, type Engine } from "./engine.js";
 import { evaluate, getPath } from "./expression.js";
-import { hash, key, runId as makeRunId, ulid } from "./ids.js";
+import { callRunId, hash, key, runId as makeRunId, ulid } from "./ids.js";
 import { findRun, runStatus } from "./runs.js";
 import { deriveRoot, sign, verify } from "./sign.js";
 import { LOCK_GRACE_MS, lockTtl, settleLock, singletonKey, takeLock, type LockRuns } from "./singleton.js";
@@ -28,14 +28,28 @@ const warn = (message: string, fields: Record<string, unknown>) =>
   console.warn(JSON.stringify({ level: "warn", message, ...fields }));
 
 /** A message the router won't ever route. It's dropped, not retried. */
-class Rejected extends Error {}
+class Rejected extends Error {
+  /** For a call, who waits for its answer. */
+  answer?: { parent: string; by: string };
+}
 
 export async function routeBatch(
   sqsEvent: SQSEvent,
   registry: Map<string, Registered>,
   engine: Engine,
 ): Promise<SQSBatchResponse> {
-  const results = await Promise.allSettled(sqsEvent.Records.map((record) => routeRecord(record, registry, engine)));
+  const results = await Promise.allSettled(
+    sqsEvent.Records.map(async (record) => {
+      try {
+        await routeRecord(record, registry, engine);
+      } catch (error) {
+        // A caller isn't left waiting for a call that's dropped.
+        if (error instanceof Rejected && error.answer)
+          await notifyParent(engine, error.answer.parent, { name: "InvokeError", message: error.message }, error.answer.by);
+        throw error;
+      }
+    }),
+  );
   const batchItemFailures: SQSBatchItemFailure[] = [];
   results.forEach((result, i) => {
     if (result.status === "fulfilled") return;
@@ -84,13 +98,19 @@ function parse(record: SQSRecord): Message {
     return { kind: "signal", signal: message.signal, data: message.data, tenant: message.tenant, id: String(message.id ?? "") };
   }
   if (message.kind === "event" || message.kind === "call") {
+    const reject = (reason: string) => {
+      const error = new Rejected(reason);
+      if (message.kind === "call" && typeof message.parent === "string" && message.parent && typeof message.fn === "string")
+        error.answer = { parent: message.parent, by: callRunId(message.fn, message.event ?? {}, message.parent) };
+      return error;
+    };
     try {
       checkEvent(message.event ?? {}, "event", message.kind === "call");
     } catch (error) {
-      throw new Rejected((error as Error).message);
+      throw reject((error as Error).message);
     }
-    if (typeof message.event.id !== "string") throw new Rejected("The event has no ID.");
-    if ((message.event.tenant ?? undefined) !== (group ?? undefined)) throw new Rejected("The event's tenant isn't its message group.");
+    if (typeof message.event.id !== "string") throw reject("The event has no ID.");
+    if ((message.event.tenant ?? undefined) !== (group ?? undefined)) throw reject("The event's tenant isn't its message group.");
     // Only what's a sender's to set.
     const event = cleanEvent(message.event);
     if (message.kind === "event") return { kind: "event", event };
@@ -110,10 +130,16 @@ async function routeRecord(record: SQSRecord, registry: Map<string, Registered>,
     const entry = registry.get(message.fn);
     // The same answer whether it's there or not: it isn't the caller's to find out.
     if (!entry?.def.external)
-      return notifyParent(engine, message.parent, { name: "InvokeError", message: `The function "${message.fn.slice(0, 128)}" doesn't take calls from other EventFlows.` });
+      return notifyParent(
+        engine,
+        message.parent,
+        { name: "InvokeError", message: `The function "${message.fn.slice(0, 128)}" doesn't take calls from other EventFlows.` },
+        callRunId(message.fn, message.event, message.parent),
+      );
     return startRun(entry.def, { ...message.event, name: "inngest/function.invoked" }, engine, registry, {
       parent: message.parent,
-      identity: `call\n${JSON.stringify([message.event.tenant ?? null, message.event.id, message.parent])}`,
+      runId: callRunId(message.fn, message.event, message.parent),
+      identity: "call",
       received: receivedAt,
       external: true,
     });
@@ -126,14 +152,14 @@ async function routeRecord(record: SQSRecord, registry: Map<string, Registered>,
     if (message.exp < Date.now()) {
       warn("Dropped a message that expired", { kind: message.kind, fn: message.fn });
       if (message.parent)
-        await notifyParent(engine, message.parent, { name: "InvokeError", message: `The run of "${message.fn}" expired before it started.` });
+        await notifyParent(engine, message.parent, { name: "InvokeError", message: `The run of "${message.fn}" expired before it started.` }, message.runId);
       return;
     }
     const entry = registry.get(message.fn);
     if (!entry) {
       warn("Skipped a run of a function that's gone", { fn: message.fn });
       if (message.parent)
-        await notifyParent(engine, message.parent, { name: "InvokeError", message: `The function "${message.fn}" isn't served.` });
+        await notifyParent(engine, message.parent, { name: "InvokeError", message: `The function "${message.fn}" isn't served.` }, message.runId);
       return;
     }
     return startRun(entry.def, await fat(engine, message.event), engine, registry, {
@@ -141,7 +167,7 @@ async function routeRecord(record: SQSRecord, registry: Map<string, Registered>,
       runId: message.runId,
       root: message.root,
       received: message.kind === "start" ? (message.received ?? receivedAt) : receivedAt,
-      held: message.kind === "start",
+      held: message.kind === "start" && message.held === true,
       fired: message.kind === "start" ? message.fired : undefined,
       batch: message.kind === "start" ? message.batch : undefined,
       external: message.kind === "start" ? message.external : undefined,
@@ -180,8 +206,9 @@ async function routeRecord(record: SQSRecord, registry: Map<string, Registered>,
   await engine.store.finishEvent(item, DEDUP_MS);
 }
 
-async function notifyParent(engine: Engine, parent: string, error: { name: string; message: string }) {
-  await engine.callback(parent, { ok: false, error } satisfies InvokeOutcome);
+/** Answer the run that invoked another. `by` is that other's ID: it takes no one else's answer. */
+async function notifyParent(engine: Engine, parent: string, error: { name: string; message: string }, by: string) {
+  await engine.callback(parent, { ok: false, error, by } satisfies InvokeOutcome);
 }
 
 async function resolveWaits(event: WireEvent, receivedAt: number, engine: Engine, registry: Map<string, Registered>) {
@@ -229,10 +256,14 @@ export async function stop(
   const stopped = await engine.stopRun(run.arn);
   const { status, payload } = await runStatus(engine, run.arn);
   if (!stopped && status !== "STOPPED") return false;
+  // Once, however often it's stopped: a timer may come long after.
+  const told = key("ST", payload?.runId ?? run.runId);
+  if (!stopped && (await engine.store.owner(told))) return false;
   const parent = run.parent ?? payload?.parent;
-  if (parent) await notifyParent(engine, parent, { name: "Cancelled", message: run.message });
+  if (parent && payload) await notifyParent(engine, parent, { name: "Cancelled", message: run.message }, payload.runId);
   if (payload?.lock) await engine.store.lockFree(payload.lock, payload.runId);
   if (payload?.event) await sendSystemEvents(registry, engine, { fn: payload.fn, runId: payload.runId, event: payload.event, outcome: "cancelled" });
+  await engine.store.claim(told, "told", ((engine.resource.runTimeoutSeconds ?? MAX_WAIT_S) + 90 * 86_400) * 1000);
   return true;
 }
 
@@ -385,7 +416,7 @@ async function routeTimer(message: Extract<Message, { kind: "timer" }>, registry
   const message_ = "The run didn't start in time.";
   if (run) return void (await stop(engine, registry, { arn: run.arn, runId: timer.runId, parent: timer.parent, message: message_ }));
   // It's held, and finds that it's cancelled when it's due.
-  if (timer.parent) await notifyParent(engine, timer.parent, { name: "Cancelled", message: message_ });
+  if (timer.parent) await notifyParent(engine, timer.parent, { name: "Cancelled", message: message_ }, timer.runId);
 }
 
 interface StartOptions {
@@ -434,7 +465,7 @@ export async function startRun(
 
   const skip = async (reason: string, text: string) => {
     log(text, { fn: def.id, event: hash(event.id, 10) });
-    if (opts.parent) await notifyParent(engine, opts.parent, { name: "InvokeError", message: `The run was skipped by its ${reason}.` });
+    if (opts.parent) await notifyParent(engine, opts.parent, { name: "InvokeError", message: `The run was skipped by its ${reason}.` }, id);
   };
   if (admission.decision === "skip") return skip(admission.reason, SKIPPED[admission.reason] ?? "Skipped a run");
   if (admission.decision === "debounce") return debounce(def, event, opts.received, engine, registry);
@@ -466,6 +497,7 @@ export async function startRun(
           root: opts.root ?? deriveRoot(id),
           received: opts.received,
           exp: admission.at + MESSAGE_TTL_MS,
+          held: true,
           ...(opts.fired ? { fired: true } : {}),
           ...(opts.batch ? { batch: opts.batch } : {}),
           ...(opts.parent ? { parent: opts.parent } : {}),

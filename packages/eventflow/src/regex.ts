@@ -71,6 +71,11 @@ export class Regex {
         return;
       }
       case "repeat": {
+        // Nothing, however often, is nothing.
+        const before = p.length;
+        this.emit(a.of);
+        if (p.length === before) return;
+        p.length = before;
         for (let i = 0; i < a.min; i++) this.emit(a.of);
         if (a.max === Infinity) {
           const split = { op: "split" as const, a: p.length + 1, b: 0 };

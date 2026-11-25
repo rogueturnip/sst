@@ -55,6 +55,7 @@ class Crash extends Error {}
 /** A worker: a store of its own, which may crash for good at any call. */
 function worker() {
   const store = new DynamoStore(table) as any;
+  store.grantMs = LEASE;
   let dead = false;
   store.alive = () => {
     if (dead) throw new Crash();
@@ -200,8 +201,7 @@ const clean = worker();
 for (const l of [shared, ...tenants.map((t) => t.own)]) {
   await clean.dispatch(l, async () => false);
   const s = await clean.readLimit(l);
-  // A lease handed to a step whose worker crashed lasts as long as an invocation may.
-  const live = Object.values<any>(s.leases).filter((x: any) => !x.granted);
+  const live = Object.values<any>(s.leases);
   if (live.length) left.push(`${l.item.slice(-4)}: ${live.length} leases`);
 }
 const expected = tenants.length * runs * 3;

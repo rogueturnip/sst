@@ -43,10 +43,12 @@ export async function takeLock(engine: Engine, runs: LockRuns, item: string, id:
     const arn = held.arn ?? (await runs.find(held.run))?.arn;
     const running = arn ? await runs.running(arn) : held.until > Date.now();
     if (running && mode === "skip") return false;
+    // Too many that it can't be sure of: those first.
+    if ((held.replaces?.length ?? 0) >= 50) await settleLock(engine, runs, item, held.run);
     const mine: Lock = {
       run: id,
       until: Date.now() + LOCK_GRACE_MS,
-      replaces: [...(held.replaces ?? []), { run: held.run, ...(arn ? { arn } : {}) }].slice(-20),
+      replaces: [...(held.replaces ?? []), { run: held.run, ...(arn ? { arn } : {}) }],
     };
     if (!(await engine.store.lockMove(item, held.run, mine, lockTtl(engine)))) continue;
     await settleLock(engine, runs, item, id);

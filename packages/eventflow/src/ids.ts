@@ -48,6 +48,11 @@ export function runId(functionId: string, identity: string) {
   return `${slug || "fn"}-${hash(`${functionId}\n${identity}`)}`;
 }
 
+/** The run ID of a call from another EventFlow, which both can work out. */
+export function callRunId(fn: string, event: { id?: unknown; tenant?: unknown }, parent: string) {
+  return runId(fn, `call\n${JSON.stringify([event.tenant ?? null, event.id ?? null, parent])}`);
+}
+
 /**
  * The ID of a replay of a run. A replay is a new execution, so it needs a new name.
  */

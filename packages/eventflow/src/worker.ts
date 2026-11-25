@@ -1,16 +1,18 @@
 import * as durable from "@aws/durable-execution-sdk-js";
 import { AsyncLocalStorage } from "async_hooks";
 import { createHash } from "crypto";
-import { fat, fatValue, slim, slimValue } from "./blobs.js";
+import { fat, fatValue, GoneError, slim, slimValue } from "./blobs.js";
+import { led, link, unlinked, type Link } from "./chain.js";
+import { Invocation } from "./invocation.js";
 import { priorityMs, type Definition } from "./definition.js";
 import { parseDuration, toDurableSeconds, type DurationInput } from "./duration.js";
-import { checkSignal, mergeSessions, MESSAGE_TTL_MS, toWireEvent, type Engine, type SendPayload } from "./engine.js";
+import { checkEvent, checkSignal, mergeSessions, MESSAGE_TTL_MS, toWireEvent, type Engine, type SendPayload } from "./engine.js";
 import { InvokeFailedError, NonRetriableError, RetryAfterError, SignalConflictError, StepFailedError } from "./errors.js";
 import { bind, conjuncts, evaluate, getPath, parseExpression, paths, type Expression } from "./expression.js";
-import { hash, key, runId as makeRunId } from "./ids.js";
+import { callRunId, hash, key, runId as makeRunId } from "./ids.js";
 import { Hooks } from "./middleware.js";
 import { publish, type TopicRef } from "./realtime.js";
-import { named, replayLogger, type Replay } from "./named.js";
+import { named, replayLogger, replayOf, type Replay } from "./named.js";
 import { keyed, sign, verify } from "./sign.js";
 import type { LeaseWaiter, Limit, Memo } from "./store.js";
 import { sendSystemEvents, wantedSystemEvents } from "./system.js";
@@ -26,10 +28,14 @@ export interface Registered {
 }
 
 /** A function's return, as the run that invoked it gets it. */
-export type InvokeOutcome =
+export type InvokeOutcome = (
   /** A large result is in the table, or for another EventFlow, isn't returned. */
   | { ok: true; result?: unknown; blob?: string }
-  | { ok: false; error: { name: string; message: string } };
+  | { ok: false; error: { name: string; message: string } }
+) & {
+  /** The run whose outcome it is. The one that invoked it takes no other's. */
+  by?: string;
+};
 
 export { NonRetriableError, RetryAfterError, StepFailedError, InvokeFailedError, SignalConflictError } from "./errors.js";
 
@@ -100,14 +106,39 @@ class TryAgain extends Error {
   readonly isUnrecoverableInvocation = true;
 }
 
-/** Read the table outside a step. It's tried again by itself; after that, by Lambda. */
-async function read<T>(what: string, fn: () => Promise<T>): Promise<T> {
+/**
+ * Read the table outside a step, for as long as the invocation lasts. What's gone, is.
+ * Out of time, the invocation ends, and Lambda starts another that reads it: in the function
+ * by waiting for that, as an error there would be the function's.
+ */
+async function read<T>(inv: Invocation, lambda: { getRemainingTimeInMillis?: () => number } | undefined, what: string, fn: () => Promise<T>, inFunction = true): Promise<T> {
+  return inv.hold(async () => {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await fn();
+      } catch (error) {
+        if (error instanceof GoneError) throw error;
+        const left = lambda?.getRemainingTimeInMillis?.() ?? 60_000;
+        if (left < 5000 || attempt > 200) {
+          if (inFunction) return never();
+          throw new TryAgain(`Failed to read ${what}: ${errorInfo(error).message}`);
+        }
+        if (attempt === 5) log("warn", `Failed to read ${what}. It's tried again.`, { error: errorInfo(error).message });
+        await new Promise((r) => setTimeout(r, Math.min(2000, 100 * 2 ** attempt)));
+      }
+    }
+  });
+}
+
+/** Try a write of the table again, in a step, for up to a minute: an outage is as likely as not over by then. */
+async function patient<T>(fn: () => Promise<T>): Promise<T> {
+  const end = Date.now() + 60_000;
   for (let attempt = 0; ; attempt++) {
     try {
       return await fn();
     } catch (error) {
-      if (attempt >= 3) throw new TryAgain(`Failed to read ${what}: ${errorInfo(error).message}`);
-      await new Promise((r) => setTimeout(r, 100 * 2 ** attempt));
+      if (Date.now() > end) throw error;
+      await new Promise((r) => setTimeout(r, Math.random() * Math.min(4000, 100 * 2 ** attempt) + 50));
     }
   }
 }
@@ -216,11 +247,16 @@ interface RunState {
   done: Record<string, Memo>;
   /** This attempt's steps that are still running. */
   busy: Set<Promise<unknown>>;
+  /** Those of them that wait for a run they invoked. */
+  invokes: Set<Promise<unknown>>;
   /** The attempt has ended: its branches that go on start nothing more. */
   fence: { down: boolean };
   replay: Replay;
+  inv: Invocation;
   /** The step names that are taken. */
   used: Set<string>;
+  /** The last call of each step ID that's used, for which led to which. */
+  calls: Map<string, Link>;
   /** A step's place, where it's been claimed already. */
   claimed?: Claim;
   /** The sessions its events share, for what it sends. */
@@ -268,7 +304,17 @@ function occurrence(state: RunState, id: string) {
 function claim(state: RunState, input: StepInput): Claim {
   if (state.claimed) return state.claimed;
   const first = state.counts.size === 0;
-  return { id: occurrence(state, stepId(input)), first };
+  const id = stepId(input);
+  const at = link(state);
+  const before = state.calls.get(id);
+  // Which of two branches uses an ID first is whichever is faster, and on a replay may be
+  // the other: then one would get the other's result, and its idempotency key.
+  if (before && !led(at, before))
+    throw new UsageError(
+      `The step ID "${id}" is used in two branches that run at once, so which is which can't be told when the run goes on later. Give each an ID of its own, like \`${id}-\${item.id}\`.`,
+    );
+  state.calls.set(id, at);
+  return { id: occurrence(state, id), first };
 }
 
 /** The sessions that all of a run's events are in. */
@@ -316,6 +362,8 @@ export function limitsFor(def: Definition, event: WireEvent): Limit[] {
 function makeStep(state: RunState) {
   const { engine, def } = state;
   const ctx = named(state.ctx, state.replay);
+  const { inv } = state;
+  const reading = <T>(what: string, fn: () => Promise<T>) => read(inv, ctx.lambdaContext, what, fn);
   const limits = limitsFor(def, state.event);
   const tenant = tenantOf(def, state.event);
   const priority = priorityMs(def, state.event);
@@ -337,7 +385,7 @@ function makeStep(state: RunState) {
 
   // What a step returned, or the error it failed with, for the function's next attempt, if
   // it throws outside a step.
-  const record = <T>(id: string, promise: Promise<T>): Promise<T> => {
+  const record = <T>(id: string, promise: Promise<T>, invokes = false): Promise<T> => {
     const kept = promise.then(
       (v) => {
         state.done[id] = { v: v === undefined ? null : v };
@@ -352,6 +400,7 @@ function makeStep(state: RunState) {
       },
     );
     state.busy.add(kept);
+    if (invokes) state.invokes.add(kept);
     const over = () => void state.busy.delete(kept);
     kept.then(over, over);
     return kept;
@@ -367,6 +416,11 @@ function makeStep(state: RunState) {
       fromStep.add(error);
       return Promise.reject(error);
     }
+    if (value instanceof BlobMemo)
+      return reading("the result", () => fatValue(engine, { blob: value.blob })).then((v) => {
+        state.done[id] = { v };
+        return v;
+      });
     state.done[id] = { v: value };
     return Promise.resolve(value);
   };
@@ -374,21 +428,35 @@ function makeStep(state: RunState) {
   const leaseMs = () => Math.max(30_000, (ctx.lambdaContext?.getRemainingTimeInMillis?.() ?? 900_000) + 10_000);
   // A wake that throws may not have reached the step: the store keeps it in line.
   const wake = (w: LeaseWaiter) =>
-    engine.callback(w.callbackId, { leaseId: w.leaseId }).catch((error) => {
+    engine.callback(w.callbackId, { leaseId: w.leaseId, placed: w.placed }).catch((error) => {
       log("warn", "Failed to wake a step in line. It stays in line.", { run: w.runId, error: errorInfo(error).message });
       throw error;
     });
 
   // Give back a step's leases, and hand them to the steps in line. An error here
   // mustn't fail the step, which would run its code again: the leases expire.
+  // False when it couldn't: then it's done in a step of its own, for as long as it takes. Not
+  // here: the step's work is done, and its result isn't saved until this ends.
   const giveBack = async (leaseId: string) => {
     try {
       // Straight to the next step in line, where there's one.
       await engine.store.handoff(limits, leaseId, tenant, wake);
+      return true;
     } catch (error) {
-      log("warn", "Failed to give back a lease. It expires on its own.", { run: state.runId, error: errorInfo(error).message });
+      log("warn", "Failed to give back a lease. It's tried again.", { run: state.runId, error: errorInfo(error).message });
+      return false;
     }
   };
+  const giveBackAfter = (child: durable.DurableContext, name: string, leaseId: string) =>
+    // For as long as the lease may last: after that it has expired. The step's work is done,
+    // or wasn't begun: it isn't failed for this.
+    child.step(name, async () => engine.store.handoff(limits, leaseId, tenant, wake), RELEASING).then(
+      () => {},
+      (error) => {
+        if (isDurableInternal(error)) throw error;
+        log("warn", "Failed to give back a lease. It expires on its own.", { run: state.runId, error: errorInfo(error).message });
+      },
+    );
 
   // Take a lease on every limit at once, or wait in line until a release can give the
   // step all of them. A step never holds one lease while it waits for another, so two
@@ -396,28 +464,29 @@ function makeStep(state: RunState) {
   // `place.joined` is when the step first joined the line, so asking again, or after
   // a lease was lost, keeps its place. It comes from a step's result, so a replay has
   // the same.
-  const takeLeases = async (child: durable.DurableContext, leaseId: string, tag: string, place: { joined?: number }) => {
+  const takeLeases = async (child: durable.DurableContext, leaseId: string, tag: string, place: { joined?: number }): Promise<string[] | undefined> => {
     for (let round = 0; ; round++) {
       const t = `${tag}.${round}`;
-      const got = await child.step(`lease:${t}`, async () => {
-        const result = await engine.store.acquire(limits, leaseId, tenant, leaseMs()).catch((error) => {
+      const got = await child.step(`lease:${t}`, async (c) => {
+        const first = round === 0 && c.attempt === 1;
+        const result = await engine.store.acquire(limits, leaseId, tenant, leaseMs(), first).catch((error) => {
           log("warn", "Failed to ask for a lease. Joining the line.", { run: state.runId, error: errorInfo(error).message });
           return "full" as const;
         });
         // When it asked, for its place in line. It's this step's result, so joining the
         // line again after an error is joining in the same place, not twice.
         return { granted: result === "granted", at: Date.now() };
-      });
-      if (got.granted) return;
+      }, LEASING);
+      if (got.granted) return undefined;
       // Runs that came first go first, so what's begun is finished. A priority moves it.
       place.joined ??= (state.at ?? got.at) - priority;
-      const [woken, callbackId] = await child.createCallback<{ leaseId: string }>(`queued:${t}`, {
+      const [woken, callbackId] = await child.createCallback<{ leaseId: string; placed?: string[] }>(`queued:${t}`, {
         timeout: { seconds: leaseWaitSeconds(round) },
         serdes: json as any,
       });
       // Join the line, then hand out what's free: the leases may have freed up in
       // between. If they're the step's, it goes on without waiting.
-      const mine = await child.step(`enqueue:${t}`, async () => {
+      const mine = await child.step(`enqueue:${t}`, async (c) => {
         const at = place.joined!;
         const waiter = {
           leaseId,
@@ -428,21 +497,20 @@ function makeStep(state: RunState) {
           at,
           expiresAt: Date.now() + leaseWaitSeconds(round) * 1000,
         };
-        const result = await engine.store.enqueue(waiter);
-        if (result === "held") return true;
-        let mine = false;
+        const result = await engine.store.enqueue(waiter, round === 0 && c.attempt === 1);
+        if (result === "held") return { placed: undefined };
+        let mine: { placed?: string[] } | undefined;
         for (const limit of limits)
           await engine.store.dispatch(limit, async (w) => {
             if (w.callbackId !== callbackId) return wake(w);
-            mine = true;
+            mine = { placed: w.placed };
             return true;
           }, waiter);
-        return mine;
-      });
-      if (mine) return;
+        return mine ?? null;
+      }, LEASING);
+      if (mine) return mine.placed;
       try {
-        await woken;
-        return;
+        return (await woken)?.placed;
       } catch (error) {
         // Not woken in time: ask again, keeping its place. If the old callback is
         // woken later, the wake fails, and the leases are handed on.
@@ -455,7 +523,10 @@ function makeStep(state: RunState) {
   // The key of a step's side effect, for idempotencyKey() called in the step.
   const keyFor = (id: string) => idempotencyKey(state.root, state.namespace, id);
   const inStep = async <T>(id: string, attempt: number, fn: () => T | Promise<T>): Promise<T> => {
+    // The invocation has ended, and goes on in a Lambda that's been thawed: the next one runs it.
+    if (inv.over) return never();
     await state.start();
+    if (inv.over) return never();
     return stepKeys.run({ key: keyFor(id), attempt: attempt - 1 }, async () => fn());
   };
 
@@ -506,7 +577,7 @@ function makeStep(state: RunState) {
               // The lease's ID comes from the run, the step and the attempt, so a lease
               // step that's retried asks for the same lease.
               const leaseId = `${hash(`${state.runId}\n${state.namespace}\n${state.attempt}\n${id}`, 12)}.${attempt}.${lost}`;
-              await takeLeases(child, leaseId, `${attempt}.${lost}`, place);
+              const placed = await takeLeases(child, leaseId, `${attempt}.${lost}`, place);
               const outcome = await child.step(
                 attempt === 1 && lost === 0 ? "run" : `run:${attempt}.${lost}`,
                 async () => {
@@ -514,19 +585,21 @@ function makeStep(state: RunState) {
                   // expired. Check they're still held before the work starts.
                   // One that can't be checked, as when DynamoDB keeps failing, counts as
                   // lost: the step takes a new one, and its code hasn't run.
-                  const held = await engine.store.renew(limits, leaseId, leaseMs()).catch((error) => {
+                  if (inv.over) return never();
+                  const held = await patient(() => engine.store.renew(limits, leaseId, leaseMs(), false, placed)).catch((error) => {
                     log("warn", "Failed to renew a lease. Taking a new one.", { run: state.runId, error: errorInfo(error).message });
                     return false;
                   });
                   if (!held) return { lost: true as const };
+                  let outcome: { ok: true; value: any; kept?: true } | { ok: false; error: { name: string; message: string }; delay: number | undefined; kept?: true };
                   try {
-                    return { ok: true as const, value: jsonify(await inStep(id, attempt, () => fn(...args))) };
+                    outcome = { ok: true, value: jsonify(await inStep(id, attempt, () => fn(...args))) };
                   } catch (error) {
                     const delay = once ? undefined : retryDelay(error, attempt, def.retries, `${state.runId}\n${id}\n${attempt}`);
-                    return { ok: false as const, error: errorInfo(error), delay };
-                  } finally {
-                    await giveBack(leaseId);
+                    outcome = { ok: false, error: errorInfo(error), delay };
                   }
+                  if (!(await giveBack(leaseId))) outcome.kept = true;
+                  return outcome;
                 },
                 {
                   retryStrategy: () => ({ shouldRetry: false }),
@@ -537,7 +610,7 @@ function makeStep(state: RunState) {
                 // An at-most-once step that the worker stopped part way fails here. It
                 // won't run again, so its leases are given back now.
                 async (error) => {
-                  await child.step(`release:${attempt}.${lost}`, async () => giveBack(leaseId));
+                  await giveBackAfter(child, `release:${attempt}.${lost}`, leaseId);
                   return {
                     ok: false as const,
                     error: isInterruption(error) ? interrupted(id) : errorInfo(error),
@@ -547,10 +620,11 @@ function makeStep(state: RunState) {
               );
               if ("lost" in outcome) {
                 // A lease expired before the step ran. Give back the rest.
-                await child.step(`release:${attempt}.${lost}`, async () => giveBack(leaseId));
+                await giveBackAfter(child, `release:${attempt}.${lost}`, leaseId);
                 if (lost >= 5) return { ok: false as const, error: { name: "LeaseError", message: `The step "${id}" kept losing its lease.` } };
                 continue;
               }
+              if ("kept" in outcome && outcome.kept) await giveBackAfter(child, `release:${attempt}.${lost}`, leaseId);
               if (outcome.ok) return { ok: true as const, value: outcome.value };
               if (outcome.delay === undefined) return { ok: false as const, error: outcome.error };
               await child.wait(`retry:${attempt}`, toDurableSeconds(outcome.delay));
@@ -602,6 +676,9 @@ function makeStep(state: RunState) {
     return slept(id, eager(ctx.wait(id, seconds)));
   };
 
+  // An event with its data, where that's large and in the table.
+  const whole = (e: any) => (e?.blob ? reading("the event's data", () => fat(engine, e)) : e);
+
   const waitForEvent = (
     idInput: string | { id: string },
     options: { event: string | { name: string }; timeout: DurationInput | Date; match?: string; if?: string },
@@ -609,7 +686,7 @@ function makeStep(state: RunState) {
     if (state.fence.down) return never();
     const { id, first } = claim(state, idInput);
     const saved = earlier(id);
-    if (saved) return saved;
+    if (saved) return saved.then(whole);
     begin(first);
     const name = typeof options.event === "string" ? options.event : options.event?.name;
     if (!name) throw new UsageError(`The step "${id}" waits for an event with no name.`);
@@ -652,7 +729,11 @@ function makeStep(state: RunState) {
         },
         { subType: "EventFlowWait" },
       ),
-    ).then((e: any) => (e?.blob ? read("the event's data", () => fat(engine, e)) : e)) as Promise<WireEvent | null>);
+    ).then((e: any) => {
+      // Only its event answers it.
+      if (e !== null && e?.name !== name) throw new UsageError(`The step "${id}" was answered by something that isn't the event "${name}".`);
+      return whole(e);
+    }) as Promise<WireEvent | null>);
   };
 
   const waitForSignal = (
@@ -705,6 +786,9 @@ function makeStep(state: RunState) {
       ),
     ).then((outcome: any) => {
       if (outcome.conflict) throw new SignalConflictError(options.signal);
+      // Only its signal answers it.
+      if (outcome.value !== null && outcome.value?.signal !== options.signal)
+        throw new UsageError(`The step "${id}" was answered by something that isn't the signal "${options.signal}".`);
       return outcome.value;
     }));
   };
@@ -742,6 +826,12 @@ function makeStep(state: RunState) {
     // child that never answers, like one AWS stopped, doesn't keep it waiting forever.
     const timeout = bounded(timeoutMs ?? Math.min(maxWaitMs, DEFAULT_INVOKE_TIMEOUT_MS), `timeout of step "${id}"`);
 
+    const identity = `invoke\n${state.runId}\n${state.namespace}\n${state.attempt ? `${state.attempt}\n` : ""}${id}`;
+    try {
+      checkEvent({ name: "inngest/function.invoked", ...(sessions ? { sessions } : {}) }, "event", true);
+    } catch (error) {
+      throw new UsageError((error as Error).message);
+    }
     return record(id, eager(
       ctx.runInChildContext(
         id,
@@ -753,7 +843,6 @@ function makeStep(state: RunState) {
             // The child run is new for each run that invokes it, as a retry of the
             // parent needs its own. Its root, which its idempotency keys come from,
             // is the same for every retry and replay of the parent.
-            const identity = `invoke\n${state.runId}\n${state.namespace}\n${state.attempt ? `${state.attempt}\n` : ""}${id}`;
             const root = hash(JSON.stringify([state.root, state.namespace, id]), 26);
             const event: WireEvent = {
               id: hash(identity),
@@ -785,8 +874,16 @@ function makeStep(state: RunState) {
             // In the history, so a rerun of this run can find the child, and check it.
             return { runId: childRunId };
           });
+          // The run whose answer this is: no one else's is taken.
+          const by =
+            app === undefined ? makeRunId(target, identity) : callRunId(target, { id: hash(identity), tenant: state.event.tenant }, callbackId);
           try {
-            return await result;
+            const answer = await result;
+            if (answer?.by === by) return answer;
+            return {
+              ok: false,
+              error: { name: "InvokeError", message: `The step "${id}" was answered by something that isn't the run it invoked.` },
+            } satisfies InvokeOutcome;
           } catch (error) {
             if (error instanceof durable.CallbackTimeoutError)
               return {
@@ -800,8 +897,8 @@ function makeStep(state: RunState) {
       ),
     ).then((outcome: InvokeOutcome) => {
       if (!outcome.ok) throw new InvokeFailedError(outcome.error.message, target);
-      return outcome.blob ? read("the result", () => fatValue(engine, { blob: outcome.blob })) : outcome.result;
-    }));
+      return outcome.blob ? reading("the result", () => fatValue(engine, { blob: outcome.blob })) : outcome.result;
+    }), true);
   };
 
   const sendEvent = (idInput: string | { id: string }, payload: SendPayload | SendPayload[]) => {
@@ -939,11 +1036,13 @@ function withMiddleware(state: RunState): Record<string, any> {
       const [fn, ...input] = takesInput ? rest : [undefined];
       // Only a step that runs code has an input.
       let args = takesInput ? input : rest;
-      const changed = await hooks.transform("transformStepInput", {
-        stepInfo: { hashedId: info.hashedId, memoized: undefined, stepType: type },
-        stepOptions: options,
-        input: takesInput ? args : [],
-      });
+      const changed = await state.inv.hold(() =>
+        hooks.transform("transformStepInput", {
+          stepInfo: { hashedId: info.hashedId, memoized: undefined, stepType: type },
+          stepOptions: options,
+          input: takesInput ? args : [],
+        }),
+      );
       options = changed.stepOptions;
       // A step's place, and its idempotency key, come from its ID.
       if (stepId(options) !== id) throw new UsageError(`A middleware changes the ID of the step "${id}", which EventFlow doesn't allow.`);
@@ -954,6 +1053,7 @@ function withMiddleware(state: RunState): Record<string, any> {
       const handler = takesInput
         ? (...a: any[]) => handledWith(state, given, (stepKeys.getStore()?.attempt ?? 0) + 1, () => fn(...a))
         : undefined;
+      state.inv.given();
       return hooks.wrap("wrapStep", { ctx: state.args, stepInfo: given }, () =>
         takesInput ? call(options, handler, ...args) : call(options, ...args),
       );
@@ -1001,9 +1101,47 @@ async function handledWith(state: RunState, info: ReturnType<Hooks["info"]>, att
   }
 }
 
+/** Where an earlier run's large result is. */
+class BlobMemo {
+  constructor(readonly blob: string) {}
+}
+
 /** The error an earlier attempt's step failed with. */
 class FailedMemo {
   constructor(readonly error: { name: string; message: string }) {}
+}
+
+/** The step tools, as a function gets them: the invocation is told as they're called, and as they answer. */
+function told(state: RunState, tools: Record<string, any>): Record<string, any> {
+  const tell = (fn: any) => {
+    const called = (...args: any[]) => {
+      // A step in a step isn't one: it would be found in no history.
+      if (stepKeys.getStore()) throw new UsageError("A step can't be called in another step. Call it in the function.");
+      state.inv.came();
+      const answer = fn(...args);
+      return typeof answer?.then !== "function"
+        ? answer
+        : answer.then(
+            (v: any) => (state.inv.given(), v),
+            (e: any) => {
+              state.inv.given();
+              throw e;
+            },
+          );
+    };
+    return Object.assign(called, { config: fn.config ? () => called : undefined });
+  };
+  const out: Record<string, any> = {};
+  for (const [name, tool] of Object.entries(tools)) {
+    if (typeof tool === "function") out[name] = tell(tool);
+    else {
+      const group: Record<string, any> = {};
+      for (const key of Object.keys(tool)) if (key !== "models") group[key] = tell(tool[key]);
+      if (name === "ai") Object.defineProperty(group, "models", { get: unsupported("step.ai.models") });
+      out[name] = group;
+    }
+  }
+  return out;
 }
 
 function escape(text: string) {
@@ -1164,7 +1302,7 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
       // The run that invoked it would otherwise wait for it.
       if (payload.parent)
         await ctx.step("sst:return", async () => {
-          await engine.callback(payload.parent!, { ok: false, error: { name: "InvokeError", message } } satisfies InvokeOutcome);
+          await engine.callback(payload.parent!, { ok: false, error: { name: "InvokeError", message }, by: payload.runId } satisfies InvokeOutcome);
         });
       throw new NonRetriableError(message);
     }
@@ -1174,11 +1312,19 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
     const runId = runIdFromArn(arn) ?? payload.runId;
     const ttlMs = (engine.resource.runTimeoutSeconds ?? MAX_WAIT_S) * 1000;
 
+    const inv = Invocation.of(ctx);
+    // Whether this invocation goes on from what's saved. The SDK's own logger can't tell, in a
+    // virtual context.
+    const replay: Replay = replayOf(ctx);
+    // The run's own operations, by name too, so one that's only sometimes there doesn't move
+    // the rest.
+    const root = named(ctx, replay);
+
     // Tell the run that invoked this one how it ended. A run that's gone is fine; any
     // other error is retried, so the result isn't lost.
     const finish = async (outcome: InvokeOutcome) => {
       if (!payload.parent) return;
-      await ctx.step("sst:return", async () => {
+      await root.step("sst:return", async () => {
         let answer = outcome;
         if (outcome.ok) {
           // A large result is kept for the run that invoked it. One of another EventFlow has
@@ -1191,7 +1337,7 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
               : outcome;
           else answer = { ok: true, blob: kept.blob };
         }
-        await engine.callback(payload.parent!, answer);
+        await engine.callback(payload.parent!, { ...answer, by: payload.runId });
       }, ENDING);
     };
 
@@ -1224,15 +1370,18 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
     let hooks = new Hooks([], options.client, {});
     let settled: Promise<void> | undefined;
     const tellRun = async (name: string, fn: () => Promise<void>) => {
-      await ctx.step(name, fn, ENDING);
+      await root.step(name, fn, ENDING);
     };
 
-    // Whether this invocation goes on from what's saved. The SDK's own logger can't tell, in a
-    // virtual context.
-    const replay: Replay = { on: Object.keys((ctx as any)._executionContext?._stepData ?? {}).length > 1 };
     // What its functions deferred. Each time the function is replayed it defers the same.
     const defers = new Map<string, Deferred>();
     let shared = sessionsOf(events);
+    // What a retry was given of the run it retries.
+    const given = () => {
+      const memo: Record<string, unknown> = Object.assign(Object.create(null), payload.memo ?? {});
+      for (const [id, blob] of Object.entries(payload.memoBlobs ?? {})) memo[id] = new BlobMemo(blob);
+      return memo;
+    };
     const newState = (more: Partial<RunState>): RunState => ({
       ctx,
       engine,
@@ -1240,7 +1389,7 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
       registry,
       runId,
       event,
-      memo: Object.assign(Object.create(null), payload.memo ?? {}),
+      memo: given(),
       // The root is signed with the payload. A payload from before roots is its own.
       root: payload.root ?? payload.runId,
       namespace: "",
@@ -1249,9 +1398,12 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
       attempt: 0,
       done: Object.create(null),
       busy: new Set(),
+      invokes: new Set(),
       fence: { down: false },
       replay,
+      inv,
       used: new Set(),
+      calls: new Map(),
       sessions: shared,
       defers,
       deferCounts: new Map(),
@@ -1266,7 +1418,7 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
       const args: Record<string, unknown> = {
         event: events[0],
         events,
-        step: withMiddleware(forState),
+        step: told(forState, withMiddleware(forState)),
         group: { parallel: <T>(fn: () => Promise<T>) => fn() },
         runId,
         logger: replayLogger(forState.ctx.logger as object, forState.replay, () => stepKeys.getStore() !== undefined),
@@ -1293,6 +1445,7 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
       if (def.deferred) args.parents = events.map((e) => ({ fnSlug: e.from?.fn ?? "", runId: e.from?.runId ?? "" }));
       // Start a deferred function once this run has ended.
       args.defer = (id: string, input: { function: any; data?: unknown; meta?: SendPayload["meta"] }) => {
+        if (stepKeys.getStore()) throw new UsageError(`defer("${id}") can't be called in a step. Call it in the function.`);
         const target = input?.function?.id ?? input?.function?.opts?.id;
         if (!target || !registry.get(target)?.def.deferred)
           throw new UsageError(`defer("${id}") needs a function made by createDefer(), and served by this EventFlow.`);
@@ -1300,12 +1453,18 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
         const checked = schema?.validate(input.data);
         if (checked && typeof checked.then === "function") throw new UsageError(`defer("${id}") needs a schema that checks at once.`);
         if (checked?.issues) throw new UsageError(`The data of defer("${id}") doesn't match its schema: ${checked.issues.map((i: any) => i.message).join("; ")}`);
+        const sessions = mergeSessions(engine.propagateSessions ? forState.sessions : undefined, input.meta);
+        try {
+          checkEvent({ name: "inngest/deferred.schedule", ...(sessions ? { sessions } : {}) }, "event", true);
+        } catch (error) {
+          throw new UsageError((error as Error).message);
+        }
         if (forState.fence.down) return { abort: () => {} };
         const name = occurrence({ counts: forState.deferCounts, used: forState.deferUsed } as any, stepId(id));
         defers.set(`${forState.namespace}\n${name}`, {
           fn: target,
           data: jsonify(checked ? checked.value : (input.data ?? {})),
-          sessions: mergeSessions(engine.propagateSessions ? forState.sessions : undefined, input.meta),
+          sessions,
         });
         return { abort: () => void defers.delete(`${forState.namespace}\n${name}`) };
       };
@@ -1315,66 +1474,73 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
     type Outcome = { ok: true; value: unknown } | { ok: false; error: unknown };
     let cancelKeys: { key: string; createdAt: number; callbackId: string }[] = [];
 
+    // The run's events, and its middleware.
+    const load = async () => {
+      if (payload.batch) {
+        const batch = payload.batch;
+        events = await read(inv, ctx.lambdaContext, "the run's batch", async () => engine.store.batchEvents(await engine.store.batchRead(batch.item, batch.n)), false);
+        if (!events.length) throw new NonRetriableError("The run's batch is gone.");
+      }
+      if (events.some((e) => e.blob))
+        events = await read(inv, ctx.lambdaContext, "the run's event", () => Promise.all(events.map((e) => fat(engine, e))), false);
+      event = events[0];
+      shared = sessionsOf(events);
+      hooks = new Hooks([...(options.middleware ?? []), ...def.middleware], options.client, { id: def.id, name: def.name, opts: { id: def.id } });
+    };
+
     // Everything the run does, up to how it ended. What it throws is the run's failure, so
     // it's ended like any other: its parent is told, and its singleton given back.
     const body = async (): Promise<Outcome> => {
       // A singleton's run that lost it to a later one, between being started and running.
       if (payload.lock) {
-        const mine = await ctx.step("sst:singleton", async () => (await engine.store.lockRead(payload.lock!))?.run === payload.runId);
+        const mine = await root.step("sst:singleton", async () => (await engine.store.lockRead(payload.lock!))?.run === payload.runId, LEASING);
         if (!mine) throw new CancelledError("The run was cancelled by a later one, as it's a singleton.");
       }
       // One with a concurrency limit starts with its first lease.
-      if (def.timeouts && !def.concurrency.length) await ctx.step("sst:started", async () => start());
-
-      if (payload.batch) {
-        const batch = payload.batch;
-        events = await read("the run's batch", async () => engine.store.batchEvents(await engine.store.batchRead(batch.item, batch.n)));
-        if (!events.length) throw new NonRetriableError("The run's batch is gone.");
-      }
-      if (events.some((e) => e.blob)) events = await read("the run's event", () => Promise.all(events.map((e) => fat(engine, e))));
-      event = events[0];
-      shared = sessionsOf(events);
-      hooks = new Hooks([...(options.middleware ?? []), ...def.middleware], options.client, { id: def.id, name: def.name, opts: { id: def.id } });
+      if (def.timeouts && !def.concurrency.length) await root.step("sst:started", async () => start(), STARTING);
+      await load();
 
       // Listen for the events that cancel the run, before it does anything else.
       if (def.cancelOn.length) {
-        const listening = await ctx.step("sst:cancelOn", async () => {
-          const keys: typeof cancelKeys = [];
-          let found = false;
-          for (const c of def.cancelOn) {
-            const { field, value, condition } = matcher("cancelOn", event, c);
-            const expiresAt = Date.now() + (c.timeoutMs ?? ttlMs);
-            const heard = await listen(engine, {
-              name: c.name,
-              tenant: payload.event.tenant,
-              field,
-              value,
-              condition,
-              callbackId: `${STOP}${arn}`,
-              runId,
-              expiresAt,
-              kind: "cancel",
-              parent: payload.parent,
-            });
-            keys.push(heard.registered);
-            found ||= !!heard.event;
-          }
-          return { keys, found };
-        }, SETUP);
-        cancelKeys = listening.keys;
+        const listening = await root.step(
+          "sst:cancelOn",
+          async () => {
+            const keys: typeof cancelKeys = [];
+            let found = false;
+            for (const c of def.cancelOn) {
+              const { field, value, condition } = matcher("cancelOn", event, c);
+              const expiresAt = Date.now() + (c.timeoutMs ?? ttlMs);
+              const heard = await listen(engine, {
+                name: c.name,
+                tenant: payload.event.tenant,
+                field,
+                value,
+                condition,
+                callbackId: `${STOP}${arn}`,
+                runId,
+                expiresAt,
+                kind: "cancel",
+                parent: payload.parent,
+              });
+              keys.push(heard.registered);
+              found ||= !!heard.event;
+            }
+            return { keys, found };
+          },
+          SETUP,
+        );
         // An event that came as it registered cancels it now, as it would have later.
         if (listening.found) throw new CancelledError("The run was cancelled by an event.");
       }
 
-      // An attempt of the function. It's in a virtual context, which costs no operation, so
-      // an attempt that failed keeps its place in the history when it isn't run again.
+      // An attempt of the function. It's in a virtual context, which costs no operation.
       const attempt = async (n: number, memo: Record<string, unknown>) => {
         // What an attempt that failed deferred, the next does again, if it comes to it.
         defers.clear();
         const state = newState({ memo, attempt: n });
         state.settled = () => (settled ??= hooks.tell("onMemoizationEnd", { ctx: state.args }));
         let outcome: Outcome | undefined;
-        await ctx.runInChildContext(
+        await root.runInChildContext(
           "sst:attempt",
           async (child) => {
             state.ctx = child;
@@ -1386,7 +1552,7 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
                 args = (await hooks.transform("transformFunctionInput", { ctx: args, steps: {} })).ctx;
                 state.args = args;
               }
-              const value = await hooks.wrap("wrapFunctionHandler", { ctx: args }, async () => entry.handler(args));
+              const value = await hooks.wrap("wrapFunctionHandler", { ctx: args }, async () => unlinked(() => entry.handler(args)));
               if (hooks.any) await state.settled();
               outcome = { ok: true, value: jsonify(value) };
             } catch (error) {
@@ -1394,23 +1560,24 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
               outcome = { ok: false, error };
             }
           },
-          { virtualContext: true },
+          { virtualContext: true, key: `attempt ${n}` },
         );
+        // It has ended, however it did: its branches that go on start nothing more.
+        state.fence.down = true;
         return { state, outcome: outcome! };
       };
 
       // How earlier attempts failed. It's kept in the table before the wait for the next one,
       // so a replay doesn't run them again, where they might not fail.
-      const failures = def.retries > 0 ? await read("how the run's attempts failed", () => engine.store.failures(payload.runId)) : [];
-      const memo = Object.assign(Object.create(null), payload.memo ?? {}) as Record<string, unknown>;
+      const failures =
+        def.retries > 0 ? await read(inv, ctx.lambdaContext, "how the run's attempts failed", () => engine.store.failures(payload.runId), false) : [];
+      const memo = given();
       for (let n = 0; ; n++) {
         let failure = failures.find((f) => f.attempt === n);
         let state: RunState | undefined;
         let error: unknown;
-        if (failure) {
-          await ctx.runInChildContext("sst:attempt", async () => {}, { virtualContext: true });
-          error = Object.assign(new Error(failure.error.message), { name: failure.error.name });
-        } else {
+        if (failure) error = Object.assign(new Error(failure.error.message), { name: failure.error.name });
+        else {
           const tried = await attempt(n, { ...memo });
           if (tried.outcome.ok) return tried.outcome;
           ({ state } = tried);
@@ -1422,43 +1589,101 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
             error instanceof StepFailedError ||
             error instanceof InvokeFailedError ||
             (error !== null && typeof error === "object" && fromStep.has(error)));
-        const delayMs = failure ? failure.delayMs : final ? undefined : retryDelay(error, n + 1, def.retries, `${runId}\n${n}`);
-        // From here its branches that go on start nothing more: the next attempt does.
-        if (state && delayMs !== undefined) state.fence.down = true;
-        // The same place in the history whether it's told now, or was before a replay.
+        let delayMs = failure ? failure.delayMs : final ? undefined : retryDelay(error, n + 1, def.retries, `${runId}\n${n}`);
+        if (!failure && delayMs !== undefined && !(await quiet(state!))) {
+          log("warn", "A step of the function didn't end after the function failed, so it isn't tried again.", { run: runId });
+          delayMs = undefined;
+        }
+        const last = delayMs === undefined;
         if (hooks.has("onRunError"))
-          await ctx.step(`sst:onRunError:${n}`, async () =>
-            hooks.tell("onRunError", { ctx: state?.args, error, isFinalAttempt: delayMs === undefined }),
-          );
+          await root.step(`sst:onRunError:${n}`, async () => hooks.tell("onRunError", { ctx: state?.args, error, isFinalAttempt: last }));
         if (delayMs === undefined) return { ok: false, error };
         if (!failure) {
-          // Its steps in flight finish first, so the next attempt has their results too.
-          while (state!.busy.size) await Promise.allSettled([...state!.busy]);
           log("warn", "The function failed outside a step. It's tried again.", { run: runId, attempt: n + 1, error: errorInfo(error).message });
           failure = { attempt: n, error: errorInfo(error), delayMs, memo: { ...state!.done } };
           const kept = failure;
-          await read("how the run's attempt failed", () => engine.store.putFailure(payload.runId, kept, ttlMs + 86_400_000));
+          await read(inv, ctx.lambdaContext, "how the run's attempt failed", () => engine.store.putFailure(payload.runId, kept, ttlMs + 86_400_000), false);
         }
-        await ctx.wait(`sst:retry:${n + 1}`, toDurableSeconds(failure.delayMs));
+        await root.wait(`sst:retry:${n + 1}`, toDurableSeconds(failure.delayMs));
         // What every attempt's steps returned, not just the last's: one that failed early
         // didn't come to all of them.
         for (const [id, m] of Object.entries(failure.memo)) memo[id] = "v" in m ? m.v : new FailedMemo(m.e);
       }
     };
 
+    // Its steps in flight finish, so the next attempt has their results too. An invoke is
+    // waited for as long as it takes; a step's code, up to a minute, as it may be waiting for
+    // something that only a branch that's ended would do.
+    const quiet = async (state: RunState) => {
+      const end = Date.now() + 60_000;
+      while (state.busy.size) {
+        const steps = [...state.busy].filter((p) => !state.invokes.has(p));
+        if (!steps.length) {
+          await Promise.allSettled([...state.busy]);
+          continue;
+        }
+        const left = end - Date.now();
+        if (left <= 0) return false;
+        await Promise.race([Promise.allSettled(steps), new Promise((r) => setTimeout(r, Math.min(left, 60_000)).unref?.())]);
+      }
+      return true;
+    };
+
+    // How the run ended is saved before anything is done about it: a replay doesn't run the
+    // function again, where it might end in another way.
+    const OUTCOME = "sst:outcome";
+    const after = (o: Outcome) =>
+      !!payload.parent ||
+      def.cancelOn.length > 0 ||
+      !!payload.lock ||
+      defers.size > 0 ||
+      hooks.has("onRunComplete") ||
+      (!o.ok && !!def.onFailure) ||
+      wantedSystemEvents(registry, engine, { event: payload.event, outcome: o.ok ? "completed" : "failed" }).length > 0;
     let outcome: Outcome;
-    try {
-      outcome = await body();
-    } catch (error) {
-      if (isDurableInternal(error)) throw error;
-      outcome = { ok: false, error };
+    const wasSaved = root.saved(OUTCOME);
+    if (wasSaved) {
+      // Its events, for what's told of it. Without them it's still ended.
+      await load().catch((error) => {
+        if (isDurableInternal(error)) throw error;
+      });
+      outcome = { ok: true, value: undefined };
+    } else {
+      try {
+        outcome = await body();
+      } catch (error) {
+        if (isDurableInternal(error)) throw error;
+        outcome = { ok: false, error };
+      }
+    }
+    if (wasSaved || after(outcome) || (!outcome.ok && errorInfo(outcome.error).name === CANCELLED)) {
+      const ended = outcome;
+      const saved = (await root.step(
+        OUTCOME,
+        async () => ({
+          ...(ended.ok ? { ok: true, ...(await slimValue(engine, `outcome\n${payload.runId}`, ended.value)) } : { ok: false, error: errorInfo(ended.error) }),
+          defers: await Promise.all(
+            [...defers].map(async ([name, d]) => [name, { ...d, data: undefined, ...(await slimValue(engine, `defer\n${payload.runId}\n${name}`, d.data)) }] as const),
+          ),
+        }),
+        LEASING,
+      )) as any;
+      if (wasSaved) {
+        defers.clear();
+        for (const [name, d] of saved.defers)
+          defers.set(name, { fn: d.fn, sessions: d.sessions, data: await read(inv, ctx.lambdaContext, "what it deferred", () => fatValue(engine, d), false) });
+        outcome = saved.ok
+          ? { ok: true, value: await read(inv, ctx.lambdaContext, "the run's result", () => fatValue(engine, saved), false) }
+          : { ok: false, error: Object.assign(new Error(saved.error.message), { name: saved.error.name }) };
+      }
+      if (def.cancelOn.length && root.saved("sst:cancelOn")) cancelKeys = (await root.step("sst:cancelOn", async () => ({ keys: [] as typeof cancelKeys, found: false }))).keys;
     }
 
     const isCancelled = !outcome.ok && (outcome.error instanceof CancelledError || errorInfo(outcome.error).name === CANCELLED);
     if (!outcome.ok && def.onFailure && !isCancelled) {
       const { error } = outcome;
       try {
-        await ctx.runInChildContext("onFailure", async (child) => {
+        await root.runInChildContext("onFailure", async (child) => {
           const ts = await child.step("sst:failed-at", async () => Date.now());
           const state = newState({ ctx: child, memo: Object.create(null), namespace: "onFailure", start: async () => {} });
           const args = makeArgs(state, {
@@ -1471,7 +1696,7 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
             },
           });
           state.args = args;
-          await def.onFailure!(args);
+          await unlinked(() => def.onFailure!(args));
         });
       } catch (failure) {
         if (isDurableInternal(failure)) throw failure;
@@ -1554,13 +1779,24 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
     if (!outcome.ok) {
       // It's cancelled, not failed, as it would be by an event that came later.
       if (isCancelled)
-        await ctx.step("sst:stop", async () => void (await engine.stopRun(arn)), { retryStrategy: () => ({ shouldRetry: false }) }).catch(() => {});
+        await root.step("sst:stop", async () => void (await engine.stopRun(arn)), { retryStrategy: () => ({ shouldRetry: false }) }).catch(() => {});
       throw isCancelled ? Object.assign(new Error(error!.message), { name: "Cancelled" }) : outcome.error;
     }
     return outcome.value;
   });
 }
 
+/** What it takes to run a step is tried for as long as an outage may last: it isn't the step's failure. */
+const LEASING: durable.StepConfig<any> = {
+  retryStrategy: (_error, attempt) => (attempt >= 100 ? { shouldRetry: false } : { shouldRetry: true, delay: { seconds: Math.min(60, 2 ** Math.min(attempt, 6)) } }),
+};
+const RELEASING: durable.StepConfig<any> = {
+  retryStrategy: (_error, attempt) => (attempt >= 8 ? { shouldRetry: false } : { shouldRetry: true, delay: { seconds: Math.min(60, 2 ** attempt) } }),
+};
+/** Whether it started is read and written until it's known. */
+const STARTING: durable.StepConfig<any> = {
+  retryStrategy: (error, attempt) => (error?.name === CANCELLED || /didn't start in time/.test(error?.message ?? "") ? { shouldRetry: false } : LEASING.retryStrategy!(error, attempt)),
+};
 /** What ends a run is tried for as long as an outage may last: what waits for it waits for days. */
 const ENDING: durable.StepConfig<any> = {
   retryStrategy: (_error, attempt) => (attempt >= 30 ? { shouldRetry: false } : { shouldRetry: true, delay: { seconds: Math.min(300, 2 ** Math.min(attempt, 8)) } }),

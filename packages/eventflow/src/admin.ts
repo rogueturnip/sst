@@ -3,6 +3,7 @@ import { toWireEvent, type Engine, type SendPayload } from "./engine.js";
 import type { Definition } from "./definition.js";
 import { cancelAll, cancelRun, getRun, listRuns, rerun, rerunAll, type ListInput } from "./runs.js";
 import { parseLease } from "./store.js";
+import { lockRuns } from "./router.js";
 import { ADMIN_VERSION } from "./types.js";
 import type { Registered } from "./worker.js";
 
@@ -294,11 +295,11 @@ async function run(op: string, args: Record<string, any>, registry: Map<string, 
     case "runs.cancelAll":
       return cancelAll(engine, list(), registry);
     case "runs.replay":
-      return rerun(engine, runId(), false, { force: args.force === true, again: args.again === true });
+      return rerun(engine, lockRuns(engine, registry), runId(), false, { force: args.force === true, again: args.again === true });
     case "runs.retry":
-      return rerun(engine, runId(), true, { force: args.force === true, again: args.again === true });
+      return rerun(engine, lockRuns(engine, registry), runId(), true, { force: args.force === true, again: args.again === true });
     case "runs.retryAll":
-      return rerunAll(engine, { ...list(), reuse: args.mode !== "replay", force: args.force === true });
+      return rerunAll(engine, lockRuns(engine, registry), { ...list(), reuse: args.mode !== "replay", force: args.force === true });
     case "send": {
       const events = (Array.isArray(args.events) ? args.events : [args.events]).map((e: SendPayload) => toWireEvent(e));
       await engine.sendEvents(events);

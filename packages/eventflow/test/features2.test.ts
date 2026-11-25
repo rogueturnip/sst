@@ -196,7 +196,7 @@ describe("another EventFlow's functions", () => {
     const run = billing.runOf("charge");
     await run.result;
     expect(run.payload.event).toMatchObject({ name: "inngest/function.invoked", tenant: "t1", data: { n: 21 } });
-    expect(answers).toEqual([[JSON.parse(call.body).parent, { ok: true, result: 42 }]]);
+    expect(answers).toEqual([[JSON.parse(call.body).parent, { ok: true, result: 42, by: run.runId }]]);
   });
 
   it("aren't, unless they say so, and it isn't said which there are", async () => {
@@ -210,7 +210,8 @@ describe("another EventFlow's functions", () => {
     expect(new Set(answers.map((a) => a.error.message.replace(/"[^"]*"/, "X"))).size).toBe(1);
     // Nor for another tenant than the message's.
     await billing.deliver([{ ...call, group: "t2" }]);
-    expect(answers).toHaveLength(3);
+    // It's told, as for any call that's dropped.
+    expect(answers).toHaveLength(4);
   });
 
   it("need the app to be given", async () => {

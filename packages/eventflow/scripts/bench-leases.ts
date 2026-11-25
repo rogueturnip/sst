@@ -111,7 +111,7 @@ async function step(i: number) {
   const tenant = `t${i % tenants}`, leaseId = `lease-${String(i).padStart(6, "0")}`;
   const at = Date.now() + i / 1000;
   for (let round = 0; ; round++) {
-    if ((await store.acquire(limits, leaseId, tenant, 60_000)) !== "granted") {
+    if ((await store.acquire(limits, leaseId, tenant, 60_000, round === 0)) !== "granted") {
       if (round) asked++;
       const callbackId = `cb-${i}-${round}`;
       const woken = new Promise<boolean>((resolve) => {
@@ -120,7 +120,7 @@ async function step(i: number) {
       });
       let mine = false;
       const w0 = { leaseId, limits, tenant, callbackId, runId: `r${i}`, at, expiresAt: Date.now() + 300_000 };
-      if ((await store.enqueue(w0)) === "held") mine = true;
+      if ((await store.enqueue(w0, round === 0)) === "held") mine = true;
       else await store.dispatch(limits[0], async (w) => (w.callbackId === callbackId ? (mine = true) : wake(w)), w0);
       if (!mine && !(await woken)) continue;
     }

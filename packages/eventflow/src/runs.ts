@@ -4,7 +4,7 @@ import type { Engine } from "./engine.js";
 import { replayId } from "./ids.js";
 import type { RunPayload, WireEvent } from "./types.js";
 import { key as keyOf } from "./ids.js";
-import { takeLock } from "./singleton.js";
+import { takeLock, type LockRuns } from "./singleton.js";
 import { sendSystemEvents } from "./system.js";
 import { ONCE, type InvokeOutcome, type Registered } from "./worker.js";
 
@@ -193,7 +193,7 @@ export async function getRun(engine: Engine, runId: string): Promise<Run | undef
     function: payload?.fn ?? "",
     event: (payload?.event && (await fat(engine, payload.event).catch(() => payload.event))) as WireEvent,
     replayOf: payload?.replayOf,
-    reused: payload?.memo ? Object.keys(payload.memo) : undefined,
+    reused: payload?.memo ? [...Object.keys(payload.memo), ...Object.keys(payload.memoBlobs ?? {})] : undefined,
     version: info.Version,
     output: parse(info.Result),
     error: info.Error ? { name: info.Error.ErrorType, message: info.Error.ErrorMessage } : undefined,
@@ -212,16 +212,19 @@ export async function cancelRun(engine: Engine, runId: string, registry: Map<str
   const stopped = await engine.stopRun(found.arn);
   const { status, payload } = await runStatus(engine, found.arn);
   // One that was stopped already is told again: what stopped it may have stopped first.
-  if (stopped || status === "STOPPED") {
+  const told = keyOf("ST", payload?.runId ?? runId);
+  if (stopped || (status === "STOPPED" && !(await engine.store.owner(told)))) {
     // The run that invoked it would otherwise wait for it.
     if (payload?.parent)
       await engine.callback(payload.parent, {
         ok: false,
         error: { name: "Cancelled", message: "The run was cancelled." },
+        by: payload.runId,
       } satisfies InvokeOutcome);
     // Its singleton is free for the next.
     if (payload?.lock) await engine.store.lockFree(payload.lock, payload.runId);
     if (payload?.event) await sendSystemEvents(registry, engine, { fn: payload.fn, runId, event: payload.event, outcome: "cancelled" });
+    await engine.store.claim(told, "told", RETENTION_MS * 4);
   }
   return { id: runId, stopped };
 }
@@ -306,6 +309,7 @@ async function riskySteps(engine: Engine, events: any[], memo: Record<string, un
 
 export async function rerun(
   engine: Engine,
+  lockRuns: LockRuns,
   runId: string,
   reuse: boolean,
   options: { force?: boolean; again?: boolean } = {},
@@ -319,14 +323,18 @@ export async function rerun(
   if (!payload?.fn) throw new Error(`The run "${runId}" isn't an EventFlow run.`);
   if (payload.parent) throw new Error(`The run "${runId}" was invoked by another run. Retry or replay that run instead.`);
 
-  const memo = reuse ? { ...(payload.memo ?? {}), ...memoFrom(events) } : undefined;
+  const found_ = reuse ? memoFrom(events) : undefined;
+  const memo = found_ ? { ...(payload.memo ?? {}), ...found_.memo } : undefined;
+  const memoBlobs = found_ ? { ...(payload.memoBlobs ?? {}), ...found_.blobs } : undefined;
+  if (memo && memoBlobs) for (const id of Object.keys(found_!.memo)) delete memoBlobs[id];
+  const reused = [...Object.keys(memo ?? {}), ...Object.keys(memoBlobs ?? {})];
   if (memo && Buffer.byteLength(JSON.stringify(memo)) > MAX_MEMO_BYTES)
     throw new Error(`The saved results of "${runId}" are over ${MAX_MEMO_BYTES} bytes. Replay it instead, to run every step again.`);
 
   // A rerun that would run an at-most-once step again, here or in a run it invoked,
   // is only done on purpose.
   if (!options.force) {
-    const risky = await riskySteps(engine, events, memo);
+    const risky = await riskySteps(engine, events, reuse ? Object.fromEntries(reused.map((id) => [id, true])) : undefined);
     if (risky.length)
       throw new InterruptedRunError(
         `A ${reuse ? "retry" : "replay"} of "${runId}" would run again atMostOnce steps that started: ${risky
@@ -349,17 +357,11 @@ export async function rerun(
   const { sig: _sig, ...rest } = payload;
   // A singleton's rerun needs the singleton, like its run did.
   if (payload.lock) {
-    const taken = await takeLock(
-      engine,
-      { find: (run) => findRun(engine, run), running: async (arn) => (await runStatus(engine, arn)).running, stop: async () => {} },
-      payload.lock,
-      id,
-      "skip",
-    );
+    const taken = await takeLock(engine, lockRuns, payload.lock, id, "skip");
     if (!taken) throw new Error(`Another run has the singleton of "${runId}". Rerun it once that one has ended.`);
   }
-  await engine.startRun({ ...rest, runId: id, root: payload.root ?? runId, replayOf: runId, memo, at: Date.now() });
-  return { id, replayOf: runId, reused: memo ? Object.keys(memo) : [] };
+  await engine.startRun({ ...rest, runId: id, root: payload.root ?? runId, replayOf: runId, memo, memoBlobs, at: Date.now() });
+  return { id, replayOf: runId, reused };
 }
 
 export class InterruptedRunError extends Error {
@@ -371,6 +373,7 @@ export class InterruptedRunError extends Error {
 
 export async function rerunAll(
   engine: Engine,
+  lockRuns: LockRuns,
   input: ListInput & { reuse: boolean; force?: boolean },
 ): Promise<{ id: string; result?: { id: string; existing?: boolean }; error?: string }[]> {
   if (input.status === "SUCCEEDED" && input.reuse)
@@ -379,7 +382,7 @@ export async function rerunAll(
   const out: { id: string; result?: { id: string }; error?: string }[] = [];
   for (const run of runs) {
     try {
-      const result = await rerun(engine, run.id, input.reuse, { force: input.force });
+      const result = await rerun(engine, lockRuns, run.id, input.reuse, { force: input.force });
       out.push({ id: run.id, result: { id: result.id, ...(result.existing ? { existing: true } : {}) } });
     } catch (error) {
       out.push({ id: run.id, error: (error as Error).message });
@@ -415,8 +418,9 @@ export async function cancelAll(engine: Engine, input: ListInput, registry: Map<
  * The results of a run's top-level steps that succeeded, by step ID, from its
  * history. A retry passes them to its run, so those steps aren't run again.
  */
-export function memoFrom(events: any[]): Record<string, unknown> {
+export function memoFrom(events: any[]): { memo: Record<string, unknown>; blobs: Record<string, string> } {
   const memo: Record<string, unknown> = Object.create(null);
+  const blobs: Record<string, string> = Object.create(null);
   for (const e of events) {
     if (e.ParentId) continue;
     const name: string | undefined = e.Name;
@@ -449,12 +453,14 @@ export function memoFrom(events: any[]): Record<string, unknown> {
       if (e.SubType === "EventFlowStep") {
         if (value?.ok) memo[name] = value.value;
       } else if (e.SubType === "EventFlowInvoke") {
-        if (value?.ok) memo[name] = value.result;
+        // A large result is in the table, and the memo says where.
+        if (value?.ok && value.blob) blobs[name] = value.blob;
+        else if (value?.ok) memo[name] = value.result ?? null;
       } else if (e.SubType === "EventFlowWait") memo[name] = value;
       else if (e.SubType === "EventFlowSignal" && !value?.conflict) memo[name] = value?.value ?? null;
     }
   }
-  return memo;
+  return { memo, blobs };
 }
 
 // The child contexts EventFlow makes, by their subtype.

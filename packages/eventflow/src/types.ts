@@ -49,6 +49,8 @@ export type Message =
       fired?: boolean;
       batch?: { item: string; n: number };
       external?: boolean;
+      /** It was held, and its timers were sent. */
+      held?: boolean;
       exp: number;
       sig: string;
     }
@@ -87,6 +89,8 @@ export interface RunPayload {
    * step ID. Those steps return their result without running again.
    */
   memo?: Record<string, unknown>;
+  /** Those of them that are large, by step ID: where they are. */
+  memoBlobs?: Record<string, string>;
   /** When its event came: the steps of runs that came first go first. */
   at?: number;
   /** For a run with a batch, which one. `event` is its first. */

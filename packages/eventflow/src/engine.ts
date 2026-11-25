@@ -173,7 +173,14 @@ export class Engine {
         return true;
       } catch (error) {
         const status = error instanceof LambdaError ? error.response.status : undefined;
-        if (status === 400 || status === 404) return false;
+        if (status === 404) return false;
+        if (status === 400) {
+          // Closed, unless it's the answer that isn't taken: that isn't the callback's end.
+          const body = error instanceof LambdaError ? await error.response.text().catch(() => "") : "";
+          if (/InvalidParameter|Validation|TooLarge/i.test(body) && /size|length|large|exceed|bytes/i.test(body))
+            throw new Error(`The answer to a callback wasn't taken: ${body.slice(0, 300)}`);
+          return false;
+        }
         const transient = status === undefined || status === 429 || status >= 500;
         if (!transient || attempt >= 4) throw error;
         await new Promise((r) => setTimeout(r, (Math.random() + 1) * 50 * 2 ** attempt));
@@ -282,6 +289,8 @@ export function checkEvent(input: Partial<WireEvent> & Record<string, unknown>, 
     throw new TypeError(`The id of ${label} "${name}" must be 1 to 128 printable characters, with no spaces.`);
   if (input.ts !== undefined && (typeof input.ts !== "number" || !Number.isFinite(input.ts)))
     throw new TypeError(`The ts of ${label} "${name}" must be a number of milliseconds.`);
+  if (input.v !== undefined && (typeof input.v !== "string" || input.v.length > 64))
+    throw new TypeError(`The v of ${label} "${name}" must be at most 64 characters.`);
   if (input.sessions !== undefined) {
     const entries = input.sessions && typeof input.sessions === "object" && !Array.isArray(input.sessions) ? Object.entries(input.sessions) : undefined;
     if (!entries || entries.length > 20 || entries.some(([k, v]) => !k || k.length > 128 || typeof v !== "string" || v.length > 256))
@@ -294,7 +303,10 @@ export function checkEvent(input: Partial<WireEvent> & Record<string, unknown>, 
 }
 
 /** Check a signal, as `sendSignal()` does and as the router does. */
-export function checkSignal(input: { signal?: unknown; tenant?: unknown }) {
+export function checkSignal(input: { signal?: unknown; tenant?: unknown; data?: unknown }) {
+  // What the callback it answers takes.
+  if (Buffer.byteLength(JSON.stringify(input.data) ?? "") > 200 * 1024)
+    throw new TypeError("A signal's data must be at most 200 KB. Store larger data in a bucket and send its key.");
   if (typeof input.signal !== "string" || !input.signal || input.signal.length > 256 || CONTROL.test(input.signal))
     throw new TypeError("A signal's name must be 1 to 256 characters, with no control characters.");
   if (input.tenant !== undefined && (typeof input.tenant !== "string" || !TENANT.test(input.tenant)))

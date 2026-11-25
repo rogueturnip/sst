@@ -871,7 +871,8 @@ for (const [name, make] of stores) {
         await store.enqueue(waiter("S", "a", 1, [l]));
         await store.dispatch(l, async () => true);
         const before = (await (store as any).readLimit(l)).leases.S.expires - Date.now();
-        expect(before).toBeGreaterThan(900_000);
+        expect(before).toBeGreaterThan(120_000);
+        expect(before).toBeLessThanOrEqual(180_000);
         expect(await store.renew([l], "S", 60_000)).toBe(true);
         expect((await (store as any).readLimit(l)).leases.S.expires - Date.now()).toBeLessThanOrEqual(60_000);
       });
@@ -1168,7 +1169,7 @@ for (const [name, make] of stores) {
           const other = shardsOf(l).find((s) => s.item !== held)!;
           await (store as any).createLimit(other);
           await (store as any).takeOne(other, "x", "a", `${Date.now() + 900_000}|g1|a`);
-          expect(await store.renew([l], "x", 60_000)).toBe(true);
+          expect(await store.renew([l], "x", 60_000, true)).toBe(true);
           expect((await (store as any).readLimit(l)).copies("x")).toHaveLength(1);
           await (make() as DynamoStore).handoff([l], "x", "a", async () => true);
           expect((await state(store, l)).active).toBe(0);

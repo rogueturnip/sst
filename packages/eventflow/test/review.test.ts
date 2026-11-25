@@ -333,7 +333,7 @@ it("a retry reuses a large result of a step with a concurrency limit", async () 
   const c = new Cluster((flow) => [flow.createFunction({ id: "f", triggers: { event: "go" }, retries: 0, concurrency: 5 }, async ({ step }: any) => { await step.run("charge", () => "x".repeat(300_000)); await step.run("small", () => 1); throw new Error("later"); })]);
   await c.flow.send({ name: "go" }); await c.drain();
   const r = await c.runOf("f").result;
-  const memo = memoFrom(r.getHistoryEvents());
+  const { memo } = memoFrom(r.getHistoryEvents());
   expect(Object.keys(memo)).toContain("charge");
 });
 it("parallel step.fetch of Requests with bodies", async () => {

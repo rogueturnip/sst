@@ -16,16 +16,27 @@ interface Internals {
   createStepId(): string;
   peekStepId(): string;
   _stepPrefix?: string;
-  _executionContext: { getStepData(id: string): { Status?: string } | undefined };
+  _executionContext: { getStepData(id: string): { Status?: string; Id?: string } | undefined };
 }
 
 export interface Replay {
   /** The function is returning what's saved, and hasn't come to anything new yet. */
   on: boolean;
+  /** The operations that were there as the invocation began, that the function hasn't come to. */
+  ahead: Set<string>;
+}
+
+/** What a run had done, as an invocation of it begins. */
+export function replayOf(ctx: durable.DurableContext): Replay {
+  const ops = Object.values(((ctx as any)._executionContext?._stepData ?? {}) as Record<string, any>);
+  const ahead = new Set<string>(ops.filter((o) => o?.Id && !o.ParentId && o.Type !== "EXECUTION").map((o) => o.Id));
+  return { on: ahead.size > 0, ahead };
 }
 
 export interface NamedContext {
   readonly raw: durable.DurableContext;
+  /** Whether an operation is done, and its result saved. */
+  saved(name: string): boolean;
   readonly lambdaContext: durable.DurableContext["lambdaContext"];
   step<T>(name: string, fn: durable.StepFunc<T>, config?: durable.StepConfig<T>): durable.DurablePromise<T>;
   wait(name: string, duration: durable.Duration): durable.DurablePromise<void>;
@@ -56,12 +67,21 @@ export function named(ctx: durable.DurableContext, replay: Replay): NamedContext
   c.peekStepId = function (this: Internals) {
     return next ?? peekStepId.call(c);
   };
-  const at = <T>(key: string, call: () => T, virtual = false): T => {
+  const idOf = (key: string) => {
     // No "-" in it: that's what nests one in another.
     const token = `n${createHash("sha256").update(key).digest("hex").slice(0, 32)}`;
-    next = c._stepPrefix ? `${c._stepPrefix}-${token}` : token;
+    return c._stepPrefix ? `${c._stepPrefix}-${token}` : token;
+  };
+  const at = <T>(key: string, call: () => T, virtual = false): T => {
+    next = idOf(key);
     const status = virtual ? undefined : c._executionContext.getStepData(next)?.Status;
-    if (!virtual && status !== "SUCCEEDED" && status !== "FAILED") replay.on = false;
+    if (!virtual) {
+      const id = c._executionContext.getStepData(next)?.Id;
+      if (id) replay.ahead.delete(id);
+      // New, or the last there was, like a sleep that's over: the function comes past it for
+      // the first time.
+      if ((status !== "SUCCEEDED" && status !== "FAILED") || !replay.ahead.size) replay.on = false;
+    }
     try {
       return call();
     } finally {
@@ -70,6 +90,7 @@ export function named(ctx: durable.DurableContext, replay: Replay): NamedContext
   };
   const context: NamedContext = {
     raw: ctx,
+    saved: (name) => c._executionContext.getStepData(idOf(name))?.Status === "SUCCEEDED",
     lambdaContext: ctx.lambdaContext,
     step: (name, fn, config) => at(name, () => ctx.step(name, fn, config)),
     wait: (name, duration) => at(name, () => ctx.wait(name, duration)),

@@ -1,4 +1,5 @@
 import type { Engine } from "./engine.js";
+import { NonRetriableError } from "./errors.js";
 import { hash } from "./ids.js";
 import type { WireEvent } from "./types.js";
 
@@ -8,6 +9,9 @@ import type { WireEvent } from "./types.js";
 
 /** The largest data that's carried with its event. */
 export const INLINE_BYTES = 100 * 1024;
+
+/** It was in the table, and has expired: reading it again won't help. */
+export class GoneError extends NonRetriableError {}
 
 /** The event with its data kept apart, if that's large. The same event makes the same reference. */
 export async function slim(engine: Engine, event: WireEvent): Promise<WireEvent> {
@@ -26,7 +30,7 @@ export async function fat(engine: Engine, event: WireEvent): Promise<WireEvent> 
   if (!event?.blob) return event;
   const { blob, ...rest } = event;
   const body = await engine.store.getBlob(blob.key);
-  if (body === undefined) throw new Error(`The data of the event "${event.id}" is gone.`);
+  if (body === undefined) throw new GoneError(`The data of the event "${event.id}" is gone.`);
   return { ...rest, data: JSON.parse(body) };
 }
 
@@ -42,7 +46,7 @@ export async function slimValue(engine: Engine, name: string, value: unknown): P
 export async function fatValue(engine: Engine, kept: { value?: unknown; blob?: string }): Promise<unknown> {
   if (!kept.blob) return kept.value;
   const body = await engine.store.getBlob(kept.blob);
-  if (body === undefined) throw new Error("The result is gone.");
+  if (body === undefined) throw new GoneError("The result is gone.");
   return JSON.parse(body);
 }
 

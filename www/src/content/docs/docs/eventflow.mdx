@@ -145,7 +145,7 @@ await flow.send({
 - **Fan-out.** Every function with a trigger for the event's name starts a run, and every wait it matches resumes. A trigger can have an `if`, like `'event.data.plan == "pro"'`.
 - **IDs and duplicates.** An event without an `id` gets a [ULID](https://github.com/ulid/spec). An event whose `id` was sent by the same tenant in the last **24 hours** starts no runs and resumes no waits. So when `send()` fails, send again with the same IDs. The same message delivered twice by SQS is routed again, and starts nothing new, and so is a message moved back from the dead-letter queue: see [delivery](#delivery-guarantees). An ID is 1 to 128 printable characters.
 - **Tenant.** `tenant` is SST's addition to the envelope. It's the message's `MessageGroupId` for fair queues, and the router refuses an event whose tenant isn't its group. Event IDs, idempotency keys, run IDs, waits, and limits without a key are all kept per tenant. Events sent from a run with `step.sendEvent()` keep the run's tenant. A tenant is 1 to 128 letters, digits and punctuation, as SQS allows. Take it from something you trust, like the signed-in user, not the request body: see [security](#security).
-- **Size.** An event is at most **256 KB** of JSON. Put large data in a bucket, and send its key.
+- **Size.** An event is at most **1 MB** of JSON. Put large data in a bucket, and send its key.
 - **Types.** `eventType()` declares an event with a [Standard Schema](https://standardschema.dev), like Zod. A trigger with it types `event.data`, and `create()` checks the data when it's sent. `staticSchema<T>()` declares the type only.
 - `send()` returns `{ ids }`. Up to 10 events go in one SQS request.
 
@@ -201,6 +201,7 @@ const user = await step.run("load-user", () => db.users.get(event.data.userId));
 A step's result is saved when it succeeds. When the run resumes, after a sleep, a wait or a crash, the handler runs again from the top, and each step that already succeeded returns its saved result without running. So:
 
 - Put side effects, like API calls, writes, `Date.now()` and random IDs, inside steps.
+- Do work in steps, not between them. Beside a branch that sleeps or waits, the function has half a second to come from one step to the next, before the run is paused until something wakes it.
 - Keep the code between steps deterministic. The same inputs must call the same steps in the same order.
 - A step's result is saved as JSON, so a `Date` comes back as a string.
 
@@ -212,13 +213,13 @@ A step that throws is retried, up to the function's `retries`, which is **4** by
 - Throw `RetryAfterError("…", "30s")` to choose when. It takes a duration, a `Date`, or a time string.
 - A step that runs out of retries throws, with the error's message. Catch it to handle the failure, or let it fail the run. `onFailure` runs when the run fails.
 
-An error thrown outside a step retries the function, up to its `retries`, with the same backoff. The steps that ended aren't run again: they return their saved results, or throw the errors they failed with. The steps in flight end first, so they aren't run twice. A sleep or a wait that hasn't ended begins again. An error that came out of a step, a `NonRetriableError`, and a step used as it can't be aren't retried: the run fails.
+An error thrown outside a step retries the function, up to its `retries`, with the same backoff. The steps that ended aren't run again: they return their saved results, or throw the errors they failed with. The steps in flight end first, so they aren't run twice: an invoke however long it takes, and a step's code within a minute, or else the function isn't retried. A sleep or a wait that hasn't ended begins again. An error that came out of a step, a `NonRetriableError`, and a step used as it can't be aren't retried: the run fails.
 
 A step is **at least once**. If the worker crashes after the step's code ran, but before its result was saved, it runs again. Make side effects idempotent with `idempotencyKey`, or run the step `atMostOnce`: see [moving money](#moving-money).
 
 ### IDs
 
-A step is found by its ID, as with Inngest, so branches that run at once can finish in any order. Used more than once, as in a loop, an ID gets the suffixes `:1`, `:2`, … in the order it's used. Give the steps of branches that run at once IDs of their own, like `` `charge-${order.id}` ``: one ID in two branches gets its suffixes by which comes first. A run stays on the version it started on: see [deploying](#deploying).
+A step is found by its ID, as with Inngest, so branches that run at once can finish in any order. Used more than once, as in a loop, an ID gets the suffixes `:1`, `:2`, … in the order it's used. Give the steps of branches that run at once IDs of their own, like `` `charge-${order.id}` ``. One ID in two branches throws, where Inngest numbers them by which comes first: that can change when the run goes on later, and then one branch would get the other's result, and its idempotency key. A loop, a list of steps started together, and a race that's run again are fine. A run stays on the version it started on: see [deploying](#deploying).
 
 ### Sleep
 
@@ -248,7 +249,7 @@ const approval = await step.waitForSignal("approval", { signal: `approve-${id}`,
 await flow.sendSignal({ signal: `approve-${id}`, data: { by: user.id }, tenant });
 ```
 
-A signal goes to the one run of its tenant that waits for its name. A second run that waits for it throws a `SignalConflictError`, or takes its place with `onConflict: "replace"`. A signal that's sent before a run waits isn't kept. `step.sendSignal()` returns the `runId` it went to, if any.
+A signal goes to the one run of its tenant that waits for its name. A second run that waits for it throws a `SignalConflictError`, or takes its place with `onConflict: "replace"`. A signal that's sent before a run waits isn't kept. Its data is at most 200 KB. `step.sendSignal()` returns the `runId` it went to, if any.
 
 ### Fetch and AI
 
@@ -280,7 +281,7 @@ const audit = createDefer(flow, { id: "audit" }, async ({ event, parents, step }
 const deferred = defer("audit", { function: audit, data: { what: "paid" } });
 ```
 
-A deferred function starts once the run that deferred it has ended, whether it succeeded or failed, and not if it was cancelled. `deferred.abort()` takes it back. Pass it to `serve()` with the others.
+A deferred function starts once the run that deferred it has ended, whether it succeeded or failed, and not if it was cancelled. `deferred.abort()` takes it back. Call `defer()` in the function, not in a step. Pass it to `serve()` with the others.
 
 ### Sessions
 
@@ -455,7 +456,7 @@ concurrency: [
 - **What's counted.** A step that's running its code. Sleeps, waits, invokes and the code between steps don't hold a lease, so a run that sleeps gives its place to another. Steps started together each take one.
 - **Scope.** `"fn"`, the default, counts the function's steps. `"env"` and `"account"` need a `key`, and count the steps of every function of the EventFlow with the same key value, like `key: '"openai"'` for a shared API.
 - **Up to two, of up to 10,000 each.** A step has to fit both, for example 5 per tenant and 50 in all. It takes them one at a time, always in the same order, and gives back the first if the second is full. So a step never waits holding a lease, and two steps that need two limits, like a transfer that locks both accounts, can't each hold one and wait for the other. Each write is conditioned, so a limit can't go over, and none is a transaction: on a busy limit, transactions fail each other, where plain writes take their turn. A limit over 25 is split into shards, each a DynamoDB item, whose caps add up to the limit: so the writes of a wide limit aren't on one item, which takes 1,000 units a second. They share one line.
-- **Leases.** Each attempt of a step takes a lease from the table before it runs, and gives it back when it ends. A retry takes a new one. A lease expires after the worker's invocation timeout plus 10 seconds, so a crash doesn't keep it. One that's given to a step in line lasts 15 minutes until the step resumes, which makes it its own before its code runs: from then on, nothing else gives it back. A step that runs again after a crash renews its lease before its code runs, and takes a new one if it expired. A lease that expired is taken back only if it's still the one that expired, so it can't be taken from a step that just renewed it.
+- **Leases.** Each attempt of a step takes a lease from the table before it runs, and gives it back when it ends. A retry takes a new one. A lease expires after the worker's invocation timeout plus 10 seconds, so a crash doesn't keep it. One that's given to a step in line lasts 3 minutes until the step resumes, which makes it its own before its code runs: from then on, nothing else gives it back. A step that resumes later than that asks again. A step that runs again after a crash renews its lease before its code runs, and takes a new one if it expired. A lease that expired is taken back only if it's still the one that expired, so it can't be taken from a step that just renewed it.
 - **Waiting in line.** A step that doesn't get a lease joins the line for it, and its run stops, holding no Lambda. When a lease is given back, it goes straight to the next step in line, which resumes. If that step can't be told, as when the callback API throttles, it's tried again, and then put back in line, in its place. A newcomer can't take a free lease while steps wait. A step that isn't woken in 3 minutes, as when a wake was lost, asks again, and keeps its place in line. The longer it waits, the less often it asks, up to every 15 minutes, so a long wait doesn't fill its run's history.
 - **Order.** A tenant's steps go in the order their runs' events came, so runs that have begun finish first. `priority: { run: "event.data.plan == 'pro' ? 120 : 0" }` moves a run up to 600 seconds ahead, or behind. A limit with shards gives to a few of the oldest at once, in any order.
 - **Fairness.** Each tenant has its own line. The next step is the oldest of the tenant that holds the fewest leases on the limit, then the one that's waited longest. So a tenant with a backlog of thousands can't keep the others out. The tenant is the event's `tenant`, or the value of the function's concurrency key. It looks at up to 200 tenants in line for each lease. It's best effort: it doesn't promise a latency. [Measured below](#performance).

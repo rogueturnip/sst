@@ -150,7 +150,7 @@ describe("retry", () => {
       { EventType: "StepFailed", Id: "6", Name: "ship", StepFailedDetails: { Error: { Payload: { ErrorMessage: "down" } } } },
       { EventType: "StepSucceeded", Id: "7", Name: "sst:cancelOn", StepSucceededDetails: { Result: { Payload: "[]" } } },
     ];
-    expect(memoFrom(events)).toEqual({
+    expect(memoFrom(events).memo).toEqual({
       load: { rows: 3 },
       pause: true,
       charge: "ch_1",

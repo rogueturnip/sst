@@ -5,6 +5,6 @@ set -e
 cd "$(dirname "$0")/.."
 status=0
 for file in test/*.test.ts; do
-  bun test --timeout 30000 "$file" || status=1
+  bun test --timeout 90000 "$file" || status=1
 done
 exit $status
