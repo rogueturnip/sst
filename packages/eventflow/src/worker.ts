@@ -4,7 +4,7 @@ import { createHash } from "crypto";
 import type { Definition } from "./definition.js";
 import { parseDuration, toDurableSeconds, type DurationInput } from "./duration.js";
 import { toWireEvent, type Engine, type SendPayload } from "./engine.js";
-import { bind, evaluate, getPath, parseExpression, type Expression } from "./expression.js";
+import { bind, conjuncts, evaluate, getPath, parseExpression, paths, type Expression } from "./expression.js";
 import { hash, key, runId as makeRunId } from "./ids.js";
 import { sign, verify } from "./sign.js";
 import type { LeaseWaiter, Limit } from "./store.js";
@@ -661,24 +661,28 @@ export function matcher(
   }
   if (options.if) {
     const parsed = parseExpression(options.if, `"if" of step "${stepId}"`);
-    // A path of the run's event that it doesn't have would compare as null, and match
-    // any event that sends null. Say so instead.
-    for (const c of parsed.clauses)
-      for (const o of [c.left, c.right])
-        if (o?.kind === "path" && o.path[0] === "event" && getPath(event, o.path.slice(1)) === undefined)
-          throw new TypeError(`The "if" of step "${stepId}" uses "${o.path.join(".")}", which the run's event doesn't have.`);
+    // A path of the run's event that it doesn't have never matches. Where the whole `if`
+    // needs it, say so instead.
+    for (const part of conjuncts(parsed.node)) {
+      if (part.kind === "binary" && part.op === "||") continue;
+      for (const path of paths(part))
+        if (path[0] === "event" && getPath(event, path.slice(1)) === undefined)
+          throw new TypeError(`The "if" of step "${stepId}" uses "${path.join(".")}", which the run's event doesn't have.`);
+    }
     const expr = bind(parsed, "event", event);
     if (Buffer.byteLength(JSON.stringify(expr)) > MAX_CONDITION_BYTES)
       throw new TypeError(`The "if" of step "${stepId}" is over ${MAX_CONDITION_BYTES} bytes with the run's values in it.`);
-    for (const c of expr.clauses) {
-      if (c.op !== "==" || !c.right) continue;
+    for (const c of conjuncts(expr.node)) {
+      if (c.kind !== "binary" || c.op !== "==") continue;
       const [path, literal] =
         c.left.kind === "path" && c.left.path[0] === "async" && c.right.kind === "literal"
           ? [c.left.path, c.right.value]
           : c.right.kind === "path" && c.right.path[0] === "async" && c.left.kind === "literal"
             ? [c.right.path, c.left.value]
             : [undefined, undefined];
-      if (path) return { field: path.slice(1).join("."), value: JSON.stringify(literal), condition: expr };
+      // A key with a "." in it can't be written as one field: it's matched by the `if`.
+      if (path && !path.some((p) => p.includes(".")))
+        return { field: path.slice(1).join("."), value: JSON.stringify(literal), condition: expr };
     }
     return { field: "*", condition: expr };
   }
