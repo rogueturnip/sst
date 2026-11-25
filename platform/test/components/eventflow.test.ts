@@ -173,6 +173,7 @@ describe("EventFlow", () => {
 
     const main = find("aws:sqs/queue:Queue", "FlowQueueQueue");
     expect(JSON.parse(main.inputs.redrivePolicy).maxReceiveCount).toBe(6);
+    expect(main.inputs.maxMessageSize).toBe(1_048_576);
     const dead = find("aws:sqs/queue:Queue", "FlowDeadLetterQueueQueue");
     expect(dead.inputs.messageRetentionSeconds).toBe(1_209_600);
 

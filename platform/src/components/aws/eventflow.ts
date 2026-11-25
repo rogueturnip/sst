@@ -387,7 +387,7 @@ export class EventFlow extends Component {
         transforms?.deadLetterQueue,
         `${name}DeadLetterQueue`,
         // Two weeks, the most SQS keeps a message, to look at it and move it back.
-        { transform: { queue: { messageRetentionSeconds: 1_209_600 } } },
+        { transform: { queue: { messageRetentionSeconds: 1_209_600, maxMessageSize: MAX_MESSAGE } } },
         { parent },
       ),
     );
@@ -399,6 +399,7 @@ export class EventFlow extends Component {
         `${name}Queue`,
         {
           visibilityTimeout: "6 minutes",
+          transform: { queue: { maxMessageSize: MAX_MESSAGE } },
           dlq: {
             queue: deadLetterQueue.arn,
             // The first delivery, and `retries` more.
@@ -687,6 +688,9 @@ export class EventFlow extends Component {
     };
   }
 }
+
+/** The largest message SQS takes: 1 MiB, where a queue's default is 256 KiB. */
+const MAX_MESSAGE = 1_048_576;
 
 /**
  * What the component and the runtime, `@sst-community/eventflow`, agree on: the
