@@ -91,7 +91,14 @@ export class Hooks {
   }
 
   async tell(hook: "onMemoizationEnd" | "onRunStart" | "onRunComplete" | "onRunError" | "onStepStart" | "onStepComplete" | "onStepError", arg: any) {
-    for (const m of this.list) await (m[hook] as any)?.({ fn: this.fn, ...arg });
+    // What a middleware is told of, it only hears: one that throws, as when tracing is down,
+    // doesn't fail the run.
+    for (const m of this.list)
+      try {
+        await (m[hook] as any)?.({ fn: this.fn, ...arg });
+      } catch (error) {
+        console.error(JSON.stringify({ level: "error", message: `The middleware's ${hook} failed`, middleware: m.id, error: String((error as Error)?.message ?? error).slice(0, 1000) }));
+      }
   }
 
   async transform(hook: "transformFunctionInput" | "transformSendEvent" | "transformStepInput", arg: any) {

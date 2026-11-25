@@ -68,3 +68,9 @@ export async function succeedCallback(id: string, payload: unknown, aws?: AwsOpt
   );
   if (!response.ok) throw new LambdaError("SendDurableExecutionCallbackSuccess", response);
 }
+
+/** Say that a callback is still waited for. It fails when it isn't. */
+export async function heartbeatCallback(id: string, aws?: AwsOptions) {
+  const response = await awsFetch("lambda", `/2025-12-01/durable-execution-callbacks/${enc(id)}/heartbeat`, { method: "POST" }, { aws });
+  if (!response.ok) throw new LambdaError("SendDurableExecutionCallbackHeartbeat", response);
+}

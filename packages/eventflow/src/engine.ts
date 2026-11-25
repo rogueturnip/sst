@@ -1,6 +1,6 @@
 import { Resource } from "sst/resource";
 import { awsFetch, type AwsOptions } from "./client.js";
-import { LambdaError, startExecution, stopExecution, succeedCallback } from "./lambda.js";
+import { heartbeatCallback, LambdaError, startExecution, stopExecution, succeedCallback } from "./lambda.js";
 import { sqs } from "./aws.js";
 import { hash, ulid } from "./ids.js";
 import { sign } from "./sign.js";
@@ -171,6 +171,17 @@ export class Engine {
     }
   }
 
+  /** Whether a run still waits for a callback. False once it's closed, or its run has ended. */
+  async waiting(callbackId: string) {
+    try {
+      await heartbeatCallback(callbackId, this.aws);
+      return true;
+    } catch (error) {
+      if (error instanceof LambdaError && [400, 404, 409].includes(error.response.status)) return false;
+      throw error;
+    }
+  }
+
   /** Stop a run. Returns false when it had already ended. */
   async stopRun(arn: string) {
     try {
@@ -223,8 +234,10 @@ export interface SendPayload {
   ts?: number;
   /**
    * The tenant the event belongs to. SST sends it as the message's `MessageGroupId`,
-   * so a tenant with a backlog doesn't hold up the others. Flow control, event IDs and
-   * waits are kept apart per tenant. Take it from something you trust, like the
+   * so a tenant with a backlog doesn't hold up the others. Event IDs, waits, and flow
+   * control without a key are kept apart per tenant. A `key` of a concurrency limit, a
+   * throttle or a rate limit is shared by the tenants that have the same value, so put
+   * `event.tenant` in it if it isn't meant to be. Take it from something you trust, like the
    * signed-in user: EventFlow can't check it.
    */
   tenant?: string;

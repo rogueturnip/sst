@@ -88,7 +88,10 @@ export async function dynamo<T = any>(
       // A hot item, like a busy concurrency limit, can conflict with transactions for
       // a while, and a burst can throttle one until DynamoDB splits it: about 5 seconds
       // in all, with jitter, before giving up.
-      if (attempt >= 13 || !isTransient(error)) throw error;
+      // So does a network error, or a server's: what was written, and its answer lost, is
+      // found by its condition. One that may not be sent twice says so.
+      const again = isTransient(error) || (options?.retries !== 0 && isUnreachable(error) && attempt < 6);
+      if (attempt >= 13 || !again) throw error;
       await new Promise((r) => setTimeout(r, Math.random() * Math.min(1000, 20 * 2 ** attempt) + 10));
     }
   }
@@ -102,6 +105,11 @@ const TRANSIENT = new Set([
   "TransactionInProgressException",
 ]);
 const TRANSIENT_REASONS = new Set(["TransactionConflict", "ThrottlingError", "ProvisionedThroughputExceeded", "RequestLimitExceeded"]);
+
+/** No answer, or a server's error: it may have been done, or not. */
+export function isUnreachable(error: unknown) {
+  return error instanceof AwsError ? error.status >= 500 : !(error instanceof SyntaxError) && error instanceof Error && !/No AWS credentials|No test cluster|Unexpected AWS call/.test(error.message);
+}
 
 /** An error that did nothing, and that's gone when asked again later. */
 export function isTransient(error: unknown) {

@@ -46,7 +46,12 @@ export async function loadKey(aws?: AwsOptions) {
  * work out those IDs, and send events with them first.
  */
 export function deriveRoot(runId: string) {
-  return createHmac("sha256", secret()).update(`root\n${runId}`).digest("base64url").slice(0, 26);
+  return keyed(`root\n${runId}`);
+}
+
+/** A name that only the router and the worker can work out. */
+export function keyed(input: string) {
+  return createHmac("sha256", secret()).update(input).digest("base64url").slice(0, 26);
 }
 
 function secret() {

@@ -4,11 +4,12 @@ import { cronMatches, localMinute } from "./cron.js";
 import { matchesTrigger, type Definition } from "./definition.js";
 import { checkEvent, checkSignal, DEDUP_MS, MESSAGE_TTL_MS, type Engine } from "./engine.js";
 import { evaluate, getPath } from "./expression.js";
-import { hash, key, runId as makeRunId } from "./ids.js";
+import { hash, key, runId as makeRunId, ulid } from "./ids.js";
 import { findRun, runStatus } from "./runs.js";
 import { deriveRoot, sign, verify } from "./sign.js";
-import type { Admission, Lock, Pending } from "./store.js";
-import { sendSystemEvents, wantedSystemEvents } from "./system.js";
+import { LOCK_GRACE_MS, lockTtl, settleLock, singletonKey, takeLock, type LockRuns } from "./singleton.js";
+import type { Admission, Pending } from "./store.js";
+import { sendSystemEvents } from "./system.js";
 import { SYSTEM_EVENTS, type Message, type RunPayload, type Timer, type WireEvent } from "./types.js";
 import { eventMatches, MAX_WAIT_S, RECENT_MS, recentKey, signalKey, startKey, STOP, waitKey, type InvokeOutcome, type Registered } from "./worker.js";
 
@@ -99,7 +100,7 @@ async function routeRecord(record: SQSRecord, registry: Map<string, Registered>,
   // When it was sent: the same each time it's delivered.
   const receivedAt = Number(record.attributes.SentTimestamp) || Date.now();
   if (message.kind === "timer") return routeTimer(message, registry, engine);
-  if (message.kind === "signal") return void (await deliverSignal(engine, message.tenant, message.signal, message.data));
+  if (message.kind === "signal") return void (await deliverSignal(engine, message.tenant, message.signal, message.data, receivedAt));
   if (message.kind === "start" || message.kind === "invoke") {
     // A signed message is good for longer than the dead-letter queue keeps it, so
     // one that's copied can't be sent again much later. The run that invoked it is
@@ -122,6 +123,7 @@ async function routeRecord(record: SQSRecord, registry: Map<string, Registered>,
       runId: message.runId,
       root: message.root,
       received: message.kind === "start" ? (message.received ?? receivedAt) : receivedAt,
+      held: message.kind === "start",
       fired: message.kind === "start" ? message.fired : undefined,
       batch: message.kind === "start" ? message.batch : undefined,
     });
@@ -136,19 +138,26 @@ async function routeRecord(record: SQSRecord, registry: Map<string, Registered>,
   // An event ID is used once per tenant in 24 hours. The same message delivered
   // again, or a message whose routing didn't finish, is routed again, since starting
   // a run and resolving a wait are both safe to repeat.
-  const item = key("E", event.tenant ?? null, event.id);
+  // What EventFlow sends has names of its own, which a sender can't take first.
+  const item = message.kind === "system" ? key("ES", event.tenant ?? null, event.id) : key("E", event.tenant ?? null, event.id);
   const seen = await engine.store.beginEvent(item, record.messageId, DEDUP_MS);
   if (seen === "duplicate") return log("Skipped an event whose ID was already sent", { id: event.id });
 
   await resolveWaits(event, receivedAt, engine, registry);
 
   const matched = [...registry.values()].filter((r) => matchesTrigger(r.def, event));
-  // One by one, so a failure part way through retries the rest, and the ones that started
-  // are found by name.
+  // Each on its own: one that fails, as when its key throws, doesn't keep the others from
+  // starting. The message comes again for it, and the ones that started are found by name.
+  const failed: string[] = [];
   for (const { def } of matched) {
-    if (def.batch && inBatch(def, event)) await addToBatch(def, event, receivedAt, engine, registry);
-    else await startRun(def, event, engine, registry, { received: receivedAt });
+    try {
+      if (def.batch && inBatch(def, event)) await addToBatch(def, event, receivedAt, engine, registry);
+      else await startRun(def, event, engine, registry, { received: receivedAt });
+    } catch (error) {
+      failed.push(`${def.id}: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
+  if (failed.length) throw new Error(`Failed to start ${failed.length} of ${matched.length} functions: ${failed.join("; ").slice(0, 2000)}`);
   await engine.store.finishEvent(item, DEDUP_MS);
 }
 
@@ -188,35 +197,37 @@ async function resolveWaits(event: WireEvent, receivedAt: number, engine: Engine
 }
 
 /**
- * Stop a run, tell the run that invoked it, and send the events about it. False when it had
- * already ended.
+ * Stop a run, tell the run that invoked it, free its singleton, and send the events about
+ * it. False when it had ended by itself. One that was stopped already is told again: what
+ * stopped it may have stopped before it told.
  */
-async function stop(
+export async function stop(
   engine: Engine,
   registry: Map<string, Registered>,
   run: { arn: string; runId: string; parent?: string; message: string },
 ) {
-  if (!(await engine.stopRun(run.arn))) return false;
-  if (run.parent) await notifyParent(engine, run.parent, { name: "Cancelled", message: run.message });
-  await cancelled(engine, registry, run.arn, run.runId);
+  const stopped = await engine.stopRun(run.arn);
+  const { status, payload } = await runStatus(engine, run.arn);
+  if (!stopped && status !== "STOPPED") return false;
+  const parent = run.parent ?? payload?.parent;
+  if (parent) await notifyParent(engine, parent, { name: "Cancelled", message: run.message });
+  if (payload?.lock) await engine.store.lockFree(payload.lock, payload.runId);
+  if (payload?.event) await sendSystemEvents(registry, engine, { fn: payload.fn, runId: payload.runId, event: payload.event, outcome: "cancelled" });
   return true;
 }
 
-/** Send the events about a run that was cancelled, where a function wants them. */
-export async function cancelled(engine: Engine, registry: Map<string, Registered>, arn: string, runId: string) {
-  const none = { id: "", name: "", data: {}, ts: 0 };
-  if (!wantedSystemEvents(registry, engine, { event: none, outcome: "cancelled" }).length) return;
-  const { payload } = await runStatus(engine, arn);
-  if (payload?.event) await sendSystemEvents(registry, engine, { fn: payload.fn, runId, event: payload.event, outcome: "cancelled" });
-}
-
-/** Give a signal's data to the run that waits for it. Returns that run's ID, if there's one. */
-export async function deliverSignal(engine: Engine, tenant: string | undefined, signal: string, data: unknown) {
+/**
+ * Give a signal's data to the run that waits for it. A run that began to wait after the
+ * signal was sent doesn't get it, so a message that's delivered twice resumes one wait.
+ */
+export async function deliverSignal(engine: Engine, tenant: string | undefined, signal: string, data: unknown, sentAt: number) {
   const item = signalKey(tenant, signal);
   const wait = await engine.store.signalRead(item);
-  if (!wait || !(await engine.callback(wait.callbackId, { signal, data: data ?? null }))) return undefined;
-  await engine.store.signalFree(item, wait.callbackId).catch(() => {});
-  return wait.runId;
+  if (!wait || wait.createdAt > sentAt) return undefined;
+  const told = await engine.callback(wait.callbackId, { signal, data: data ?? null });
+  // One that's over is free for the next, too.
+  await engine.store.signalFree(item, wait.callbackId);
+  return told ? wait.runId : undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -345,7 +356,8 @@ async function routeTimer(message: Extract<Message, { kind: "timer" }>, registry
     const def = entry.def.batch ? entry.def : { ...entry.def, batch: { maxSize: 100, timeoutMs: 0 } };
     return closeBatches(def, timer.item, engine, registry);
   }
-  if (timer.type === "finish") return void (await stop(engine, registry, { arn: timer.arn, runId: timer.runId, parent: timer.parent, message: "The run didn't finish in time." }));
+  if (timer.type === "finish")
+    return void (await stop(engine, registry, { arn: timer.arn, runId: timer.runId, parent: timer.parent, message: "The run didn't finish in time." }));
   // A run that hasn't started: whichever is written first decides, this or its start.
   if ((await engine.store.successor(startKey(timer.runId), "cancelled", (engine.resource.runTimeoutSeconds ?? MAX_WAIT_S) * 1000)) !== "cancelled") return;
   const run = await findRun(engine, timer.runId);
@@ -365,6 +377,8 @@ interface StartOptions {
   /** It's a debounce's or a batch's run: the event has been through what comes before. */
   fired?: boolean;
   batch?: { item: string; n: number };
+  /** It was held, and has come back: its timers were sent. */
+  held?: boolean;
   /** Not before this, as for a cron's jitter. */
   notBefore?: number;
 }
@@ -407,10 +421,11 @@ export async function startRun(
       if (lockItem) await engine.store.lockFree(lockItem, id);
       return skip("start timeout", "Skipped a run that didn't start in time");
     }
-    await engine.sendTimer(
-      { type: "start", fn: def.id, runId: id, parent: opts.parent, tenant: event.tenant },
-      opts.received + def.timeouts.startMs,
-    );
+    if (!opts.held)
+      await engine.sendTimer(
+        { type: "start", fn: def.id, runId: id, parent: opts.parent, tenant: event.tenant },
+        opts.received + def.timeouts.startMs,
+      );
   }
 
   if (admission.decision === "hold" && admission.at > Date.now() + 1000) {
@@ -439,8 +454,9 @@ export async function startRun(
     return;
   }
 
-  // A run that had the singleton, and lost it to a later one while it was held.
-  if (lockItem && (await engine.store.lockRead(lockItem))?.run !== id)
+  // A run that had the singleton, and lost it to a later one while it was held. The runs it
+  // took it from are stopped first.
+  if (lockItem && (await settleLock(engine, lockRuns(engine, registry), lockItem, id))?.run !== id)
     return skip("singleton", "Skipped a run that a later one replaced");
 
   const payload: RunPayload = {
@@ -480,18 +496,31 @@ async function admit(
   // A limit without a key is per tenant.
   const bucket = (kind: string, k: string | undefined) => key("T", def.id, kind, k ?? tenant);
   if (def.rateLimit && !opts.fired) {
-    const k = def.rateLimit.key?.(scope);
-    if ((await engine.store.take(bucket("rl", k), def.rateLimit.intervalMs, def.rateLimit.toleranceMs)) > 0)
-      return { decision: "skip", reason: "rateLimit" };
+    const item = bucket("rl", def.rateLimit.key?.(scope));
+    // A router that stopped after it took the slot, and before it saved what it decided, or
+    // may have: the run has it. At worst a run too many starts, and none is lost.
+    const mark = key("TK", def.id, id);
+    const me = ulid();
+    if ((await engine.store.successor(mark, me, DEDUP_MS)) === me) {
+      if ((await engine.store.take(item, def.rateLimit.intervalMs, def.rateLimit.toleranceMs)) > 0) {
+        // It has none: a delivery after this one, if this stops here, asks again.
+        await engine.store.unclaim(mark, me);
+        return { decision: "skip", reason: "rateLimit" };
+      }
+    }
   }
   // A run that's invoked, or a cron's, has nothing to wait for: what invoked it waits.
   if (def.debounce && !opts.fired && !opts.parent && !opts.identity) return { decision: "debounce" };
-  if (def.idempotency) {
-    const k = def.idempotency(scope);
-    if (k !== undefined && !(await engine.store.claim(key("I", def.id, tenant, k), id, DEDUP_MS)))
-      return { decision: "skip", reason: "idempotency" };
-  }
-  if (lockItem && !(await takeSingleton(def, engine, registry, lockItem, id))) return { decision: "skip", reason: "singleton" };
+  const claimed = def.idempotency?.(scope);
+  const idempotency = claimed === undefined ? undefined : key("I", def.id, tenant, claimed);
+  if (idempotency && !(await engine.store.claim(idempotency, id, DEDUP_MS))) return { decision: "skip", reason: "idempotency" };
+  // A run that's skipped after all gives back what it took.
+  const skip = async (reason: string): Promise<Admission> => {
+    if (idempotency) await engine.store.unclaim(idempotency, id);
+    if (lockItem) await engine.store.lockFree(lockItem, id);
+    return { decision: "skip", reason };
+  };
+  if (lockItem && !(await takeLock(engine, lockRuns(engine, registry), lockItem, id, def.singleton!.mode))) return skip("singleton");
   let at = opts.notBefore ?? 0;
   if (def.throttle) {
     // Each held run takes its own slot, so they come back one at a time, in order. One that
@@ -504,15 +533,13 @@ async function admit(
       def.throttle.toleranceMs,
       startMs === undefined ? undefined : Math.max(0, opts.received + startMs - now),
     );
-    if (due === Infinity) {
-      if (lockItem) await engine.store.lockFree(lockItem, id);
-      return { decision: "skip", reason: "start timeout" };
-    }
+    if (due === Infinity) return skip("start timeout");
     at = Math.max(at, due);
   }
   if (at <= now + 1000) return { decision: "start" };
   // While it's held there's no run to find.
-  if (lockItem) await engine.store.lockMove(lockItem, id, { run: id, until: at + LOCK_GRACE_MS }, at - now + lockTtl(engine));
+  if (lockItem)
+    await engine.store.lockMove(lockItem, id, { run: id, until: at + LOCK_GRACE_MS }, at - now + lockTtl(engine));
   return { decision: "hold", at };
 }
 
@@ -520,45 +547,16 @@ async function admit(
 // Singletons
 // ---------------------------------------------------------------------------
 
-/**
- * How long a run that has a singleton, and isn't found, is taken for one that's still to be
- * started: longer than the queue takes to deliver its message again.
- */
-const LOCK_GRACE_MS = 45 * 60_000;
-
-function lockTtl(engine: Engine) {
-  return (engine.resource.runTimeoutSeconds ?? MAX_WAIT_S) * 1000 + 2 * 86_400_000;
-}
-
-function singletonKey(def: Definition, event: WireEvent) {
-  if (!def.singleton) return undefined;
-  const k = def.singleton.key?.({ event });
-  return k === false ? undefined : key("S", def.id, event.tenant ?? null, k ?? null);
-}
-
-/**
- * Take a singleton for a run. A run that has it and has ended, as when it was stopped, or
- * its worker was, loses it. So does one that's running, with mode "cancel".
- */
-async function takeSingleton(def: Definition, engine: Engine, registry: Map<string, Registered>, item: string, id: string) {
-  const mine: Lock = { run: id, until: Date.now() + LOCK_GRACE_MS };
-  for (let attempt = 0; attempt < 10; attempt++) {
-    const held = await engine.store.lockTake(item, mine, lockTtl(engine));
-    if (!held) return true;
-    const arn = held.arn ?? (await findRun(engine, held.run))?.arn;
-    const running = arn ? (await runStatus(engine, arn)).running : held.until > Date.now();
-    if (running && def.singleton!.mode === "skip") return false;
-    // The lock first: a run that isn't found yet checks that it has it before it starts,
-    // and again as its first step.
-    if (!(await engine.store.lockMove(item, held.run, mine, lockTtl(engine)))) continue;
-    if (arn && running) {
-      const { payload } = await runStatus(engine, arn);
-      await stop(engine, registry, { arn, runId: held.run, parent: payload?.parent, message: "The run was cancelled by a later one, as it's a singleton." });
-      log("Cancelled a run that a later one replaced", { run: held.run });
-    }
-    return true;
-  }
-  throw new Error("A singleton is busy.");
+/** What a singleton needs of runs, for the router. */
+export function lockRuns(engine: Engine, registry: Map<string, Registered>): LockRuns {
+  return {
+    find: (run) => findRun(engine, run),
+    running: async (arn) => (await runStatus(engine, arn)).running,
+    stop: async (runId, arn) => {
+      if (await stop(engine, registry, { arn, runId, message: "The run was cancelled by a later one, as it's a singleton." }))
+        log("Cancelled a run that a later one replaced", { run: runId });
+    },
+  };
 }
 
 /**

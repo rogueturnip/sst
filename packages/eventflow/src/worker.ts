@@ -61,6 +61,8 @@ export function leaseWaitSeconds(round: number) {
 }
 /** A waiter whose callback is this, followed by a run's ARN, stops the run. */
 export const STOP = "stop:";
+/** The largest answer of an invoked run: what the callback API takes. */
+const MAX_ANSWER_BYTES = 250 * 1024;
 /** How long a received event is kept for a wait that registers just after it. */
 export const RECENT_MS = 3_600_000;
 /** The largest `if` a wait or cancelOn keeps, with the run's values in it. */
@@ -77,9 +79,33 @@ function jsonify(value: unknown) {
   return value === undefined ? null : JSON.parse(JSON.stringify(value));
 }
 
+/** What's kept of an error: one can be larger than what keeps it. */
+const MAX_MESSAGE = 16 * 1024;
+
 export function errorInfo(error: unknown) {
-  if (error instanceof Error) return { name: error.name, message: error.message };
-  return { name: "Error", message: String(error) };
+  if (error instanceof Error) return { name: String(error.name).slice(0, 256), message: String(error.message).slice(0, MAX_MESSAGE) };
+  return { name: "Error", message: String(error).slice(0, MAX_MESSAGE) };
+}
+
+/**
+ * An error that isn't the run's: the invocation ends, and Lambda starts another, which goes
+ * on from what's saved.
+ */
+class TryAgain extends Error {
+  readonly isUnrecoverable = true;
+  readonly isUnrecoverableInvocation = true;
+}
+
+/** Read the table outside a step. It's tried again by itself; after that, by Lambda. */
+async function read<T>(what: string, fn: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (attempt >= 3) throw new TryAgain(`Failed to read ${what}: ${errorInfo(error).message}`);
+      await new Promise((r) => setTimeout(r, 100 * 2 ** attempt));
+    }
+  }
 }
 
 // Exponential backoff, from 2 seconds, doubling to at most 10 minutes. The jitter
@@ -114,9 +140,11 @@ class UsageError extends TypeError {}
 export class CancelledError extends NonRetriableError {
   constructor(message: string) {
     super(message);
-    this.name = "Cancelled";
+    // Its own, as it's how it's known after it came out of a step.
+    this.name = CANCELLED;
   }
 }
+const CANCELLED = "sst:Cancelled";
 
 /** Errors that came out of a step: it was tried again already. */
 const fromStep = new WeakSet<object>();
@@ -184,12 +212,22 @@ interface RunState {
   done: Record<string, Memo>;
   /** This attempt's steps that are still running. */
   busy: Set<Promise<unknown>>;
+  /** The attempt has ended: its branches that go on start nothing more. */
+  fence: { down: boolean };
+  /** A step's place, where it's been claimed already. */
+  claimed?: Claim;
   /** Note that the run started, before its first step runs. */
   start: () => Promise<void>;
   hooks: Hooks;
   /** The context a hook gets. */
   args?: Record<string, unknown>;
   settled: () => Promise<void>;
+}
+
+interface Claim {
+  id: string;
+  /** It's the function's first step. */
+  first: boolean;
 }
 
 // Inngest gives a step ID used more than once the suffixes ":1", ":2", and so on.
@@ -199,6 +237,16 @@ function occurrence(state: RunState, id: string) {
   state.counts.set(id, n + 1);
   return n === 0 ? id : `${id}:${n}`;
 }
+
+// A step's place among the function's, taken as it's called: what a step does before it
+// runs can take time, and the next one mustn't get its place, or its idempotency key.
+function claim(state: RunState, input: StepInput): Claim {
+  if (state.claimed) return state.claimed;
+  const first = state.counts.size === 0;
+  return { id: occurrence(state, stepId(input)), first };
+}
+
+const never = () => new Promise<never>(() => {});
 
 // A DurablePromise starts when it's awaited. Start it now, as Inngest does, so a step
 // that isn't awaited still runs, and steps started together run together.
@@ -379,7 +427,8 @@ function makeStep(state: RunState) {
   };
 
   const run = <T>(idInput: StepInput, fn: (...args: any[]) => T | Promise<T>, ...args: any[]): Promise<T> => {
-    const id = occurrence(state, stepId(idInput));
+    if (state.fence.down) return never();
+    const { id } = claim(state, idInput);
     const saved = earlier(id);
     if (saved) return saved as Promise<T>;
     return record(id, runStep(id, idInput, fn, args));
@@ -488,8 +537,8 @@ function makeStep(state: RunState) {
 
   // A function with a concurrency limit starts with its first step that has a lease, or here,
   // with a first step that needs none.
-  const begin = () => {
-    if (!limits.length || !def.timeouts || state.counts.size > 1 || state.namespace) return;
+  const begin = (first: boolean) => {
+    if (!limits.length || !def.timeouts || !first || state.namespace) return;
     void eager(ctx.step("sst:started", async () => state.start())).catch(() => {});
   };
   // A sleep, or a wait, that's done isn't done again by the function's next attempt. One that
@@ -501,17 +550,19 @@ function makeStep(state: RunState) {
     });
 
   const sleep = (idInput: string | { id: string }, duration: DurationInput) => {
-    const id = occurrence(state, stepId(idInput));
+    if (state.fence.down) return never();
+    const { id, first } = claim(state, idInput);
     if (earlier(id)) return Promise.resolve();
-    begin();
+    begin(first);
     const seconds = bounded(parseDuration(duration, `duration of step "${id}"`), `sleep of step "${id}"`);
     return slept(id, eager(ctx.wait(id, seconds)));
   };
 
   const sleepUntil = (idInput: string | { id: string }, time: Date | string) => {
-    const id = occurrence(state, stepId(idInput));
+    if (state.fence.down) return never();
+    const { id, first } = claim(state, idInput);
     if (earlier(id)) return Promise.resolve();
-    begin();
+    begin(first);
     const at = time instanceof Date ? time.getTime() : Date.parse(time);
     if (!Number.isFinite(at)) throw new UsageError(`The time of step "${id}" isn't a date.`);
     const seconds = bounded(at - Date.now(), `sleep of step "${id}"`);
@@ -522,10 +573,11 @@ function makeStep(state: RunState) {
     idInput: string | { id: string },
     options: { event: string | { name: string }; timeout: DurationInput | Date; match?: string; if?: string },
   ): Promise<WireEvent | null> => {
-    const id = occurrence(state, stepId(idInput));
+    if (state.fence.down) return never();
+    const { id, first } = claim(state, idInput);
     const saved = earlier(id);
     if (saved) return saved;
-    begin();
+    begin(first);
     const name = typeof options.event === "string" ? options.event : options.event?.name;
     if (!name) throw new UsageError(`The step "${id}" waits for an event with no name.`);
     if (options.match && options.if) throw new UsageError(`The step "${id}" has both "match" and "if". Use one.`);
@@ -574,10 +626,11 @@ function makeStep(state: RunState) {
     idInput: string | { id: string },
     options: { signal: string; timeout: DurationInput | Date; onConflict?: "fail" | "replace" },
   ): Promise<{ signal: string; data: unknown } | null> => {
-    const id = occurrence(state, stepId(idInput));
+    if (state.fence.down) return never();
+    const { id, first } = claim(state, idInput);
     const saved = earlier(id);
     if (saved) return saved;
-    begin();
+    begin(first);
     checkSignal(options);
     if (options.onConflict !== undefined && options.onConflict !== "fail" && options.onConflict !== "replace")
       throw new UsageError(`The step "${id}" has onConflict "${options.onConflict}". Use "fail" or "replace".`);
@@ -590,21 +643,25 @@ function makeStep(state: RunState) {
         id,
         async (child) => {
           const [received, callbackId] = await child.createCallback<{ signal: string; data: unknown }>("signal", { timeout, serdes: json as any });
-          const mine = await child.step("listen", async () =>
-            engine.store.signalWait(
-              item,
-              { callbackId, runId: state.runId, owner: `${state.runId}\n${state.namespace}\n${id}`, expiresAt: Date.now() + timeoutMs },
-              options.onConflict === "replace",
-            ),
-          );
+          const mine = await child.step("listen", async () => {
+            const now = Date.now();
+            const wait = { callbackId, runId: state.runId, owner: `${state.runId}\n${state.namespace}\n${id}`, createdAt: now, expiresAt: now + timeoutMs };
+            if (await engine.store.signalWait(item, wait, options.onConflict === "replace")) return true;
+            // One whose run was stopped keeps its name until it's over: ask whether it waits.
+            const held = await engine.store.signalRead(item);
+            if (!held) return engine.store.signalWait(item, wait, false);
+            if (await engine.waiting(held.callbackId)) return false;
+            return engine.store.signalWait(item, wait, { over: held.callbackId });
+          });
           if (!mine) return { conflict: true as const };
           let value: { signal: string; data: unknown } | null = null;
           try {
             value = await received;
           } catch (error) {
             if (!(error instanceof durable.CallbackTimeoutError)) throw error;
-            await child.step("stop-listening", async () => engine.store.signalFree(item, callbackId).catch(() => {}));
           }
+          // Free before the function goes on, so it can wait for the name again.
+          await child.step("stop-listening", async () => engine.store.signalFree(item, callbackId));
           return { value };
         },
         { subType: "EventFlowSignal" },
@@ -619,10 +676,11 @@ function makeStep(state: RunState) {
     idInput: string | { id: string },
     options: { function: string | { id: string } | { opts?: { id?: string; functionId?: string; appId?: string } }; data?: unknown; timeout?: DurationInput | Date },
   ) => {
-    const id = occurrence(state, stepId(idInput));
+    if (state.fence.down) return never();
+    const { id, first } = claim(state, idInput);
     const saved = earlier(id);
     if (saved) return saved;
-    begin();
+    begin(first);
     const fn = options.function as any;
     const target = typeof fn === "string" ? fn.replace(new RegExp(`^${escape(engine.appId)}-`), (prefix) => (state.registry.has(fn) ? prefix : "")) : (fn?.id ?? fn?.opts?.id ?? fn?.opts?.functionId);
     if (!target) throw new UsageError(`The step "${id}" has no function to invoke.`);
@@ -698,10 +756,11 @@ function makeStep(state: RunState) {
   };
 
   const sendEvent = (idInput: string | { id: string }, payload: SendPayload | SendPayload[]) => {
-    const id = occurrence(state, stepId(idInput));
+    if (state.fence.down) return never();
+    const { id, first } = claim(state, idInput);
     const saved = earlier(id);
     if (saved) return saved as Promise<{ ids: string[] }>;
-    begin();
+    begin(first);
     const list = Array.isArray(payload) ? payload : [payload];
     const send = async (events: any[]) => {
       // IDs come from the run's root and the step, so a retried step, and a retry
@@ -742,25 +801,45 @@ function makeStep(state: RunState) {
   };
 
   const sendSignal = (idInput: string | { id: string }, options: { signal: string; data?: unknown }) => {
-    const id = occurrence(state, stepId(idInput));
+    if (state.fence.down) return never();
+    const { id, first } = claim(state, idInput);
     const saved = earlier(id);
     if (saved) return saved as Promise<{ runId: string | undefined }>;
-    begin();
+    begin(first);
     checkSignal(options);
     return record(
       id,
-      eager(ctx.step(id, async () => ({ runId: await deliver(engine, state.event.tenant, options.signal, options.data) }))),
+      eager(
+        ctx.step(id, async () => {
+          const item = signalKey(state.event.tenant, options.signal);
+          const wait = await engine.store.signalRead(item);
+          // The wait it found first, so a try that comes after the run waits again doesn't
+          // answer that too.
+          const to = await engine.store.successor(
+            key("GS", state.runId, state.namespace, state.attempt, id),
+            wait ? JSON.stringify([wait.callbackId, wait.runId]) : "",
+            86_400_000,
+          );
+          if (!to) return { runId: undefined };
+          const [callbackId, runId] = JSON.parse(to) as [string, string];
+          const told = await engine.callback(callbackId, { signal: options.signal, data: options.data ?? null });
+          await engine.store.signalFree(item, callbackId);
+          return { runId: told || wait?.callbackId !== callbackId ? runId : undefined };
+        }),
+      ),
     ).then((r: any) => ({ runId: r?.runId ?? undefined }));
   };
 
   // step.fetch takes what fetch takes. Its ID is where it goes, so it's known in the history.
   const stepFetch = Object.assign(
-    async (input: any, init?: any): Promise<Response> => {
-      const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
-      const request = input instanceof Request ? { method: input.method, headers: input.headers, body: input.body ? await input.clone().arrayBuffer() : undefined } : {};
-      const method = String(init?.method ?? (request as any).method ?? "GET").toUpperCase();
-      const saved = await run<SavedResponse>(`fetch ${method} ${url.host}`, async () => saveResponse(await globalThis.fetch(url, { ...request, ...init })));
-      return toResponse(saved);
+    (input: any, init?: any): Promise<Response> => {
+      const request = typeof input === "object" && input !== null && !(input instanceof URL) ? (input as Request) : undefined;
+      const url = new URL(request ? request.url : input);
+      const method = String(init?.method ?? request?.method ?? "GET").toUpperCase();
+      // Its place is taken now. A request's body is read in the step, each time it's tried.
+      return run<SavedResponse>(`fetch ${method} ${url.host}`, async () =>
+        saveResponse(await globalThis.fetch(url, { ...(await requestInit(request)), ...init })),
+      ).then(toResponse);
     },
     { config: () => stepFetch, fallback: undefined },
   ) as any;
@@ -780,11 +859,18 @@ function makeStep(state: RunState) {
 
 // With middleware, each step is in a virtual context of its own: what a hook does before its
 // step can take time, and the steps' places in the history mustn't come from who's first.
+async function requestInit(request: Request | undefined) {
+  if (!request) return {};
+  return { method: request.method, headers: request.headers, body: request.body ? Buffer.from(await request.clone().arrayBuffer()) : undefined };
+}
+
 function withMiddleware(state: RunState): Record<string, any> {
   const plain = makeStep(state);
   const { hooks } = state;
   if (!hooks.any) return plain;
   const tool = (type: string, name: string) => (idInput: StepInput, ...rest: any[]) => {
+    if (state.fence.down) return never();
+    const claimed = claim(state, idInput);
     const id = stepId(idInput);
     const info = hooks.info(id, typeof idInput === "object" ? idInput.name : undefined, type);
     const inner = async (child: durable.DurableContext) => {
@@ -799,9 +885,11 @@ function withMiddleware(state: RunState): Record<string, any> {
         input: takesInput ? args : [],
       });
       options = changed.stepOptions;
+      // A step's place, and its idempotency key, come from its ID.
+      if (stepId(options) !== id) throw new UsageError(`A middleware changes the ID of the step "${id}", which EventFlow doesn't allow.`);
       if (takesInput) args = changed.input;
       const given: any = { ...info, options, input: takesInput ? args : undefined };
-      const tools = makeStep({ ...state, ctx: child });
+      const tools = makeStep({ ...state, ctx: child, claimed });
       const call = name.split(".").reduce((t: any, k) => t[k], tools);
       const handler = takesInput
         ? (...a: any[]) => handledWith(state, given, (stepKeys.getStore()?.attempt ?? 0) + 1, () => fn(...a))
@@ -860,14 +948,6 @@ class FailedMemo {
 
 function escape(text: string) {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-async function deliver(engine: Engine, tenant: string | undefined, signal: string, data: unknown) {
-  const item = signalKey(tenant, signal);
-  const wait = await engine.store.signalRead(item);
-  if (!wait || !(await engine.callback(wait.callbackId, { signal, data: data ?? null }))) return undefined;
-  await engine.store.signalFree(item, wait.callbackId).catch(() => {});
-  return wait.runId;
 }
 
 // How a wait finds its event. `match: "data.userId"` matches an event with the same
@@ -1038,19 +1118,20 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
     const finish = async (outcome: InvokeOutcome) => {
       if (!payload.parent) return;
       await ctx.step("sst:return", async () => {
-        await engine.callback(payload.parent!, outcome);
-      });
+        const bytes = Buffer.byteLength(JSON.stringify(outcome));
+        const answer: InvokeOutcome =
+          bytes > MAX_ANSWER_BYTES
+            ? {
+                ok: false,
+                error: {
+                  name: "InvokeError",
+                  message: `The run succeeded, and its result is ${bytes} bytes, more than the ${MAX_ANSWER_BYTES} an invoke returns. Store it in a bucket, and return its key.`,
+                },
+              }
+            : outcome;
+        await engine.callback(payload.parent!, answer);
+      }, ENDING);
     };
-
-    // A singleton's run that lost it to a later one, between being started and running.
-    if (payload.lock) {
-      const mine = await ctx.step("sst:singleton", async () => (await engine.store.lockRead(payload.lock!))?.run === payload.runId);
-      if (!mine) {
-        const error = new CancelledError("The run was cancelled by a later one, as it's a singleton.");
-        await finish({ ok: false, error: errorInfo(error) });
-        throw error;
-      }
-    }
 
     // Whichever is written first decides: that it started, or that it didn't in time.
     let starting: Promise<void> | undefined;
@@ -1074,18 +1155,16 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
         starting = undefined;
         throw error;
       }));
-    // One with a concurrency limit starts with its first lease.
-    if (def.timeouts && !def.concurrency.length) await ctx.step("sst:started", async () => start());
 
-    const events = payload.batch
-      ? await engine.store.batchEvents(await engine.store.batchRead(payload.batch.item, payload.batch.n))
-      : [payload.event];
-    if (!events.length) throw new NonRetriableError("The run's batch is gone.");
-
-    const hooks = new Hooks([...(options.middleware ?? []), ...def.middleware], options.client, { id: def.id, name: def.name, opts: { id: def.id } });
+    // It has the run's event alone, until the batch is read.
+    let events = [payload.event];
+    let hooks = new Hooks([], options.client, {});
     let settled: Promise<void> | undefined;
+    const tellRun = async (name: string, fn: () => Promise<void>) => {
+      await ctx.step(name, fn, ENDING);
+    };
 
-    const state: RunState = {
+    const newState = (more: Partial<RunState>): RunState => ({
       ctx,
       engine,
       def,
@@ -1101,10 +1180,12 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
       attempt: 0,
       done: Object.create(null),
       busy: new Set(),
+      fence: { down: false },
       start,
       hooks,
-      settled: () => (settled ??= hooks.tell("onMemoizationEnd", { ctx: state.args })),
-    };
+      settled: async () => {},
+      ...more,
+    });
 
     const makeArgs = (forState: RunState, extra: Record<string, unknown> = {}) => {
       const args: Record<string, unknown> = {
@@ -1112,7 +1193,7 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
         events,
         step: withMiddleware(forState),
         group: { parallel: <T>(fn: () => Promise<T>) => fn() },
-        runId: state.runId,
+        runId,
         logger: forState.ctx.logger,
         ...extra,
       };
@@ -1148,164 +1229,229 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
       return args;
     };
 
-    // Listen for the events that cancel the run, before it does anything else.
-    const cancelKeys = def.cancelOn.length
-      ? await ctx.step("sst:cancelOn", async () => {
-          const keys: { key: string; createdAt: number; callbackId: string }[] = [];
+    type Outcome = { ok: true; value: unknown } | { ok: false; error: unknown };
+    let cancelKeys: { key: string; createdAt: number; callbackId: string }[] = [];
+
+    // Everything the run does, up to how it ended. What it throws is the run's failure, so
+    // it's ended like any other: its parent is told, and its singleton given back.
+    const body = async (): Promise<Outcome> => {
+      // A singleton's run that lost it to a later one, between being started and running.
+      if (payload.lock) {
+        const mine = await ctx.step("sst:singleton", async () => (await engine.store.lockRead(payload.lock!))?.run === payload.runId);
+        if (!mine) throw new CancelledError("The run was cancelled by a later one, as it's a singleton.");
+      }
+      // One with a concurrency limit starts with its first lease.
+      if (def.timeouts && !def.concurrency.length) await ctx.step("sst:started", async () => start());
+
+      if (payload.batch) {
+        const batch = payload.batch;
+        events = await read("the run's batch", async () => engine.store.batchEvents(await engine.store.batchRead(batch.item, batch.n)));
+        if (!events.length) throw new NonRetriableError("The run's batch is gone.");
+      }
+      hooks = new Hooks([...(options.middleware ?? []), ...def.middleware], options.client, { id: def.id, name: def.name, opts: { id: def.id } });
+
+      // Listen for the events that cancel the run, before it does anything else.
+      if (def.cancelOn.length) {
+        const listening = await ctx.step("sst:cancelOn", async () => {
+          const keys: typeof cancelKeys = [];
+          let found = false;
           for (const c of def.cancelOn) {
             const { field, value, condition } = matcher("cancelOn", payload.event, c);
             const expiresAt = Date.now() + (c.timeoutMs ?? ttlMs);
-            const found = await listen(engine, {
+            const heard = await listen(engine, {
               name: c.name,
               tenant: payload.event.tenant,
               field,
               value,
               condition,
               callbackId: `${STOP}${arn}`,
-              runId: state.runId,
+              runId,
               expiresAt,
               kind: "cancel",
               parent: payload.parent,
             });
-            keys.push(found.registered);
-            // An event that came as it registered cancels it now.
-            if (found.event) await engine.stopRun(arn);
+            keys.push(heard.registered);
+            found ||= !!heard.event;
           }
-          return keys;
-        })
-      : [];
-
-    const stopListening = async () => {
-      if (!cancelKeys.length) return;
-      await ctx.step("sst:cancelOn:end", async () => {
-        await Promise.all(cancelKeys.map((k) => engine.store.deleteWaiter(k.key, k).catch(() => {})));
-      });
-    };
-
-    // Give back the singleton, and send the events about the run.
-    const end = async (outcome: "completed" | "failed", more: { result?: unknown; error?: { name: string; message: string } }) => {
-      const wanted = wantedSystemEvents(registry, engine, { event: payload.event, outcome });
-      if (!payload.lock && !wanted.length) return;
-      await ctx.step("sst:end", async () => {
-        if (payload.lock) await engine.store.lockFree(payload.lock, payload.runId);
-        if (wanted.length) await sendSystemEvents(registry, engine, { fn: def.id, runId: state.runId, event: payload.event, events, outcome, ...more });
-      });
-    };
-
-    // An attempt of the function. It's in a virtual context, which costs no operation, so
-    // an attempt that failed keeps its place in the history when it isn't run again.
-    const attempt = async (n: number): Promise<{ ok: true; value: unknown } | { ok: false; error: unknown }> => {
-      let outcome: { ok: true; value: unknown } | { ok: false; error: unknown } | undefined;
-      await ctx.runInChildContext(
-        "sst:attempt",
-        async (child) => {
-          Object.assign(state, { ctx: child, counts: new Map(), done: Object.create(null), busy: new Set(), attempt: n });
-          let args = makeArgs(state);
-          state.args = args;
-          try {
-            if (hooks.any) {
-              if (n === 0 && hooks.has("onRunStart")) await child.step("sst:onRunStart", async () => hooks.tell("onRunStart", { ctx: args }));
-              args = (await hooks.transform("transformFunctionInput", { ctx: args, steps: {} })).ctx;
-              state.args = args;
-            }
-            const value = await hooks.wrap("wrapFunctionHandler", { ctx: args }, async () => entry.handler(args));
-            if (hooks.any) await state.settled();
-            outcome = { ok: true, value: jsonify(value) };
-          } catch (error) {
-            if (isDurableInternal(error)) throw error;
-            outcome = { ok: false, error };
-          }
-        },
-        { virtualContext: true },
-      );
-      return outcome!;
-    };
-
-    let outcome: { ok: true; value: unknown } | { ok: false; error: unknown };
-    // How earlier attempts failed. It's kept in the table before the wait for the next one,
-    // so a replay doesn't run them again, where they might not fail.
-    const failures = def.retries > 0 ? await engine.store.failures(payload.runId) : [];
-    for (let n = 0; ; n++) {
-      let failure = failures.find((f) => f.attempt === n);
-      if (failure) await ctx.runInChildContext("sst:attempt", async () => {}, { virtualContext: true });
-      else {
-        outcome = await attempt(n);
-        if (outcome.ok) break;
-        const { error } = outcome;
-        const final =
-          error instanceof UsageError ||
-          error instanceof StepFailedError ||
-          error instanceof InvokeFailedError ||
-          (error !== null && typeof error === "object" && fromStep.has(error));
-        const delayMs = final ? undefined : retryDelay(error, n + 1, def.retries, `${state.runId}\n${n}`);
-        if (hooks.has("onRunError"))
-          await ctx.step(`sst:onRunError:${n}`, async () => hooks.tell("onRunError", { ctx: state.args, error, isFinalAttempt: delayMs === undefined }));
-        if (delayMs === undefined) break;
-        // Its other steps finish first, so the next attempt has their results too.
-        while (state.busy.size) await Promise.allSettled([...state.busy]);
-        log("warn", "The function failed outside a step. It's tried again.", { run: state.runId, attempt: n + 1, error: errorInfo(error).message });
-        failure = { attempt: n, error: errorInfo(error), delayMs, memo: { ...state.done } };
-        await engine.store.putFailure(payload.runId, failure, ttlMs + 86_400_000);
+          return { keys, found };
+        }, SETUP);
+        cancelKeys = listening.keys;
+        // An event that came as it registered cancels it now, as it would have later.
+        if (listening.found) throw new CancelledError("The run was cancelled by an event.");
       }
-      await ctx.wait(`sst:retry:${n + 1}`, toDurableSeconds(failure.delayMs));
-      state.memo = Object.assign(Object.create(null), payload.memo ?? {});
-      for (const [id, m] of Object.entries(failure.memo)) state.memo[id] = "v" in m ? m.v : new FailedMemo(m.e);
-    }
-    Object.assign(state, { ctx });
 
-    if (!outcome.ok) {
-      const { error } = outcome;
-      // It's cancelled, not failed: its timer stops it.
-      const isCancelled = error instanceof CancelledError || (error as any)?.name === "Cancelled";
-      try {
-        if (def.onFailure && !isCancelled) {
-          await ctx.runInChildContext("onFailure", async (child) => {
-            const failure: RunState = {
-              ...state,
-              ctx: child,
-              counts: new Map(),
-              memo: Object.create(null),
-              done: Object.create(null),
-              busy: new Set(),
-              attempt: 0,
-              namespace: "onFailure",
-              start: async () => {},
-            };
-            const ts = await child.step("sst:failed-at", async () => Date.now());
-            const args = makeArgs(failure, {
-              error,
-              event: {
-                id: hash(`failed\n${state.runId}`),
-                name: "inngest/function.failed",
-                data: { event: payload.event, error: errorInfo(error), function_id: def.id, run_id: state.runId },
-                ts,
-              },
-            });
-            failure.args = args;
-            await def.onFailure!(args);
-          });
+      // An attempt of the function. It's in a virtual context, which costs no operation, so
+      // an attempt that failed keeps its place in the history when it isn't run again.
+      const attempt = async (n: number, memo: Record<string, unknown>) => {
+        const state = newState({ memo, attempt: n });
+        state.settled = () => (settled ??= hooks.tell("onMemoizationEnd", { ctx: state.args }));
+        let outcome: Outcome | undefined;
+        await ctx.runInChildContext(
+          "sst:attempt",
+          async (child) => {
+            state.ctx = child;
+            try {
+              let args = makeArgs(state);
+              state.args = args;
+              if (hooks.any) {
+                if (n === 0 && hooks.has("onRunStart")) await child.step("sst:onRunStart", async () => hooks.tell("onRunStart", { ctx: args }));
+                args = (await hooks.transform("transformFunctionInput", { ctx: args, steps: {} })).ctx;
+                state.args = args;
+              }
+              const value = await hooks.wrap("wrapFunctionHandler", { ctx: args }, async () => entry.handler(args));
+              if (hooks.any) await state.settled();
+              outcome = { ok: true, value: jsonify(value) };
+            } catch (error) {
+              if (isDurableInternal(error)) throw error;
+              outcome = { ok: false, error };
+            }
+          },
+          { virtualContext: true },
+        );
+        return { state, outcome: outcome! };
+      };
+
+      // How earlier attempts failed. It's kept in the table before the wait for the next one,
+      // so a replay doesn't run them again, where they might not fail.
+      const failures = def.retries > 0 ? await read("how the run's attempts failed", () => engine.store.failures(payload.runId)) : [];
+      const memo = Object.assign(Object.create(null), payload.memo ?? {}) as Record<string, unknown>;
+      for (let n = 0; ; n++) {
+        let failure = failures.find((f) => f.attempt === n);
+        let state: RunState | undefined;
+        let error: unknown;
+        if (failure) {
+          await ctx.runInChildContext("sst:attempt", async () => {}, { virtualContext: true });
+          error = Object.assign(new Error(failure.error.message), { name: failure.error.name });
+        } else {
+          const tried = await attempt(n, { ...memo });
+          if (tried.outcome.ok) return tried.outcome;
+          ({ state } = tried);
+          error = tried.outcome.error;
         }
+        const final =
+          !failure &&
+          (error instanceof UsageError ||
+            error instanceof StepFailedError ||
+            error instanceof InvokeFailedError ||
+            (error !== null && typeof error === "object" && fromStep.has(error)));
+        const delayMs = failure ? failure.delayMs : final ? undefined : retryDelay(error, n + 1, def.retries, `${runId}\n${n}`);
+        // From here its branches that go on start nothing more: the next attempt does.
+        if (state && delayMs !== undefined) state.fence.down = true;
+        // The same place in the history whether it's told now, or was before a replay.
+        if (hooks.has("onRunError"))
+          await ctx.step(`sst:onRunError:${n}`, async () =>
+            hooks.tell("onRunError", { ctx: state?.args, error, isFinalAttempt: delayMs === undefined }),
+          );
+        if (delayMs === undefined) return { ok: false, error };
+        if (!failure) {
+          // Its steps in flight finish first, so the next attempt has their results too.
+          while (state!.busy.size) await Promise.allSettled([...state!.busy]);
+          log("warn", "The function failed outside a step. It's tried again.", { run: runId, attempt: n + 1, error: errorInfo(error).message });
+          failure = { attempt: n, error: errorInfo(error), delayMs, memo: { ...state!.done } };
+          const kept = failure;
+          await read("how the run's attempt failed", () => engine.store.putFailure(payload.runId, kept, ttlMs + 86_400_000));
+        }
+        await ctx.wait(`sst:retry:${n + 1}`, toDurableSeconds(failure.delayMs));
+        // What every attempt's steps returned, not just the last's: one that failed early
+        // didn't come to all of them.
+        for (const [id, m] of Object.entries(failure.memo)) memo[id] = "v" in m ? m.v : new FailedMemo(m.e);
+      }
+    };
+
+    let outcome: Outcome;
+    try {
+      outcome = await body();
+    } catch (error) {
+      if (isDurableInternal(error)) throw error;
+      outcome = { ok: false, error };
+    }
+
+    const isCancelled = !outcome.ok && (outcome.error instanceof CancelledError || errorInfo(outcome.error).name === CANCELLED);
+    if (!outcome.ok && def.onFailure && !isCancelled) {
+      const { error } = outcome;
+      try {
+        await ctx.runInChildContext("onFailure", async (child) => {
+          const ts = await child.step("sst:failed-at", async () => Date.now());
+          const state = newState({ ctx: child, memo: Object.create(null), namespace: "onFailure", start: async () => {} });
+          const args = makeArgs(state, {
+            error,
+            event: {
+              id: hash(`failed\n${runId}`),
+              name: "inngest/function.failed",
+              data: { event: payload.event, error: errorInfo(error), function_id: def.id, run_id: runId },
+              ts,
+            },
+          });
+          state.args = args;
+          await def.onFailure!(args);
+        });
       } catch (failure) {
         if (isDurableInternal(failure)) throw failure;
-        log("error", "onFailure failed", { run: state.runId, error: errorInfo(failure).message });
-      } finally {
-        await stopListening();
-        if (!isCancelled) await end("failed", { error: errorInfo(error) });
-        await finish({ ok: false, error: errorInfo(error) });
+        log("error", "onFailure failed", { run: runId, error: errorInfo(failure).message });
       }
-      throw error;
     }
-    const { value } = outcome;
-    if (hooks.has("onRunComplete"))
-      await ctx.step("sst:onRunComplete", async () => hooks.tell("onRunComplete", { ctx: state.args, output: value }));
-    await stopListening();
-    await end("completed", { result: value });
-    await finish({ ok: true, result: value });
-    return value;
+
+    // Each of these is done whatever becomes of the others.
+    const error = outcome.ok ? undefined : { ...errorInfo(outcome.error), ...(isCancelled ? { name: "Cancelled" } : {}) };
+    const ending = async (what: string, fn: () => Promise<void>) => {
+      try {
+        await fn();
+      } catch (failure) {
+        if (isDurableInternal(failure)) throw failure;
+        log("error", `Failed to ${what}`, { run: runId, error: errorInfo(failure).message });
+      }
+    };
+    if (outcome.ok && hooks.has("onRunComplete")) {
+      const output = outcome.value;
+      await ending("tell the middleware", () => tellRun("sst:onRunComplete", () => hooks.tell("onRunComplete", { output })));
+    }
+    if (cancelKeys.length)
+      await ending("stop listening", () =>
+        tellRun("sst:cancelOn:end", async () => {
+          await Promise.all(cancelKeys.map((k) => engine.store.deleteWaiter(k.key, k)));
+        }),
+      );
+    // Give back the singleton, and send the events about the run.
+    const ended = outcome.ok ? "completed" : isCancelled ? "cancelled" : "failed";
+    const wanted = wantedSystemEvents(registry, engine, { event: payload.event, outcome: ended });
+    if (payload.lock || wanted.length)
+      await ending("end the run", () =>
+        tellRun("sst:end", async () => {
+          if (payload.lock) await engine.store.lockFree(payload.lock, payload.runId);
+          if (wanted.length)
+            await sendSystemEvents(registry, engine, {
+              fn: def.id,
+              runId: payload.runId,
+              event: payload.event,
+              events,
+              outcome: ended,
+              ...(outcome.ok ? { result: outcome.value } : { error }),
+            });
+        }),
+      );
+    await ending("tell the run that invoked it", () => finish(outcome.ok ? { ok: true, result: outcome.value } : { ok: false, error: error! }));
+    if (!outcome.ok) {
+      // It's cancelled, not failed, as it would be by an event that came later.
+      if (isCancelled)
+        await ctx.step("sst:stop", async () => void (await engine.stopRun(arn)), { retryStrategy: () => ({ shouldRetry: false }) }).catch(() => {});
+      throw isCancelled ? Object.assign(new Error(error!.message), { name: "Cancelled" }) : outcome.error;
+    }
+    return outcome.value;
   });
 }
 
+/** What ends a run is tried for as long as an outage may last: what waits for it waits for days. */
+const ENDING: durable.StepConfig<any> = {
+  retryStrategy: (_error, attempt) => (attempt >= 30 ? { shouldRetry: false } : { shouldRetry: true, delay: { seconds: Math.min(300, 2 ** Math.min(attempt, 8)) } }),
+};
+/** A function that can't be set up, as for an event without a field, can't later. */
+const SETUP: durable.StepConfig<any> = {
+  retryStrategy: (error, attempt) =>
+    attempt >= 10 || /doesn't have|isn't supported|bytes with the run's/.test(error.message) ? { shouldRetry: false } : { shouldRetry: true, delay: { seconds: Math.min(60, 2 ** attempt) } },
+};
+
 function isDurableInternal(error: unknown) {
+  if ((error as any)?.isUnrecoverable === true) return true;
   const name = (error as any)?.constructor?.name ?? "";
   return /Unrecoverable|NonDeterministic|Termination/.test(name);
 }

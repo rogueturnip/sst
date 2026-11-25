@@ -100,6 +100,8 @@ export interface Lock {
   arn?: string;
   /** Until when a run that isn't found is taken for one that's still to start. */
   until: number;
+  /** The runs it took it from, that aren't known to be stopped yet. */
+  replaces?: { run: string; arn?: string }[];
 }
 
 /** How a function's attempt failed, and what its steps had returned by then. */
@@ -116,6 +118,7 @@ export interface SignalWait {
   runId: string;
   /** The wait's own, the same when its step is tried again. */
   owner: string;
+  createdAt: number;
   expiresAt: number;
 }
 
@@ -136,6 +139,8 @@ export interface Store {
   putAdmission(item: string, admission: Admission, ttlMs: number): Promise<Admission>;
   /** True the first time the key is claimed in the window. */
   claim(item: string, owner: string, ttlMs: number): Promise<boolean>;
+  /** Gives up a key that's claimed, if this is its owner. */
+  unclaim(item: string, owner: string): Promise<void>;
   /** The owner of a key, if it has one. */
   owner(item: string): Promise<string | undefined>;
   /** Records the owner of a key if it has none, and returns the owner it has. */
@@ -224,14 +229,16 @@ export interface Store {
   lockRead(item: string): Promise<Lock | undefined>;
   /** Notes the execution of the run that has it. */
   lockStarted(item: string, run: string, arn: string): Promise<void>;
-  /** Gives it from one run to another. False when that one no longer has it. */
+  /** Gives it from one run to another. False when neither has it. */
   lockMove(item: string, from: string, to: Lock, ttlMs: number): Promise<boolean>;
+  /** The runs it was taken from are stopped. */
+  lockSettled(item: string, run: string): Promise<void>;
   lockFree(item: string, run: string): Promise<void>;
   /** Keeps how a function's attempt failed. The first one kept for an attempt stays. */
   putFailure(run: string, failure: Failure, ttlMs: number): Promise<void>;
   failures(run: string): Promise<Failure[]>;
   /** The holder of a signal's name, or takes it. `replace` takes it from another. */
-  signalWait(item: string, wait: SignalWait, replace: boolean): Promise<boolean>;
+  signalWait(item: string, wait: SignalWait, replace: boolean | { over: string }): Promise<boolean>;
   signalRead(item: string): Promise<SignalWait | undefined>;
   signalFree(item: string, callbackId: string): Promise<void>;
   /** For the admin API: the items whose key starts with a prefix. */
@@ -375,6 +382,17 @@ export class DynamoStore implements Store {
     }
   }
 
+  async unclaim(item: string, owner: string) {
+    await this.db("DeleteItem", {
+      Key: { pk: S(item), sk: S("-") },
+      ConditionExpression: "#o = :o",
+      ExpressionAttributeNames: { "#o": "owner" },
+      ExpressionAttributeValues: { ":o": S(owner) },
+    }).catch((error) => {
+      if (!isConditionFailure(error)) throw error;
+    });
+  }
+
   async owner(item: string) {
     const result = await this.db("GetItem", {
       Key: { pk: S(item), sk: S("-") },
@@ -393,6 +411,14 @@ export class DynamoStore implements Store {
   // because others were in the way.
   private async gcra(item: string, intervalMs: number, toleranceMs: number, reserve: boolean, maxWaitMs = Infinity): Promise<number> {
     const Key = { pk: S(item), sk: S("-") };
+    // A rate limit's write isn't sent again after a lost answer: it would find the slot it
+    // took, and skip the run. One that may have been made counts as made, so at worst a run
+    // too many starts, and none is lost. A throttle's is: a slot too many only waits.
+    const once = reserve ? undefined : { retries: 0 };
+    const unknown = (error: unknown) => {
+      if (reserve || (error instanceof AwsError && error.status < 500)) throw error;
+      return 0;
+    };
     for (;;) {
       const now = Date.now();
       // The latest the next start may be due for this one to go, or be held.
@@ -408,11 +434,11 @@ export class DynamoStore implements Store {
           ExpressionAttributeValues: { ":i": N(intervalMs), ":now": N(now), ":e": expires, ...(bounded ? { ":latest": N(latest) } : {}) },
           ReturnValues: "UPDATED_NEW",
           ReturnValuesOnConditionCheckFailure: "ALL_OLD",
-        });
+        }, once);
         const due = Number(result.Attributes.tat.N) - intervalMs - toleranceMs;
         return reserve ? Math.max(now, due) : 0;
       } catch (error) {
-        if (!isConditionFailure(error)) throw error;
+        if (!isConditionFailure(error)) return unknown(error);
         const stored = (error as AwsError).body?.Item?.tat?.N;
         if (stored !== undefined && Number(stored) >= now) {
           // Over the limit, or held for longer than it may be.
@@ -428,10 +454,10 @@ export class DynamoStore implements Store {
           UpdateExpression: "SET tat = :tat, expires = :e",
           ConditionExpression: "attribute_not_exists(tat) OR tat < :now",
           ExpressionAttributeValues: { ":tat": N(now + intervalMs), ":now": N(now), ":e": expires },
-        });
+        }, once);
         return reserve ? now : 0;
       } catch (error) {
-        if (!isConditionFailure(error)) throw error;
+        if (!isConditionFailure(error)) return unknown(error);
       }
     }
   }
@@ -687,11 +713,16 @@ export class DynamoStore implements Store {
   // Give back a step's lease on a limit, wherever it is.
   private async releaseFrom(limit: Limit, leaseId: string, tenant: string) {
     const shards = shardsOf(limit);
-    if (shards.length === 1) return void (await this.releaseOne(limit.item, leaseId, tenant));
+    // One that isn't there may be in another's shard.
+    if (shards.length === 1 && (await this.releaseOne(limit.item, leaseId, tenant))) return;
     const key = `${limit.item}|${leaseId}`;
     const known = this.places.get(key);
     this.places.delete(key);
     if (known && (await this.releaseOne(known.item, leaseId, tenant))) return;
+    if (shards.length === 1 && !known) {
+      const { Item } = await this.db("GetItem", { Key: { pk: S(limit.item), sk: S("-") }, ProjectionExpression: "shards", ConsistentRead: true });
+      if (Number(Item?.shards?.N ?? 1) === 1) return;
+    }
     const state = await this.readLimit(limit, "none");
     for (const c of state.copies(leaseId)) await this.releaseOne(c.shard.item, leaseId, tenant);
   }
@@ -932,13 +963,13 @@ export class DynamoStore implements Store {
     const end = Date.now() + DISPATCH_MS;
     while (woken < limit.limit + 5 && Date.now() < end) {
       const state = await this.readLimit(limit);
-      if (state.missing.length === state.shards.length) return woken;
+      if (state.missing.length && state.shards.length === state.missing.length) return woken;
       if (await this.reap([state], Date.now())) continue;
       if (await this.createSome(state)) continue;
       if (state.free <= 0) return woken;
       // One at a time, so each is given to whoever is fairest by then. A limit with shards
       // has many to give at once, as many to each tenant as keeps it fair.
-      const width = state.shards.length === 1 ? 1 : Math.min(state.free, 25);
+      const width = shardsOf(limit).length === 1 ? 1 : Math.min(state.free, 25);
       const rooms = state.rooms();
       let undone = false;
       let raced = false;
@@ -993,7 +1024,7 @@ export class DynamoStore implements Store {
     // The fairest, then the next fairest if it's given one, and so on.
     const given: Record<string, number> = Object.create(null);
     const load = (w: LeaseWaiter) => held(tenantKey(w.tenant)) + (given[w.tenant] ?? 0);
-    const chunk = state.shards.length === 1 ? 16 : 8;
+    const chunk = shardsOf(limit).length === 1 ? 16 : 8;
     for (let from = 0; from < tenants.length; from += chunk) {
       const lines = (await Promise.all(tenants.slice(from, from + chunk).map(({ t }) => this.heads(limit, state, t, skip)))).filter((l) => l.length);
       while (lines.length) {
@@ -1015,7 +1046,7 @@ export class DynamoStore implements Store {
   // order: dispatches that all went for the one oldest step would get in each other's way.
   private async heads(limit: Limit, state: LimitState, t: string, skip: Set<string>): Promise<LeaseWaiter[]> {
     const mark = state.waiting[t];
-    const wide = state.shards.length > 1;
+    const wide = shardsOf(limit).length > 1;
     const wanted = wide ? 12 : 1;
     const found: LeaseWaiter[] = [];
     let empty = true;
@@ -1087,7 +1118,7 @@ export class DynamoStore implements Store {
       if (!shard) continue;
       // Over the limit, as when it was lowered: give it back.
       const there = states[i].shards.find((s) => s.limit.item === shard.item)!;
-      if (Object.keys(there.leases).length > there.limit.limit) break;
+      if (Object.keys(there.leases).length > there.limit.limit || states[i].held > unique[i].limit) break;
       for await (const next of this.candidates(unique[i], states[i], skip)) {
         const { granted, passed } = await this.grant(next, unique, { from: { leaseId, tenant, at } });
         if (!granted) continue;
@@ -1110,7 +1141,16 @@ export class DynamoStore implements Store {
   // taking one lease to give it back, as when a tenant's own limit is full.
   private async hasRoom(limits: Limit[]) {
     const rooms = await Promise.all(
-      uniqueLimits(limits).map(async (l) => (await Promise.all(shardsOf(l).map((s) => this.room(s)))).some((r) => r > 0)),
+      uniqueLimits(limits).map(async (l) => {
+        if (shardsOf(l).length > 1) return (await this.readLimit(l, "none")).free > 0;
+        const { Item } = await this.db("GetItem", {
+          Key: { pk: S(l.item), sk: S("-") },
+          ProjectionExpression: "active, shards",
+          ConsistentRead: true,
+        });
+        if (!Item || Number(Item.active?.N ?? 0) >= l.limit) return false;
+        return Number(Item.shards?.N ?? 1) === 1 || (await this.readLimit(l, "none")).free > 0;
+      }),
     );
     return rooms.every(Boolean);
   }
@@ -1247,18 +1287,25 @@ export class DynamoStore implements Store {
   // A limit's leases, from its shards, and the tenants marked as in its line: all of them,
   // or the first ones, or none.
   private async readLimit(limit: Limit, line: "all" | "some" | "none" = "all"): Promise<LimitState> {
-    const limits = shardsOf(limit);
-    const [items, marks] = await Promise.all([
-      Promise.all(limits.map((l) => this.db("GetItem", { Key: { pk: S(l.item), sk: S("-") }, ConsistentRead: true }))),
+    const own = shardsOf(limit);
+    const read = (l: Limit) => this.db("GetItem", { Key: { pk: S(l.item), sk: S("-") }, ConsistentRead: true });
+    const [ownItems, marks] = await Promise.all([
+      Promise.all(own.map(read)),
       line === "none" ? [] : this.readMarks(limit.item, line === "some"),
     ]);
+    // Shards of a version with a higher limit: their leases count too, and none is given there.
+    const used = Number(ownItems[0].Item?.shards?.N ?? 1);
+    const others: Limit[] = [];
+    for (let i = own.length; i < used; i++) others.push({ item: `${limit.item}.${i}`, limit: 0, label: limit.label });
+    const items = [...ownItems, ...(await Promise.all(others.map(read)))];
+    const limits = [...own, ...others];
     const tenants: Record<string, number> = Object.create(null);
     const leases: Record<string, Lease> = Object.create(null);
     const missing: Limit[] = [];
     const shards = limits.map((l, i): ShardState => {
       const shard: ShardState = { limit: l, leases: Object.create(null), raw: Object.create(null) };
       const item = items[i].Item;
-      if (!item) missing.push(l);
+      if (!item && i < own.length) missing.push(l);
       for (const [id, value] of Object.entries<any>(item?.leases?.M ?? {})) {
         shard.raw[id] = String(value.S);
         leases[id] = shard.leases[id] = parseLease(shard.raw[id]);
@@ -1266,16 +1313,23 @@ export class DynamoStore implements Store {
       for (const [t, v] of Object.entries<any>(item?.tenants?.M ?? {})) tenants[t] = (tenants[t] ?? 0) + Number(v.N);
       return shard;
     });
+    const held = shards.reduce((n, s) => n + Object.keys(s.leases).length, 0);
+    // What the shards have room for, and the limit, with the leases elsewhere.
+    const most = Math.max(0, limit.limit - held);
+    const room = (s: ShardState) =>
+      missing.includes(s.limit) || others.length > 0 && most === 0 ? 0 : Math.max(0, s.limit.limit - Object.keys(s.leases).length);
     const waiting: Record<string, Mark> = Object.create(null);
     for (const i of marks) waiting[String(i.sk.S).slice(2)] = { at: Number(i.at?.N ?? 0), lines: Number(i.n?.N ?? 1) };
     return {
+      limit,
       shards,
       missing,
+      held,
       leases,
       tenants,
       waiting,
-      free: shards.reduce((n, s) => n + (missing.includes(s.limit) ? 0 : Math.max(0, s.limit.limit - Object.keys(s.leases).length)), 0),
-      rooms: () => new Map(shards.map((s) => [s.limit.item, missing.includes(s.limit) ? 0 : s.limit.limit - Object.keys(s.leases).length])),
+      free: Math.min(most, shards.reduce((n, s) => n + room(s), 0)),
+      rooms: () => new Map(shards.map((s) => [s.limit.item, room(s)])),
       copies: (id) => shards.filter((s) => s.leases[id]).map((s) => ({ shard: s.limit, lease: s.leases[id], raw: s.raw[id] })),
     };
   }
@@ -1301,8 +1355,28 @@ export class DynamoStore implements Store {
   // random, so steps that ask at once share the work.
   private async createSome(state: LimitState) {
     if (!state.missing.length || state.free > 0) return false;
-    await Promise.all(shuffle([...state.missing]).slice(0, 3).map((l) => this.createLimit(l)));
+    // Others, of a version with a higher limit, may hold them all.
+    if (state.held >= state.limit.limit) return false;
+    const some = shuffle([...state.missing]).slice(0, 3);
+    // Before a shard has a lease, the limit says it has shards, so a version with a lower
+    // limit looks at them too.
+    const used = Math.max(...some.map((l) => state.shards.findIndex((s) => s.limit.item === l.item))) + 1;
+    if (used > 1) await this.widen(state.limit, used);
+    await Promise.all(some.map((l) => this.createLimit(l)));
     return true;
+  }
+
+  // Note how many shards a limit has used.
+  private async widen(limit: Limit, shards: number) {
+    await this.createLimit(shardsOf(limit)[0]);
+    await this.db("UpdateItem", {
+      Key: { pk: S(limit.item), sk: S("-") },
+      UpdateExpression: "SET shards = :n",
+      ConditionExpression: "attribute_not_exists(shards) OR shards < :n",
+      ExpressionAttributeValues: { ":n": N(shards) },
+    }).catch((error) => {
+      if (!isConditionFailure(error)) throw error;
+    });
   }
 
   private async createLimit(limit: Limit) {
@@ -1442,10 +1516,24 @@ export class DynamoStore implements Store {
   }
 
   async debounceMerge(item: string, event: WireEvent, order: string, received: string, now: number, ttlMs: number) {
+    const Key = { pk: S(item), sk: S("-") };
+    // The latest of the events the window had, replaced ones too: none of them, delivered
+    // again once it's closed, opens another.
+    const had = () =>
+      this.db("UpdateItem", {
+        Key,
+        UpdateExpression: "SET received = :r",
+        ConditionExpression: "attribute_exists(#o) AND received < :r",
+        ExpressionAttributeNames: { "#o": "order" },
+        ExpressionAttributeValues: { ":r": S(received) },
+      }).catch((error) => {
+        if (!isConditionFailure(error)) throw error;
+      });
     try {
       const result = await this.db("UpdateItem", {
-        Key: { pk: S(item), sk: S("-") },
-        UpdateExpression: "SET #e = :e, #o = :o, #l = :now, opened = if_not_exists(opened, :now), received = :r, expires = :x",
+        Key,
+        UpdateExpression:
+          "SET #e = :e, #o = :o, #l = :now, opened = if_not_exists(opened, :now), received = if_not_exists(received, :r), expires = :x",
         // Newer than the one that's kept, or the first since the last window closed, and
         // not one that window had.
         ConditionExpression:
@@ -1461,10 +1549,13 @@ export class DynamoStore implements Store {
         ReturnValues: "ALL_NEW",
         ReturnValuesOnConditionCheckFailure: "ALL_OLD",
       });
+      if (String(result.Attributes.received.S) < received) await had();
       return { opened: Number(result.Attributes.opened.N), last: Number(result.Attributes.last.N) };
     } catch (error) {
       if (!isConditionFailure(error)) throw error;
-      return (error as AwsError).body?.Item?.closing ? ("closing" as const) : ("stale" as const);
+      if ((error as AwsError).body?.Item?.closing) return "closing" as const;
+      await had();
+      return "stale" as const;
     }
   }
 
@@ -1518,13 +1609,19 @@ export class DynamoStore implements Store {
     const expires = { N: seconds(at + ttlMs) };
     try {
       await this.db("PutItem", {
-        Item: { pk: S(ref), sk: S("-"), event: S(body), expires },
+        Item: { pk: S(ref), sk: S("-"), event: S(body), order: S(order), expires },
         ConditionExpression: "attribute_not_exists(pk)",
         ReturnValuesOnConditionCheckFailure: "ALL_OLD",
       });
     } catch (error) {
       if (!isConditionFailure(error)) throw error;
-      if ((error as AwsError).body?.Item?.batch) return false;
+      const there = (error as AwsError).body?.Item;
+      if (there?.batch) return false;
+      // In its place, though another message brought it, as from the dead-letter queue.
+      if (there?.order) {
+        order = String(there.order.S);
+        at = Number(order.split("#")[0]) || at;
+      }
     }
     await this.db("PutItem", {
       Item: { pk: S(item), sk: S(`q#${order}`), ref: S(ref), at: N(at), bytes: N(Buffer.byteLength(body)), expires },
@@ -1567,7 +1664,7 @@ export class DynamoStore implements Store {
       const closed = await this.manifest(item, n);
       if (closed) return { n, ...closed };
       const pending = await this.batchPending(item, max);
-      const chosen = choose(pending);
+      const chosen = choose(pending).filter((p, i, all) => all.findIndex((o) => o.ref === p.ref) === i);
       if (!chosen.length) return undefined;
       // One that was put back in line after it was in a batch, as when its message came
       // again just then, is taken out.
@@ -1673,11 +1770,24 @@ export class DynamoStore implements Store {
 
   async lockMove(item: string, from: string, to: Lock, ttlMs: number) {
     const set = { ...lockItem(to), expires: { N: seconds(Date.now() + ttlMs) } };
-    return this.ifHeld(item, from, {
-      UpdateExpression: `SET #run = :run, #until = :until, expires = :x${to.arn ? ", arn = :arn" : " REMOVE arn"}`,
-      ExpressionAttributeNames: { "#until": "until" },
-      ExpressionAttributeValues: { ":run": set.run, ":until": set.until, ":x": set.expires, ...(to.arn ? { ":arn": S(to.arn) } : {}) },
-    });
+    try {
+      await this.db("PutItem", {
+        Item: { pk: S(item), sk: S("-"), ...set },
+        ConditionExpression: "#run = :held",
+        ExpressionAttributeNames: { "#run": "run" },
+        ExpressionAttributeValues: { ":held": S(from) },
+        ReturnValuesOnConditionCheckFailure: "ALL_OLD",
+      });
+      return true;
+    } catch (error) {
+      if (!isConditionFailure(error)) throw error;
+      // Moved already, as when the answer to it was lost.
+      return (error as AwsError).body?.Item?.run?.S === to.run;
+    }
+  }
+
+  async lockSettled(item: string, run: string) {
+    await this.ifHeld(item, run, { UpdateExpression: "REMOVE replaces", ExpressionAttributeValues: {} });
   }
 
   private async ifHeld(item: string, run: string, update: any) {
@@ -1709,7 +1819,8 @@ export class DynamoStore implements Store {
 
   // A failure's steps can be more than an item holds: they're in parts, and the failure
   // itself goes last, so one that's there has all of them.
-  async putFailure(run: string, failure: Failure, ttlMs: number) {
+  async putFailure(run: string, given: Failure, ttlMs: number) {
+    const failure = { ...given, error: { name: given.error.name.slice(0, 256), message: given.error.message.slice(0, 8192) } };
     const pk = S(keyOf("F", run));
     const expires = { N: seconds(Date.now() + ttlMs) };
     const body = JSON.stringify(failure.memo);
@@ -1744,13 +1855,20 @@ export class DynamoStore implements Store {
 
   async failures(run: string) {
     const pk = S(keyOf("F", run));
-    const { Items } = await this.db("Query", {
-      KeyConditionExpression: "pk = :pk AND begins_with(sk, :f)",
-      ExpressionAttributeValues: { ":pk": pk, ":f": S("f#") },
-      ConsistentRead: true,
-    });
+    const items: any[] = [];
+    let start: any;
+    do {
+      const page = await this.db("Query", {
+        KeyConditionExpression: "pk = :pk AND begins_with(sk, :f)",
+        ExpressionAttributeValues: { ":pk": pk, ":f": S("f#") },
+        ConsistentRead: true,
+        ExclusiveStartKey: start,
+      });
+      items.push(...(page.Items ?? []));
+      start = page.LastEvaluatedKey;
+    } while (start);
     const out: Failure[] = [];
-    for (const i of Items ?? []) {
+    for (const i of items) {
       const attempt = String(i.sk.S).slice(2);
       const parts = await Promise.all(
         Array.from({ length: Number(i.count.N) }, (_, n) =>
@@ -1767,7 +1885,7 @@ export class DynamoStore implements Store {
     return out;
   }
 
-  async signalWait(item: string, wait: SignalWait, replace: boolean) {
+  async signalWait(item: string, wait: SignalWait, replace: boolean | { over: string }) {
     try {
       await this.db("PutItem", {
         Item: {
@@ -1776,15 +1894,17 @@ export class DynamoStore implements Store {
           callback: S(wait.callbackId),
           run: S(wait.runId),
           owner: S(wait.owner),
+          created: N(wait.createdAt),
           until: N(wait.expiresAt),
           expires: { N: seconds(wait.expiresAt + DAY) },
         },
-        ...(replace
+        ...(replace === true
           ? {}
           : {
-              ConditionExpression: "attribute_not_exists(pk) OR #o = :o OR #u < :now",
+              // Or over a wait that's known to have ended.
+              ConditionExpression: `attribute_not_exists(pk) OR #o = :o OR #u < :now${replace ? " OR callback = :over" : ""}`,
               ExpressionAttributeNames: { "#o": "owner", "#u": "until" },
-              ExpressionAttributeValues: { ":o": S(wait.owner), ":now": N(Date.now()) },
+              ExpressionAttributeValues: { ":o": S(wait.owner), ":now": N(Date.now()), ...(replace ? { ":over": S(replace.over) } : {}) },
             }),
       });
       return true;
@@ -1797,7 +1917,13 @@ export class DynamoStore implements Store {
   async signalRead(item: string): Promise<SignalWait | undefined> {
     const { Item } = await this.db("GetItem", { Key: { pk: S(item), sk: S("-") }, ConsistentRead: true });
     if (!Item || Number(Item.until.N) < Date.now()) return undefined;
-    return { callbackId: Item.callback.S, runId: Item.run.S, owner: Item.owner.S, expiresAt: Number(Item.until.N) };
+    return {
+      callbackId: Item.callback.S,
+      runId: Item.run.S,
+      owner: Item.owner.S,
+      createdAt: Number(Item.created?.N ?? 0),
+      expiresAt: Number(Item.until.N),
+    };
   }
 
   async signalFree(item: string, callbackId: string) {
@@ -1840,12 +1966,22 @@ interface ShardState {
 }
 
 function lockItem(lock: Lock) {
-  return { run: S(lock.run), until: N(lock.until), ...(lock.arn ? { arn: S(lock.arn) } : {}) };
+  return {
+    run: S(lock.run),
+    until: N(lock.until),
+    ...(lock.arn ? { arn: S(lock.arn) } : {}),
+    ...(lock.replaces?.length ? { replaces: S(JSON.stringify(lock.replaces)) } : {}),
+  };
 }
 
 function lockOf(item: any): Lock | undefined {
   if (!item) return undefined;
-  return { run: String(item.run.S), until: Number(item.until.N), ...(item.arn ? { arn: String(item.arn.S) } : {}) };
+  return {
+    run: String(item.run.S),
+    until: Number(item.until.N),
+    ...(item.arn ? { arn: String(item.arn.S) } : {}),
+    ...(item.replaces ? { replaces: JSON.parse(item.replaces.S) } : {}),
+  };
 }
 
 /** When a tenant was marked as in a limit's line, and in how many lines. */
@@ -1862,7 +1998,11 @@ interface Copy {
 }
 
 interface LimitState {
+  limit: Limit;
+  /** Its shards, and those of a version with a higher limit, which have no room. */
   shards: ShardState[];
+  /** How many leases it has in all. */
+  held: number;
   /** The shards that aren't in the table yet. */
   missing: Limit[];
   /** Every lease, whichever shard it's in. */
@@ -1897,28 +2037,32 @@ interface Grant {
 
 /**
  * How many leases of a limit are in one item: few enough that the item is 2 KB, and a
- * write to it 2 units. Those of a limit over 500 have more, as each dispatch reads every
+ * write to it 2 units. Those after the first 500 have more, as each dispatch reads every
  * shard.
  */
 export const SHARD_LEASES = 25;
+const SMALL_SHARDS = 20;
+const LARGE_SHARD = 100;
 
-function shardCount(cap: number) {
-  if (cap <= 500) return Math.max(1, Math.ceil(cap / SHARD_LEASES));
-  return Math.min(120, 20 + Math.ceil((cap - 500) / 100));
+function shardSize(i: number) {
+  return i < SMALL_SHARDS ? SHARD_LEASES : LARGE_SHARD;
 }
 
 /**
- * A limit's shards, whose caps add up to it. The first one's item is the limit's, so a
- * limit that has one, as most do, is that item.
+ * A limit's shards, whose caps add up to it: each full, but the last. A shard's cap only
+ * grows with the limit, so two versions of a function, with two limits, don't hold more
+ * than the larger one. The first one's item is the limit's, so a limit that has one, as
+ * most do, is that item.
  */
 export function shardsOf(limit: Limit): Limit[] {
-  const n = shardCount(limit.limit);
-  if (n === 1) return [limit];
-  return Array.from({ length: n }, (_, i) => ({
-    item: i ? `${limit.item}.${i}` : limit.item,
-    limit: Math.floor(limit.limit / n) + (i < limit.limit % n ? 1 : 0),
-    label: limit.label,
-  }));
+  if (limit.limit <= SHARD_LEASES) return [limit];
+  const shards: Limit[] = [];
+  for (let i = 0, left = limit.limit; left > 0; i++) {
+    const cap = Math.min(left, shardSize(i));
+    shards.push({ item: i ? `${limit.item}.${i}` : limit.item, limit: cap, label: limit.label });
+    left -= cap;
+  }
+  return shards;
 }
 
 /**
@@ -1927,7 +2071,7 @@ export function shardsOf(limit: Limit): Limit[] {
  * the order its steps joined.
  */
 function linesOf(limit: Limit) {
-  const n = shardCount(limit.limit);
+  const n = shardsOf(limit).length;
   return n === 1 ? 1 : Math.min(16, Math.ceil(n / 2));
 }
 

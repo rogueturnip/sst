@@ -19,4 +19,4 @@ curl -s -o /dev/null "$EVENTFLOW_TEST_ENDPOINT" \
   -H 'X-Amz-Target: DynamoDB_20120810.CreateTable' \
   -H 'Authorization: AWS4-HMAC-SHA256 Credential=local/20260101/local/dynamodb/aws4_request, SignedHeaders=host, Signature=0' \
   -d '{"TableName":"eventflow-test","BillingMode":"PAY_PER_REQUEST","AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"},{"AttributeName":"sk","AttributeType":"S"}],"KeySchema":[{"AttributeName":"pk","KeyType":"HASH"},{"AttributeName":"sk","KeyType":"RANGE"}]}'
-AWS_REGION="${AWS_REGION:-local}" bun test --timeout 120000 test/store-contract.test.ts
+AWS_REGION="${AWS_REGION:-local}" bun test --timeout 120000 test/store-contract.test.ts test/review-table.test.ts

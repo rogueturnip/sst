@@ -1,6 +1,6 @@
 import { nameMatches } from "./definition.js";
 import type { Engine } from "./engine.js";
-import { hash } from "./ids.js";
+import { keyed } from "./sign.js";
 import { SYSTEM_EVENTS, type WireEvent } from "./types.js";
 import type { Registered } from "./worker.js";
 
@@ -55,7 +55,8 @@ export async function sendSystemEvents(registry: Map<string, Registered>, engine
         : full;
     await engine.sendSystem({
       // The same each time it's sent, so one that's sent again starts nothing new.
-      id: hash(JSON.stringify([name, ended.runId])),
+      // It's keyed, so nobody else can work it out.
+      id: keyed(JSON.stringify([name, ended.runId])),
       name,
       data,
       ts: Date.now(),

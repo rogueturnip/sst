@@ -225,7 +225,7 @@ for (const [name, make] of stores) {
     it("has one run wait for a signal, unless it's replaced or over", async () => {
       const store = make();
       const item = `G#contract-${run}-${n++}`;
-      const wait = (owner: string, ms = 60_000) => ({ callbackId: `cb-${owner}`, runId: owner, owner, expiresAt: Date.now() + ms });
+      const wait = (owner: string, ms = 60_000) => ({ callbackId: `cb-${owner}`, runId: owner, owner, createdAt: 1, expiresAt: Date.now() + ms });
       expect(await store.signalWait(item, wait("a"), false)).toBe(true);
       expect(await store.signalWait(item, wait("a"), false)).toBe(true);
       expect(await store.signalWait(item, wait("b"), false)).toBe(false);

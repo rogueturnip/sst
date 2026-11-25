@@ -383,9 +383,8 @@ describe("singleton", () => {
     const { cluster } = make("cancel");
     await cluster.flow.send({ name: "sync", data: { k: "a", n: 1 } });
     const lock = cluster.store.lockRead.bind(cluster.store);
-    let reads = 0;
     // The router sees that it has it, and then a later run takes it.
-    cluster.store.lockRead = async (item) => (++reads === 1 ? lock(item) : { run: "later", until: Date.now() + 1e6 });
+    cluster.store.lockRead = async (item) => (cluster.runs.size === 0 ? lock(item) : { run: "later", until: Date.now() + 1e6 });
     await cluster.drain();
     const result = await cluster.runOf("sync").result;
     expect(result.getStatus()).toBe(ExecutionStatus.FAILED);

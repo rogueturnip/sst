@@ -3,6 +3,7 @@ import type { Engine } from "./engine.js";
 import { replayId } from "./ids.js";
 import type { RunPayload, WireEvent } from "./types.js";
 import { key as keyOf } from "./ids.js";
+import { takeLock } from "./singleton.js";
 import { sendSystemEvents } from "./system.js";
 import { ONCE, type InvokeOutcome, type Registered } from "./worker.js";
 
@@ -169,9 +170,10 @@ async function detail(engine: Engine, arn: string) {
 }
 
 /** Whether a run is running, and what it started with. */
-export async function runStatus(engine: Engine, arn: string): Promise<{ running: boolean; payload?: RunPayload }> {
+export async function runStatus(engine: Engine, arn: string): Promise<{ running: boolean; status: string; payload?: RunPayload }> {
   const info = await detail(engine, arn);
   return {
+    status: String(info.Status),
     running: ["RUNNING", "PAUSED", "PAUSING"].includes(info.Status),
     payload: parse(info.InputPayload) as RunPayload | undefined,
   };
@@ -206,19 +208,19 @@ export async function getRun(engine: Engine, runId: string): Promise<Run | undef
 export async function cancelRun(engine: Engine, runId: string, registry: Map<string, Registered>) {
   const found = await findRun(engine, runId);
   if (!found) throw new Error(`There's no run "${runId}".`);
-  const info = await detail(engine, found.arn);
-  const payload = parse(info.InputPayload) as RunPayload | undefined;
   const stopped = await engine.stopRun(found.arn);
-  // The run that invoked it would otherwise wait for it.
-  if (stopped && payload?.parent)
-    await engine.callback(payload.parent, {
-      ok: false,
-      error: { name: "Cancelled", message: "The run was cancelled." },
-    } satisfies InvokeOutcome);
-  if (stopped && payload?.event) {
+  const { status, payload } = await runStatus(engine, found.arn);
+  // One that was stopped already is told again: what stopped it may have stopped first.
+  if (stopped || status === "STOPPED") {
+    // The run that invoked it would otherwise wait for it.
+    if (payload?.parent)
+      await engine.callback(payload.parent, {
+        ok: false,
+        error: { name: "Cancelled", message: "The run was cancelled." },
+      } satisfies InvokeOutcome);
     // Its singleton is free for the next.
-    if (payload.lock) await engine.store.lockFree(payload.lock, runId);
-    await sendSystemEvents(registry, engine, { fn: payload.fn, runId, event: payload.event, outcome: "cancelled" });
+    if (payload?.lock) await engine.store.lockFree(payload.lock, payload.runId);
+    if (payload?.event) await sendSystemEvents(registry, engine, { fn: payload.fn, runId, event: payload.event, outcome: "cancelled" });
   }
   return { id: runId, stopped };
 }
@@ -346,8 +348,14 @@ export async function rerun(
   const { sig: _sig, ...rest } = payload;
   // A singleton's rerun needs the singleton, like its run did.
   if (payload.lock) {
-    const held = await engine.store.lockTake(payload.lock, { run: id, until: Date.now() + 45 * 60_000 }, RETENTION_MS);
-    if (held) throw new Error(`Another run, "${held.run}", has the singleton of "${runId}". Rerun it once that one has ended.`);
+    const taken = await takeLock(
+      engine,
+      { find: (run) => findRun(engine, run), running: async (arn) => (await runStatus(engine, arn)).running, stop: async () => {} },
+      payload.lock,
+      id,
+      "skip",
+    );
+    if (!taken) throw new Error(`Another run has the singleton of "${runId}". Rerun it once that one has ended.`);
   }
   await engine.startRun({ ...rest, runId: id, root: payload.root ?? runId, replayOf: runId, memo, at: Date.now() });
   return { id, replayOf: runId, reused: memo ? Object.keys(memo) : [] };
@@ -418,10 +426,25 @@ export function memoFrom(events: any[]): Record<string, unknown> {
       const text = d?.Result?.Payload;
       return text === undefined || text === "" ? null : JSON.parse(text);
     };
+    // A large result isn't in the context's own event: it's in the one of what's in it.
+    const inner = (names: RegExp, type: string) => {
+      const found = events.filter((o) => o.ParentId === e.Id && o.EventType === type && names.test(String(o.Name))).pop();
+      const text = found?.[`${type}Details`]?.Result?.Payload;
+      if (!text) throw new Error(`The result of step "${name}" is too large to reuse. Replay the run instead.`);
+      return JSON.parse(text);
+    };
     if (type === "StepSucceeded") memo[name] = payload(e.StepSucceededDetails);
     else if (type === "WaitSucceeded") memo[name] = true;
     else if (type === "ContextSucceeded") {
-      const value = payload(e.ContextSucceededDetails);
+      const own = /^EventFlow(Step|Wait|Invoke|Signal)$/.test(String(e.SubType));
+      const large = own && !e.ContextSucceededDetails?.Result?.Payload;
+      const value = !large
+        ? payload(e.ContextSucceededDetails)
+        : e.SubType === "EventFlowStep"
+          ? inner(/^run(:|$)/, "StepSucceeded")
+          : e.SubType === "EventFlowSignal"
+            ? { value: inner(/^signal$/, "CallbackSucceeded") }
+            : inner(e.SubType === "EventFlowWait" ? /^event$/ : /^result$/, "CallbackSucceeded");
       if (e.SubType === "EventFlowStep") {
         if (value?.ok) memo[name] = value.value;
       } else if (e.SubType === "EventFlowInvoke") {

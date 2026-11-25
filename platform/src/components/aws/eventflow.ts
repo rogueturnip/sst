@@ -418,7 +418,12 @@ export class EventFlow extends Component {
       permission({ actions: ["ssm:GetParameter"], resources: [keyParam.arn] }),
       permission({ actions: ["sqs:SendMessage"], resources: [queue.arn] }),
       permission({
-        actions: ["lambda:SendDurableExecutionCallbackSuccess", "lambda:StopDurableExecution"],
+        actions: [
+          "lambda:SendDurableExecutionCallbackSuccess",
+          // To see whether a run still waits for a signal.
+          "lambda:SendDurableExecutionCallbackHeartbeat",
+          "lambda:StopDurableExecution",
+        ],
         resources: [interpolate`${workerArn}:*`],
       }),
     ];

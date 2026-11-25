@@ -58,7 +58,7 @@ describe("routing", () => {
     const [message] = cluster.queue.splice(0);
     const first = await cluster.deliver([message]);
     expect(first.batchItemFailures).toEqual([{ itemIdentifier: message.messageId }]);
-    expect([...cluster.runs.keys()].length).toBe(1);
+    expect([...cluster.runs.keys()].length).toBe(2);
     const second = await cluster.deliver([message]);
     expect(second.batchItemFailures).toEqual([]);
     expect([...cluster.runs.values()].map((r) => r.payload.fn).sort()).toEqual(["a", "b", "c"]);

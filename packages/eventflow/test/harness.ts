@@ -130,7 +130,13 @@ export class Cluster {
           return new Response('{"__type":"DurableExecutionAlreadyStartedException"}', { status: 409 });
         return new Response(null, { status: 202 });
       }
-      const runner = new LocalDurableTestRunner({ handlerFunction: this.handler as any });
+      const runner = new LocalDurableTestRunner({
+        handlerFunction: ((event: any, context: any) => {
+          // The local runner's own name for the run.
+          if (event?.DurableExecutionArn) this.arns.set(event.DurableExecutionArn, name);
+          return this.handler(event, context);
+        }) as any,
+      });
       const record: RunRecord = { runId: name, payload: body, runner, result: runner.run({ payload: body }) };
       this.runs.set(name, record);
       record.result.then(
@@ -155,9 +161,9 @@ export class Cluster {
       const to = from + Number(params.get("MaxItems") ?? 50);
       return Response.json({ DurableExecutions: all.slice(from, to), NextMarker: to < all.length ? String(to) : undefined });
     }
-    const executions = path.match(/^\/2025-12-01\/durable-executions\/arn%2F([^/?]+)(\/history)?\?/);
+    const executions = path.match(/^\/2025-12-01\/durable-executions\/([^/?]+)(\/history)?\?/);
     if (service === "lambda" && executions) {
-      const id = decodeURIComponent(executions[1]);
+      const id = this.idOf(decodeURIComponent(executions[1]));
       const run = this.runs.get(id);
       const h = this.history.get(id) ?? (run && { status: this.statusOf(id), payload: run.payload, events: [], error: undefined });
       if (!h) return new Response("ResourceNotFoundException", { status: 404 });
@@ -166,9 +172,9 @@ export class Cluster {
     }
     const stop = path.match(/^\/2025-12-01\/durable-executions\/(.+)\/stop$/);
     if (service === "lambda" && stop) {
-      const id = decodeURIComponent(stop[1]).replace(/^arn\//, "");
+      const id = this.idOf(decodeURIComponent(stop[1]));
       if (this.runs.has(id) && this.statusOf(id) !== "RUNNING") return new Response("ended", { status: 409 });
-      this.stopped.push(decodeURIComponent(stop[1]));
+      this.stopped.push(this.runs.has(id) || !this.arns.has(decodeURIComponent(stop[1])) ? `arn/${id}` : decodeURIComponent(stop[1]));
       return Response.json({ StopTimestamp: Date.now() / 1000 });
     }
     const callback = path.match(/^\/2025-12-01\/durable-execution-callbacks\/([^/]+)\/succeed$/);
@@ -186,7 +192,23 @@ export class Cluster {
       setTimeout(() => void op.sendCallbackSuccess(JSON.stringify(body)).catch((e) => console.error("callback", e)), 50);
       return new Response(null, { status: 200 });
     }
+    const heartbeat = path.match(/^\/2025-12-01\/durable-execution-callbacks\/([^/]+)\/heartbeat$/);
+    if (service === "lambda" && heartbeat) {
+      const id = decodeURIComponent(heartbeat[1]);
+      for (const [runId, run] of this.runs)
+        for (const name of ["signal"])
+          try {
+            const op = run.runner.getOperationByNameAndIndex(name, 0);
+            if (op.getCallbackDetails()?.callbackId === id && !this.closed.has(id) && this.statusOf(runId) === "RUNNING") return new Response(null, { status: 200 });
+          } catch {}
+      return new Response('{"__type":"CallbackTimeoutException"}', { status: 400 });
+    }
     throw new Error(`Unexpected AWS call ${service} ${target ?? ""} ${path}`);
+  }
+
+  private arns = new Map<string, string>();
+  private idOf(arn: string) {
+    return this.arns.get(arn) ?? arn.replace(/^arn\//, "");
   }
 
   /** How the runs that ended did. */

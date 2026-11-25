@@ -67,6 +67,10 @@ export class MemoryStore implements Store {
     return true;
   }
 
+  async unclaim(item: string, owner: string) {
+    if (this.claims.get(item)?.owner === owner) this.claims.delete(item);
+  }
+
   async owner(item: string) {
     return this.claims.get(item)?.owner;
   }
@@ -295,8 +299,10 @@ export class MemoryStore implements Store {
     const w = this.windows.get(item) ?? {};
     this.windows.set(item, w);
     if (w.closing) return "closing" as const;
-    if (w.order !== undefined ? w.order > order : w.fired !== undefined && w.fired >= received) return "stale" as const;
-    Object.assign(w, { event, order, received, last: now, opened: w.opened ?? now });
+    const open = w.order !== undefined;
+    if (open && (w.received ?? "") < received) w.received = received;
+    if (open ? w.order! > order : w.fired !== undefined && w.fired >= received) return "stale" as const;
+    Object.assign(w, { event, order, received: w.received ?? received, last: now, opened: w.opened ?? now });
     return { opened: w.opened!, last: now };
   }
   async debounceRead(item: string) {
@@ -315,7 +321,7 @@ export class MemoryStore implements Store {
   }
 
   batches = new Map<string, { next: number; pending: Pending[]; closed: Map<number, { refs: string[]; orders: string[]; at: number }> }>();
-  batchItems = new Map<string, { event: WireEvent; batch?: string }>();
+  batchItems = new Map<string, { event: WireEvent; order: string; batch?: string }>();
   private batch(item: string) {
     let b = this.batches.get(item);
     if (!b) this.batches.set(item, (b = { next: 0, pending: [], closed: new Map() }));
@@ -323,7 +329,11 @@ export class MemoryStore implements Store {
   }
   async batchAdd(item: string, ref: string, order: string, event: WireEvent, at: number) {
     if (this.batchItems.get(ref)?.batch) return false;
-    if (!this.batchItems.has(ref)) this.batchItems.set(ref, { event });
+    const there = this.batchItems.get(ref);
+    if (there) {
+      order = there.order;
+      at = Number(order.split("#")[0]) || at;
+    } else this.batchItems.set(ref, { event, order });
     const b = this.batch(item);
     b.pending = [...b.pending.filter((p) => p.order !== order), { order, at, bytes: JSON.stringify(event).length, ref }].sort((x, y) => (x.order < y.order ? -1 : 1));
     return true;
@@ -370,7 +380,12 @@ export class MemoryStore implements Store {
     const held = this.locks.get(item);
     if (held?.run === run) held.arn = arn;
   }
+  async lockSettled(item: string, run: string) {
+    const held = this.locks.get(item);
+    if (held?.run === run) delete held.replaces;
+  }
   async lockMove(item: string, from: string, to: Lock) {
+    if (this.locks.get(item)?.run === to.run && from !== to.run) return true;
     if (this.locks.get(item)?.run !== from) return false;
     this.locks.set(item, { ...to });
     return true;
@@ -390,9 +405,9 @@ export class MemoryStore implements Store {
   }
 
   signals = new Map<string, SignalWait>();
-  async signalWait(item: string, wait: SignalWait, replace: boolean) {
+  async signalWait(item: string, wait: SignalWait, replace: boolean | { over: string }) {
     const held = this.signals.get(item);
-    if (held && !replace && held.owner !== wait.owner && held.expiresAt >= this.now()) return false;
+    if (held && replace !== true && !(replace && held.callbackId === replace.over) && held.owner !== wait.owner && held.expiresAt >= this.now()) return false;
     this.signals.set(item, wait);
     return true;
   }
