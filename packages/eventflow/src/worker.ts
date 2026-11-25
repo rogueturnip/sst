@@ -8,6 +8,7 @@ import { InvokeFailedError, NonRetriableError, RetryAfterError, SignalConflictEr
 import { bind, conjuncts, evaluate, getPath, parseExpression, paths, type Expression } from "./expression.js";
 import { hash, key, runId as makeRunId } from "./ids.js";
 import { Hooks } from "./middleware.js";
+import { named, replayLogger, type Replay } from "./named.js";
 import { sign, verify } from "./sign.js";
 import type { LeaseWaiter, Limit, Memo } from "./store.js";
 import { sendSystemEvents, wantedSystemEvents } from "./system.js";
@@ -214,6 +215,9 @@ interface RunState {
   busy: Set<Promise<unknown>>;
   /** The attempt has ended: its branches that go on start nothing more. */
   fence: { down: boolean };
+  replay: Replay;
+  /** The step names that are taken. */
+  used: Set<string>;
   /** A step's place, where it's been claimed already. */
   claimed?: Claim;
   /** Note that the run started, before its first step runs. */
@@ -233,9 +237,15 @@ interface Claim {
 // Inngest gives a step ID used more than once the suffixes ":1", ":2", and so on.
 // It's done here too, so IDs that are built in a loop stay distinct in the history.
 function occurrence(state: RunState, id: string) {
-  const n = state.counts.get(id) ?? 0;
-  state.counts.set(id, n + 1);
-  return n === 0 ? id : `${id}:${n}`;
+  // A name is one step's: it's what its result and its idempotency key are found by. Also one
+  // that looks like another's second occurrence.
+  for (let n = state.counts.get(id) ?? 0; ; n++) {
+    const name = n === 0 ? id : `${id}:${n}`;
+    if (state.used.has(name)) continue;
+    state.counts.set(id, n + 1);
+    state.used.add(name);
+    return name;
+  }
 }
 
 // A step's place among the function's, taken as it's called: what a step does before it
@@ -282,7 +292,8 @@ export function limitsFor(def: Definition, event: WireEvent): Limit[] {
 }
 
 function makeStep(state: RunState) {
-  const { ctx, engine, def } = state;
+  const { engine, def } = state;
+  const ctx = named(state.ctx, state.replay);
   const limits = limitsFor(def, state.event);
   const tenant = tenantOf(def, state.event);
   const priority = priorityMs(def, state.event);
@@ -868,6 +879,7 @@ function withMiddleware(state: RunState): Record<string, any> {
   const plain = makeStep(state);
   const { hooks } = state;
   if (!hooks.any) return plain;
+  const ctx = named(state.ctx, state.replay);
   const tool = (type: string, name: string) => (idInput: StepInput, ...rest: any[]) => {
     if (state.fence.down) return never();
     const claimed = claim(state, idInput);
@@ -901,7 +913,7 @@ function withMiddleware(state: RunState): Record<string, any> {
     // An error out of a virtual context is made another: it's kept apart.
     let outcome: { ok: boolean; value?: any; error?: unknown };
     return eager(
-      state.ctx.runInChildContext(
+      ctx.runInChildContext(
         id,
         async (child) => {
           try {
@@ -911,7 +923,7 @@ function withMiddleware(state: RunState): Record<string, any> {
             outcome = { ok: false, error };
           }
         },
-        { virtualContext: true },
+        { virtualContext: true, key: `middleware ${claimed.id}` },
       ),
     ).then(() => {
       if (!outcome.ok) throw outcome.error;
@@ -1164,6 +1176,9 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
       await ctx.step(name, fn, ENDING);
     };
 
+    // Whether this invocation goes on from what's saved. The SDK's own logger can't tell, in a
+    // virtual context.
+    const replay: Replay = { on: Object.keys((ctx as any)._executionContext?._stepData ?? {}).length > 1 };
     const newState = (more: Partial<RunState>): RunState => ({
       ctx,
       engine,
@@ -1181,6 +1196,8 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
       done: Object.create(null),
       busy: new Set(),
       fence: { down: false },
+      replay,
+      used: new Set(),
       start,
       hooks,
       settled: async () => {},
@@ -1194,7 +1211,7 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
         step: withMiddleware(forState),
         group: { parallel: <T>(fn: () => Promise<T>) => fn() },
         runId,
-        logger: forState.ctx.logger,
+        logger: replayLogger(forState.ctx.logger as object, forState.replay, () => stepKeys.getStore() !== undefined),
         ...extra,
       };
       // Each step is tried at most this many times, as with Inngest.
@@ -1294,7 +1311,7 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
               let args = makeArgs(state);
               state.args = args;
               if (hooks.any) {
-                if (n === 0 && hooks.has("onRunStart")) await child.step("sst:onRunStart", async () => hooks.tell("onRunStart", { ctx: args }));
+                if (n === 0 && hooks.has("onRunStart")) await named(child, replay).step("sst:onRunStart", async () => hooks.tell("onRunStart", { ctx: args }));
                 args = (await hooks.transform("transformFunctionInput", { ctx: args, steps: {} })).ctx;
                 state.args = args;
               }
