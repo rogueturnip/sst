@@ -15,7 +15,8 @@ import type { WireEvent } from "./types.js";
 //   A#…    what the router decided for a function and an event: start, skip or hold
 //   I#…    an idempotency key of a function and a tenant, for 24 hours
 //   T#…    a throttle or rate limit bucket
-//   C#…    one concurrency limit, or a shard of it: its leases, and each tenant's count
+//   C#…    one concurrency limit, or a shard of it: its leases, and each tenant's count; and,
+//          at "C#…~", the tenants that may have steps in its line
 //   Q#…    the steps waiting for a lease on a limit, oldest first
 //   WF#…   the fields that waits for an event of a tenant match on
 //   W#…    the waits for an event, and the cancelOns
@@ -166,7 +167,9 @@ export interface Store {
   release(limits: Limit[], leaseId: string, tenant: string): Promise<void>;
   /**
    * Puts a step in line for every limit it needs. A step that asks again, with the
-   * same time and lease, keeps its place. "held" when the step already holds them all.
+   * same time and lease, keeps its place. "held" when the step already holds them all: then
+   * it goes on, and closes its callback first, so one that's giving it others at that moment
+   * finds it closed, and gives them back.
    */
   enqueue(waiter: LeaseWaiter, first?: boolean): Promise<"queued" | "held">;
   /**
@@ -488,7 +491,7 @@ export class DynamoStore implements Store {
   //
   // All the shards have one line, so a lease that's given back in any of them goes to the
   // step whose turn it is. The line is per tenant: a step's entry is an item under its
-  // limit and tenant. An item at "w#<tenant>" under the limit marks that the tenant may
+  // limit and tenant. An item at "w#<tenant>" beside the limit marks that the tenant may
   // have steps in line. It's put there after an entry goes in, if it isn't there, and
   // taken out when the line's found empty, which then looks at the line again. Each writes
   // first and reads second, so one of them sees the other, and a step isn't hidden.
@@ -698,7 +701,9 @@ export class DynamoStore implements Store {
         .copies(leaseId)
         // An expired lease may be given back at any moment: it isn't renewed.
         .filter((c) => c.lease.expires > now)
-        .sort((a, b) => Number(a.lease.granted) - Number(b.lease.granted) || b.lease.expires - a.lease.expires);
+        // Of two that were given, the first: the other is of a grant that came later, finds it,
+        // and is undone.
+        .sort((a, b) => Number(a.lease.granted) - Number(b.lease.granted) || a.lease.expires - b.lease.expires);
       if (!copies.length) return false;
       mine.push(copies[0]);
       extra.push(...copies.slice(1));
@@ -845,30 +850,46 @@ export class DynamoStore implements Store {
   // Mark that a tenant may have steps in a limit's line, and in how many it's split, if it
   // isn't. A limit that was changed may have more lines in runs on another version.
   private async mark(item: string, t: string, lines: number, put = false) {
-    const Key = { pk: S(item), sk: S(`w#${t}`) };
+    const Key = { pk: S(marksKey(item)), sk: S(`w#${t}`) };
     const now = Date.now();
+    // A mark isn't taken out within a minute of when it was put, so one that was seen, and is
+    // younger, is there.
+    const known = this.marks.get(`${item}|${t}`);
+    if (!put && known && known.lines >= lines && now < known.at + STALE_LINE_MS - 10_000) return;
     const { Item } = await this.db("GetItem", { Key, ConsistentRead: true });
     const marked = Number(Item?.n?.N ?? 0);
+    const seen = (at: number, n: number) => {
+      if (this.marks.size > 5000) this.marks.clear();
+      this.marks.set(`${item}|${t}`, { at, lines: n });
+    };
     // Renewed now and then, so it's kept as long as its line is.
-    if (!put && Item && marked >= lines && Number(Item.at?.N ?? 0) > now - MARK_FRESH_MS) return;
+    // One that's seen often is renewed before it's looked up each time.
+    const at = Number(Item?.at?.N ?? 0);
+    if (!put && Item && marked >= lines && at > now - STALE_LINE_MS / 2) return seen(at, marked);
     await this.db("UpdateItem", {
       Key,
       UpdateExpression: "SET #at = :at, expires = :e, #n = if_not_exists(#n, :zero) + :more",
-      ConditionExpression: Item ? "#n = :marked" : "attribute_not_exists(pk)",
+      // As it was read: one that another has just renewed needn't be.
+      ConditionExpression: Item ? "#n = :marked AND #at = :was" : "attribute_not_exists(pk)",
       ExpressionAttributeNames: { "#at": "at", "#n": "n" },
       ExpressionAttributeValues: {
         ":at": N(now),
         ":e": { N: seconds(now + DAY) },
         ":zero": N(0),
         ":more": N(Math.max(0, lines - marked)),
-        ...(Item ? { ":marked": N(marked) } : {}),
+        ...(Item ? { ":marked": N(marked), ":was": N(at) } : {}),
       },
-    }).catch((error) => {
-      // Another marked it, or took the mark out: look again.
-      if (isConditionFailure(error)) return this.mark(item, t, lines, put);
-      throw error;
-    });
+    }).then(
+      () => seen(now, Math.max(lines, marked)),
+      (error) => {
+        // Another marked it, or took the mark out: look again.
+        if (isConditionFailure(error)) return this.mark(item, t, lines, put);
+        throw error;
+      },
+    );
   }
+
+  private readonly marks = new Map<string, Mark>();
 
   // Take out the mark of a tenant whose line was found empty, if it hasn't changed. Then
   // look at the line again: a step that joined in between may have seen the mark, and
@@ -876,7 +897,7 @@ export class DynamoStore implements Store {
   private async unmark(item: string, t: string, mark: Mark) {
     try {
       await this.db("DeleteItem", {
-        Key: { pk: S(item), sk: S(`w#${t}`) },
+        Key: { pk: S(marksKey(item)), sk: S(`w#${t}`) },
         ConditionExpression: "#at = :at AND #n = :lines",
         ExpressionAttributeNames: { "#at": "at", "#n": "n" },
         ExpressionAttributeValues: { ":at": N(mark.at), ":lines": N(mark.lines) },
@@ -911,6 +932,9 @@ export class DynamoStore implements Store {
     // A step that goes on isn't in line. An entry of it left there, whose callback it
     // won't wait for, would be given leases that no step gives back.
     const held = async () => {
+      // It may have been given others in between: renewing it looks everywhere, and gives
+      // those back.
+      for (const l of limits) this.places.delete(`${l.item}|${waiter.leaseId}`);
       for (const l of limits) await this.leave(l, waiter);
       return "held" as const;
     };
@@ -975,13 +999,17 @@ export class DynamoStore implements Store {
   private async dispatchOne(limit: Limit, w: LeaseWaiter, wake: (w: LeaseWaiter) => Promise<boolean>) {
     const skip = new Set<string>();
     for (let attempt = 0; attempt < 4; attempt++) {
-      const state = await this.readLimit(limit);
+      const state = await this.readLimit(limit, "none");
       if (await this.reap([state], Date.now())) continue;
       if (state.leases[w.leaseId]) {
-        // Its own, from before it was run again, or one that's being given to it: it's its
-        // own now, if it has them all, and it goes on.
+        // One it took itself, before it was run again, is only its to take: it goes on with it.
+        // One that's being given to it is for who gives it to tell it of.
+        if (state.copies(w.leaseId).some((c) => c.lease.granted)) return 0;
         if (!(await this.renew(w.limits, w.leaseId, this.grantMs, true))) return 0;
-        for (const l of ordered(w.limits)) await this.leave(l, w);
+        for (const l of ordered(w.limits)) {
+          this.places.delete(`${l.item}|${w.leaseId}`);
+          await this.leave(l, w);
+        }
         return (await wake(w).catch(() => false)) ? 1 : 0;
       }
       if (await this.createSome(state)) continue;
@@ -1068,7 +1096,7 @@ export class DynamoStore implements Store {
     // The fairest, then the next fairest if it's given one, and so on.
     const given: Record<string, number> = Object.create(null);
     const load = (w: LeaseWaiter) => held(tenantKey(w.tenant)) + (given[w.tenant] ?? 0);
-    const chunk = shardsOf(limit).length === 1 ? 16 : 8;
+    const chunk = shardsOf(limit).length === 1 ? 16 : 3;
     for (let from = 0; from < tenants.length; from += chunk) {
       const lines = (await Promise.all(tenants.slice(from, from + chunk).map(({ t }) => this.heads(limit, state, t, skip)))).filter((l) => l.length);
       while (lines.length) {
@@ -1109,7 +1137,14 @@ export class DynamoStore implements Store {
           // A step that holds its lease here is being given it right now, or was put back in
           // line and had been told after all. One that couldn't be told it was given one
           // waits for the next dispatch.
-          if (found.length >= wanted || state.leases[String(e.lease.S)] || skip.has(String(e.lease.S))) continue;
+          // One that's claimed is being given its leases by another.
+          if (
+            found.length >= wanted ||
+            state.leases[String(e.lease.S)] ||
+            skip.has(String(e.lease.S)) ||
+            Number(e.claimed?.N ?? 0) > Date.now()
+          )
+            continue;
           found.push({
             leaseId: String(e.lease.S),
             tenant: String(e.tenant.S),
@@ -1215,15 +1250,15 @@ export class DynamoStore implements Store {
     return Item ? shard.limit - Number(Item.active?.N ?? 0) : 0;
   }
 
-  // Give a step in line every lease it needs, or none. First it's taken out of its first
-  // line, which one grant only can do: two can't give it leases at once, and the one that's
-  // late has only tried to delete an entry. If it can't have them all, it's put back, in
-  // its place. Then it's taken out of its other lines. With `from`, a step that's done
-  // gives its lease on a limit they share straight to it, in one write. It returns the
-  // leases, to give back only those, and which were passed. The step that's done still
-  // holds the others.
-  // A worker that stops part way leaves the step out of line, with no lease or one that
-  // expires: the step asks again when its callback times out.
+  // Give a step in line every lease it needs, or none. First its entry is claimed, which one
+  // grant only can do at a time: two can't give it leases at once, and one that's late has
+  // only tried to write an entry. If it can't have them all, the claim is given up, and it's
+  // in its place. If it can, its entry is taken out, which only its claim's own can do, and
+  // then its other lines'. So an entry is never put back: one that's gone is a step that has
+  // gone on. With `from`, a step that's done gives its lease on a limit they share straight to
+  // it, in one write. It returns the leases, to give back only those, and which were passed.
+  // The step that's done still holds the others.
+  // A worker that stops part way leaves a claim that runs out, and leases that expire.
   // `current` are the limits as the caller has them: a step's are as it joined the line,
   // and a limit that was lowered since is held to.
   private async grant(
@@ -1240,20 +1275,18 @@ export class DynamoStore implements Store {
       ...l,
       limit: Math.min(l.limit, current.find((c) => c.item === l.item)?.limit ?? l.limit),
     }));
-    // Its entry as it was read: one that asked again with a new callback isn't given
-    // leases with the old one. One that's gone was read before another grant took it out:
-    // its other entries with this callback are left over.
-    const left = await this.leave(first, w, w.callbackId).catch(() => "unknown" as const);
-    if (left === "gone") for (const l of rest) await this.leave(l, w, w.callbackId).catch(() => {});
-    if (left === "unknown") await this.join(first, w).catch(() => {});
-    if (left !== "left") return { undone: left === "unknown", raced: left !== "unknown" };
+    // Its entry as it was read: one that asked again with a new callback isn't given leases
+    // with the old one.
+    const claim = value.split("|")[1];
+    const claimed = await this.claimEntry(first, w, claim).catch(() => "unknown" as const);
+    if (claimed === "gone") for (const l of rest) await this.leave(l, w, w.callbackId).catch(() => {});
+    if (claimed !== "claimed") return { undone: false, raced: claimed !== "unknown" };
 
     const passed: Limit[] = [];
     const at: Limit[] = [];
-    const undo = async (inLine: boolean): Promise<Grant> => {
+    const undo = async (): Promise<Grant> => {
       for (const shard of at) await this.releaseOne(shard.item, w.leaseId, w.tenant, value).catch(() => {});
-      if (inLine) await this.join(first, w);
-      else for (const l of rest) await this.leave(l, w, w.callbackId).catch(() => {});
+      await this.unclaimEntry(first, w, claim).catch(() => {});
       return { undone: true, raced: false };
     };
     try {
@@ -1273,17 +1306,68 @@ export class DynamoStore implements Store {
         // The step that's done no longer holds it, or it isn't one it has: take it
         // like any other.
         const took = await this.takeAny(limit, w.leaseId, w.tenant, value, rooms?.get(limit.item));
-        // One that's held is the step's own: it asked again, and found room. It's out of
-        // line, or joins it again itself.
-        if (typeof took !== "object") return await undo(took === "full");
+        // Full, or held by the step itself, as it asked again and found room.
+        if (typeof took !== "object") return await undo();
         at.push(took);
       }
     } catch (error) {
-      await undo(true).catch(() => {});
+      await undo().catch(() => {});
       throw error;
     }
+    // Taken out, or gone, or it can't be known: the step is told, and where it has gone on,
+    // its callback is closed. One that asked again in between is told by its new callback.
+    if ((await this.finishEntry(first, w, claim).catch(() => "unknown" as const)) === "rejoined") return undo();
     for (const l of rest) await this.leave(l, w).catch(() => {});
     return { granted: { value, at }, passed, undone: false, raced: false };
+  }
+
+  private async claimEntry(limit: Limit, w: LeaseWaiter, claim: string): Promise<"claimed" | "busy" | "rejoined" | "gone"> {
+    const now = Date.now();
+    try {
+      await this.db("UpdateItem", {
+        Key: this.entryKey(limit, w),
+        UpdateExpression: "SET #claim = :c, claimed = :until",
+        // The same claim again, as when its answer was lost, is this one's.
+        ConditionExpression: "callback = :cb AND (attribute_not_exists(#claim) OR #claim = :c OR claimed < :now)",
+        ExpressionAttributeNames: { "#claim": "claim" },
+        ExpressionAttributeValues: { ":c": S(claim), ":cb": S(w.callbackId), ":until": N(now + CLAIM_MS), ":now": N(now) },
+        ReturnValuesOnConditionCheckFailure: "ALL_OLD",
+      });
+      return "claimed";
+    } catch (error) {
+      if (!isConditionFailure(error)) throw error;
+      const item = (error as AwsError).body?.Item;
+      return !item ? "gone" : item.callback?.S === w.callbackId ? "busy" : "rejoined";
+    }
+  }
+
+  private async unclaimEntry(limit: Limit, w: LeaseWaiter, claim: string) {
+    await this.db("UpdateItem", {
+      Key: this.entryKey(limit, w),
+      UpdateExpression: "REMOVE #claim, claimed",
+      ConditionExpression: "#claim = :c",
+      ExpressionAttributeNames: { "#claim": "claim" },
+      ExpressionAttributeValues: { ":c": S(claim) },
+    }).catch((error) => {
+      if (!isConditionFailure(error)) throw error;
+    });
+  }
+
+  private async finishEntry(limit: Limit, w: LeaseWaiter, claim: string): Promise<"done" | "rejoined" | "gone"> {
+    try {
+      await this.db("DeleteItem", {
+        Key: this.entryKey(limit, w),
+        ConditionExpression: "#claim = :c AND callback = :cb",
+        ExpressionAttributeNames: { "#claim": "claim" },
+        ExpressionAttributeValues: { ":c": S(claim), ":cb": S(w.callbackId) },
+        ReturnValuesOnConditionCheckFailure: "ALL_OLD",
+      });
+      return "done";
+    } catch (error) {
+      if (!isConditionFailure(error)) throw error;
+      const item = (error as AwsError).body?.Item;
+      return item ? "rejoined" : "gone";
+    }
   }
 
   // Take a step out of a line: with `callbackId`, if its entry still has that callback.
@@ -1297,9 +1381,6 @@ export class DynamoStore implements Store {
           ...(callbackId === undefined ? {} : { ExpressionAttributeValues: { ":cb": S(callbackId) } }),
           ReturnValuesOnConditionCheckFailure: "ALL_OLD",
         },
-        // Sent again after a lost answer, it would find its own entry gone, and take it
-        // for another grant's.
-        { retries: 0 },
       );
     } catch (error) {
       if (!isConditionFailure(error)) throw error;
@@ -1401,7 +1482,7 @@ export class DynamoStore implements Store {
     do {
       const page = await this.db("Query", {
         KeyConditionExpression: "pk = :pk AND begins_with(sk, :w)",
-        ExpressionAttributeValues: { ":pk": S(item), ":w": S("w#") },
+        ExpressionAttributeValues: { ":pk": S(marksKey(item)), ":w": S("w#") },
         ConsistentRead: true,
         ExclusiveStartKey: start,
         ...(some ? { Limit: 17 } : {}),
@@ -2180,8 +2261,8 @@ function shuffle<T>(list: T[]) {
 /** How long a tenant's mark is kept once its line is empty. */
 const STALE_LINE_MS = 60_000;
 
-/** How long before a mark is put again, so it outlives its line. */
-const MARK_FRESH_MS = 3_600_000;
+/** How long a step's entry is claimed by a grant: longer than one takes. */
+const CLAIM_MS = 20_000;
 
 /** How long a dispatch looks for steps to wake. */
 const DISPATCH_MS = 10_000;
@@ -2196,6 +2277,11 @@ const MAX_TENANTS = 200;
  * again.
  */
 export const GRANT_MS = 180_000;
+
+/** Where a limit's marks are: apart from its leases, as both are read by every step. */
+function marksKey(item: string) {
+  return `${item}~`;
+}
 
 /** A line of a limit, for one tenant. */
 function lineKey(item: string, tenant: string, line: number) {

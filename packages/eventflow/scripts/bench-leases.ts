@@ -121,7 +121,7 @@ async function step(i: number) {
       let mine = false;
       const w0 = { leaseId, limits, tenant, callbackId, runId: `r${i}`, at, expiresAt: Date.now() + 300_000 };
       if ((await store.enqueue(w0, round === 0)) === "held") mine = true;
-      else await store.dispatch(limits[0], async (w) => (w.callbackId === callbackId ? (mine = true) : wake(w)), w0);
+      else await store.dispatch(limits[0], async (w) => (w.callbackId === callbackId ? (waiting.delete(callbackId), (mine = true)) : wake(w)), w0);
       if (!mine && !(await woken)) continue;
     }
     if (!(await store.renew(limits, leaseId, 60_000))) continue;

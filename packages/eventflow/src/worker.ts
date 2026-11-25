@@ -498,12 +498,20 @@ function makeStep(state: RunState) {
           expiresAt: Date.now() + leaseWaitSeconds(round) * 1000,
         };
         const result = await engine.store.enqueue(waiter, round === 0 && c.attempt === 1);
-        if (result === "held") return { placed: undefined };
+        // A step that goes on without its callback closes it. An entry of it may be left in
+        // line, put back by one that couldn't give it its leases as another did: given others
+        // later, it would be told, and they'd be held for no one.
+        const close = () => engine.callback(callbackId, { leaseId }).catch(() => false);
+        if (result === "held") {
+          await close();
+          return { placed: undefined };
+        }
         let mine: { placed?: string[] } | undefined;
         for (const limit of limits)
           await engine.store.dispatch(limit, async (w) => {
             if (w.callbackId !== callbackId) return wake(w);
             mine = { placed: w.placed };
+            await close();
             return true;
           }, waiter);
         return mine ?? null;

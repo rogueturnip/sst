@@ -126,8 +126,8 @@ async function attemptStep(leaseId: string, tenant: (typeof tenants)[number], ms
       let mine = false;
       for (let tries = 0; tries < 8; tries++) {
         try {
-          if ((await store.enqueue(w)) === "held") mine = true;
-          else for (const l of limits) await store.dispatch(l, async (o: LeaseWaiter) => (o.callbackId === callbackId ? (mine = true) : wake(o)), w);
+          if ((await store.enqueue(w)) === "held") (wakes.delete(callbackId), (mine = true));
+          else for (const l of limits) await store.dispatch(l, async (o: LeaseWaiter) => (o.callbackId === callbackId ? (wakes.delete(callbackId), (mine = true)) : wake(o)), w);
           break;
         } catch {}
       }
