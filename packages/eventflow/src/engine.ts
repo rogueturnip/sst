@@ -2,7 +2,7 @@ import { Resource } from "sst/resource";
 import { awsFetch, type AwsOptions } from "./client.js";
 import { LambdaError, startExecution, stopExecution, succeedCallback } from "./lambda.js";
 import { sqs } from "./aws.js";
-import { ulid } from "./ids.js";
+import { hash, ulid } from "./ids.js";
 import { sign } from "./sign.js";
 import { DynamoStore, type Store } from "./store.js";
 import {
@@ -12,11 +12,17 @@ import {
   type EngineResource,
   type Message,
   type RunPayload,
+  type Timer,
   type WireEvent,
 } from "./types.js";
 
 /** The largest event, in bytes of JSON, that `send()` accepts. It leaves room for the message around it in SQS's 256 KB. */
 export const MAX_EVENT_BYTES = 255 * 1024;
+/**
+ * How long a signed message in the queue is good for: longer than the dead-letter
+ * queue keeps it, so one moved back after a fix still runs.
+ */
+export const MESSAGE_TTL_MS = 15 * 86_400_000;
 /** How long an event ID is remembered, so a second send of it is skipped. */
 export const DEDUP_MS = 24 * 3_600_000;
 
@@ -26,6 +32,10 @@ export const DEDUP_MS = 24 * 3_600_000;
  */
 export class Engine {
   private _store?: Store;
+  /** The app's ID, which a reference to one of its functions has. */
+  appId = "";
+  /** Send the events about every run that ended, also where no function has a trigger for them. */
+  systemEvents = false;
 
   constructor(
     public readonly resource: EngineResource,
@@ -89,11 +99,29 @@ export class Engine {
       if (result.Failed?.length) {
         const failed = result.Failed.map((f) => {
           const m = entries[Number(f.Id)].message;
-          return `${m.event.id}: ${f.Code}${f.Message ? ` ${f.Message}` : ""}`;
+          return `${"event" in m ? m.event.id : m.kind}: ${f.Code}${f.Message ? ` ${f.Message}` : ""}`;
         });
         throw new SendError(`Failed to send ${failed.length} of ${entries.length} events: ${failed.join("; ")}`);
       }
     }
+  }
+
+  /** Send a timer, to come at `at`. A queue delays a message at most 15 minutes, so it may come more than once. */
+  async sendTimer(timer: Timer, at: number) {
+    await this.sendMessages([
+      {
+        message: sign({ kind: "timer" as const, timer, at, exp: Math.max(at, Date.now()) + MESSAGE_TTL_MS }),
+        group: timer.tenant ?? `t-${hash(timer.fn, 10)}`,
+        delaySeconds: Math.max(0, Math.min(900, Math.ceil((at - Date.now()) / 1000))),
+      },
+    ]);
+  }
+
+  /** Send an event about a run that ended. */
+  async sendSystem(event: WireEvent) {
+    await this.sendMessages([
+      { message: sign({ kind: "system" as const, event, exp: Date.now() + MESSAGE_TTL_MS }), group: event.tenant },
+    ]);
   }
 
   async sendEvents(events: WireEvent[]) {
@@ -216,6 +244,8 @@ export function checkEvent(input: Partial<WireEvent> & Record<string, unknown>, 
   if (typeof name !== "string" || !name) throw new TypeError(`An ${label} needs a name.`);
   if (name.length > 256 || CONTROL.test(name))
     throw new TypeError(`The ${label} name "${name.slice(0, 40)}" must be 1 to 256 characters, with no control characters.`);
+  // So a sender can't make up what happened to a run.
+  if (name.startsWith("inngest/")) throw new TypeError(`The ${label} name "${name.slice(0, 60)}" is kept for EventFlow's own, as "inngest/" is.`);
   if (input.tenant !== undefined && (typeof input.tenant !== "string" || !TENANT.test(input.tenant)))
     throw new TypeError(
       `The tenant of ${label} "${name}" must be 1 to 128 letters, digits and punctuation, as SQS allows in a MessageGroupId.`,
@@ -228,6 +258,14 @@ export function checkEvent(input: Partial<WireEvent> & Record<string, unknown>, 
     throw new TypeError(
       `The ${label} "${name}" has a "user" field. Inngest v4 removed it, and EventFlow doesn't support it. Put it in "data".`,
     );
+}
+
+/** Check a signal, as `sendSignal()` does and as the router does. */
+export function checkSignal(input: { signal?: unknown; tenant?: unknown }) {
+  if (typeof input.signal !== "string" || !input.signal || input.signal.length > 256 || CONTROL.test(input.signal))
+    throw new TypeError("A signal's name must be 1 to 256 characters, with no control characters.");
+  if (input.tenant !== undefined && (typeof input.tenant !== "string" || !TENANT.test(input.tenant)))
+    throw new TypeError("The tenant of a signal must be 1 to 128 letters, digits and punctuation, as SQS allows in a MessageGroupId.");
 }
 
 export function toWireEvent(input: SendPayload, now = Date.now()): WireEvent {

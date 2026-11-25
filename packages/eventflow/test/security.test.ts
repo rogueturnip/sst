@@ -245,8 +245,9 @@ void sdk;
 
 describe("Inngest options EventFlow doesn't have", () => {
   it("throw on the client, and accept the ones about Inngest's cloud", () => {
-    expect(() => new sdk.EventFlow({ id: "x", logger: console } as any)).toThrow("logger");
-    expect(() => new sdk.EventFlow({ id: "x", middleware: [] } as any)).toThrow("middleware");
+    expect(() => new sdk.EventFlow({ id: "x", fetch } as any)).toThrow("fetch");
+    expect(() => new sdk.EventFlow({ id: "x", schemas: {} } as any)).toThrow("eventType");
+    expect(() => new sdk.EventFlow({ id: "x", logger: console, middleware: [] })).not.toThrow();
     expect(() => new sdk.EventFlow({ id: "x", eventKey: "k", isDev: true, appVersion: "1" })).not.toThrow();
   });
 });

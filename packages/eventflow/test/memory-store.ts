@@ -3,6 +3,10 @@ import {
   tenantKey,
   uniqueLimits,
   type Admission,
+  type Failure,
+  type Lock,
+  type Pending,
+  type SignalWait,
   type LeaseWaiter,
   type Limit,
   type Store,
@@ -61,6 +65,10 @@ export class MemoryStore implements Store {
     if (c && c.owner !== owner && c.expires > this.now()) return false;
     this.claims.set(item, { owner, expires: this.now() + ttlMs });
     return true;
+  }
+
+  async owner(item: string) {
+    return this.claims.get(item)?.owner;
   }
 
   async successor(item: string, owner: string, ttlMs: number) {
@@ -160,7 +168,10 @@ export class MemoryStore implements Store {
       lines.set(waiter.tenant, line);
       const same = line.find((w) => w.at === waiter.at && w.leaseId === waiter.leaseId);
       if (same) same.callbackId = waiter.callbackId;
-      else line.push({ ...waiter, limits, seq: this.seq++ });
+      else {
+        line.push({ ...waiter, limits, seq: this.seq++ });
+        line.sort((a, b) => a.at - b.at || a.seq - b.seq);
+      }
     }
     return "queued" as const;
   }
@@ -277,6 +288,120 @@ export class MemoryStore implements Store {
 
   async recent(key: string, since: number) {
     return (this.recentItems.get(key) ?? []).filter((r) => r.receivedAt >= since);
+  }
+
+  windows = new Map<string, { event?: WireEvent; order?: string; opened?: number; last?: number; received?: string; closing?: boolean; fired?: string }>();
+  async debounceMerge(item: string, event: WireEvent, order: string, received: string, now: number) {
+    const w = this.windows.get(item) ?? {};
+    this.windows.set(item, w);
+    if (w.closing) return "closing" as const;
+    if (w.order !== undefined ? w.order > order : w.fired !== undefined && w.fired >= received) return "stale" as const;
+    Object.assign(w, { event, order, received, last: now, opened: w.opened ?? now });
+    return { opened: w.opened!, last: now };
+  }
+  async debounceRead(item: string) {
+    const w = this.windows.get(item);
+    return w?.order === undefined ? undefined : { event: w.event!, order: w.order, opened: w.opened!, last: w.last!, closing: !!w.closing };
+  }
+  async debounceClose(item: string, order: string) {
+    const w = this.windows.get(item);
+    if (w?.order !== order) return false;
+    w.closing = true;
+    return true;
+  }
+  async debounceDone(item: string, order: string) {
+    const w = this.windows.get(item);
+    if (w?.order === order && w.closing) this.windows.set(item, { fired: w.received });
+  }
+
+  batches = new Map<string, { next: number; pending: Pending[]; closed: Map<number, { refs: string[]; orders: string[]; at: number }> }>();
+  batchItems = new Map<string, { event: WireEvent; batch?: string }>();
+  private batch(item: string) {
+    let b = this.batches.get(item);
+    if (!b) this.batches.set(item, (b = { next: 0, pending: [], closed: new Map() }));
+    return b;
+  }
+  async batchAdd(item: string, ref: string, order: string, event: WireEvent, at: number) {
+    if (this.batchItems.get(ref)?.batch) return false;
+    if (!this.batchItems.has(ref)) this.batchItems.set(ref, { event });
+    const b = this.batch(item);
+    b.pending = [...b.pending.filter((p) => p.order !== order), { order, at, bytes: JSON.stringify(event).length, ref }].sort((x, y) => (x.order < y.order ? -1 : 1));
+    return true;
+  }
+  async batchPending(item: string, max: number) {
+    return this.batch(item).pending.slice(0, max);
+  }
+  async batchEvents(refs: string[]) {
+    return refs.flatMap((r) => (this.batchItems.has(r) ? [this.batchItems.get(r)!.event] : []));
+  }
+  async batchClose(item: string, max: number, choose: (p: Pending[]) => Pending[]) {
+    const b = this.batch(item);
+    const open = b.closed.get(b.next);
+    if (open) return { n: b.next, refs: open.refs, at: open.at };
+    b.pending = b.pending.filter((p) => !this.batchItems.get(p.ref)?.batch);
+    const chosen = choose(b.pending.slice(0, max));
+    if (!chosen.length) return undefined;
+    b.closed.set(b.next, { refs: chosen.map((p) => p.ref), orders: chosen.map((p) => p.order), at: chosen[0].at });
+    return { n: b.next, refs: chosen.map((p) => p.ref), at: chosen[0].at };
+  }
+  async batchRead(item: string, n: number) {
+    return this.batch(item).closed.get(n)?.refs ?? [];
+  }
+  async batchDone(item: string, n: number) {
+    const b = this.batch(item);
+    const c = b.closed.get(n);
+    if (!c) return;
+    for (const r of c.refs) this.batchItems.get(r)!.batch = `${item}#${n}`;
+    b.pending = b.pending.filter((p) => !c.orders.includes(p.order));
+    b.next = Math.max(b.next, n + 1);
+  }
+
+  locks = new Map<string, Lock>();
+  async lockTake(item: string, lock: Lock) {
+    const held = this.locks.get(item);
+    if (held && held.run !== lock.run) return { ...held };
+    if (!held) this.locks.set(item, { ...lock });
+    return undefined;
+  }
+  async lockRead(item: string) {
+    return this.locks.get(item);
+  }
+  async lockStarted(item: string, run: string, arn: string) {
+    const held = this.locks.get(item);
+    if (held?.run === run) held.arn = arn;
+  }
+  async lockMove(item: string, from: string, to: Lock) {
+    if (this.locks.get(item)?.run !== from) return false;
+    this.locks.set(item, { ...to });
+    return true;
+  }
+  async lockFree(item: string, run: string) {
+    if (this.locks.get(item)?.run === run) this.locks.delete(item);
+  }
+
+  failed = new Map<string, Failure[]>();
+  async putFailure(run: string, failure: Failure) {
+    const list = this.failed.get(run) ?? [];
+    if (!list.some((f) => f.attempt === failure.attempt)) list.push(JSON.parse(JSON.stringify(failure)));
+    this.failed.set(run, list);
+  }
+  async failures(run: string) {
+    return this.failed.get(run) ?? [];
+  }
+
+  signals = new Map<string, SignalWait>();
+  async signalWait(item: string, wait: SignalWait, replace: boolean) {
+    const held = this.signals.get(item);
+    if (held && !replace && held.owner !== wait.owner && held.expiresAt >= this.now()) return false;
+    this.signals.set(item, wait);
+    return true;
+  }
+  async signalRead(item: string) {
+    const w = this.signals.get(item);
+    return w && w.expiresAt >= this.now() ? w : undefined;
+  }
+  async signalFree(item: string, callbackId: string) {
+    if (this.signals.get(item)?.callbackId === callbackId) this.signals.delete(item);
   }
 
   async scan(prefix: string) {

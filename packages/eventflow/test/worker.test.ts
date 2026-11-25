@@ -148,16 +148,6 @@ describe("runs", () => {
     expect((await cluster.runOf("parallel").result).getResult()).toBe(3);
   });
 
-  it("throws when a run reads `attempt`", async () => {
-    const cluster = new Cluster((flow) => [
-      flow.createFunction({ id: "attempt", triggers: { event: "go" } }, async (ctx: any) => ctx.attempt),
-    ]);
-    await cluster.flow.send({ name: "go" });
-    await cluster.drain();
-    const result = await cluster.runOf("attempt").result;
-    expect(result.getStatus()).toBe(ExecutionStatus.FAILED);
-    expect(result.getError().errorMessage).toContain("attempt");
-  });
 });
 
 describe("limits", () => {

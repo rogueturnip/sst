@@ -47,6 +47,7 @@ function post(endpoint: string, action: string, body: any) {
       },
       (res) => {
         let text = "";
+        res.setEncoding("utf8");
         res.on("data", (c) => (text += c));
         res.on("end", () => resolve({ status: res.statusCode!, data: JSON.parse(text || "{}") }));
       },
@@ -122,6 +123,122 @@ const collect = (into: string[]) => async (w: LeaseWaiter) => (into.push(w.lease
 
 for (const [name, make] of stores) {
   describe(`${name} store`, () => {
+    it("gives leases in the order of their places in line, whenever they joined", async () => {
+      const store = make();
+      const l = limit(1);
+      await store.acquire([l], "H", "a", 60_000);
+      for (const [id, at] of [["third", 3000], ["first", 1000], ["second", 2000]] as const) await store.enqueue(waiter(id, "a", at, [l]));
+      const woken: string[] = [];
+      for (const id of ["H", "first", "second"]) await store.handoff([l], id, "a", collect(woken));
+      expect(woken).toEqual(["first", "second", "third"]);
+    });
+
+    it("keeps a debounce's window: the last event, one closing, and none that's had again", async () => {
+      const store = make();
+      const item = `D#contract-${run}-${n++}`;
+      const e = (id: string) => ({ id, name: "x", data: { id }, ts: 1 });
+      const at = (i: number) => String(i).padStart(15, "0");
+      const merge = (i: number, order = i) => store.debounceMerge(item, e(`e${i}`), `${at(order)}#e${i}`, `${at(i)}#e${i}`, 1000 + i, 86_400_000);
+      expect(await merge(1)).toEqual({ opened: 1001, last: 1001 });
+      expect(await merge(3)).toEqual({ opened: 1001, last: 1003 });
+      expect(await merge(4, 2)).toBe("stale");
+      // The same again, as delivered twice.
+      expect(await merge(3)).toEqual({ opened: 1001, last: 1003 });
+      expect((await store.debounceRead(item))!.event.id).toBe("e3");
+      expect(await store.debounceClose(item, `${at(1)}#e1`)).toBe(false);
+      expect(await store.debounceClose(item, `${at(3)}#e3`)).toBe(true);
+      expect(await merge(5)).toBe("closing");
+      expect((await store.debounceRead(item))!.closing).toBe(true);
+      await store.debounceDone(item, `${at(3)}#e3`);
+      await store.debounceDone(item, `${at(3)}#e3`);
+      expect(await store.debounceRead(item)).toBeUndefined();
+      expect(await merge(2)).toBe("stale");
+      expect(await merge(3)).toBe("stale");
+      expect(await merge(5)).toEqual({ opened: 1005, last: 1005 });
+    });
+
+    it("has each event in one batch, when many routers close them and stop part way", async () => {
+      const store = make();
+      const item = `B#contract-${run}-${n++}`;
+      const started = new Map<number, string>();
+      const choose = (p: any[]) => (p.length >= 5 ? p.slice(0, 5) : []);
+      const router = async () => {
+        for (;;) {
+          const closed = await store.batchClose(item, 6, choose, 86_400_000);
+          if (!closed) return;
+          const ids = (await store.batchEvents(closed.refs)).map((e) => e.id).join(",");
+          // Whoever starts it, it's the same batch.
+          if (started.has(closed.n)) expect(started.get(closed.n)).toBe(ids);
+          started.set(closed.n, ids);
+          if (Math.random() < 0.3) return;
+          await store.batchDone(item, closed.n);
+        }
+      };
+      await Promise.all(
+        Array.from({ length: 50 }, async (_, i) => {
+          const id = `e${String(i).padStart(2, "0")}`;
+          for (let again = 0; again < 2; again++) {
+            await store.batchAdd(item, `BE#${item}-${id}`, `${String(1000 + i).padStart(15, "0")}#${id}`, { id, name: "x", data: {}, ts: 1 }, 1000 + i, 86_400_000);
+            await router().catch((error) => expect(String(error)).toContain("busy"));
+          }
+        }),
+      );
+      for (let i = 0; i < 30; i++) await router().catch(() => {});
+      const all = [...started.values()].flatMap((ids) => ids.split(","));
+      expect(all).toHaveLength(50);
+      expect(new Set(all).size).toBe(50);
+      expect(await store.batchAdd(item, `BE#${item}-e00`, "0#e00", { id: "e00", name: "x", data: {}, ts: 1 }, 1, 86_400_000)).toBe(false);
+    }, 120_000);
+
+    it("gives a singleton to one run at a time", async () => {
+      const store = make();
+      const item = `S#contract-${run}-${n++}`;
+      const lock = (r: string) => ({ run: r, until: Date.now() + 60_000 });
+      const took = await Promise.all(Array.from({ length: 10 }, (_, i) => store.lockTake(item, lock(`r${i}`), 86_400_000)));
+      const winner = took.findIndex((t) => t === undefined);
+      expect(took.filter((t) => t === undefined)).toHaveLength(1);
+      expect(took.find((t) => t)!.run).toBe(`r${winner}`);
+      expect(await store.lockTake(item, lock(`r${winner}`), 86_400_000)).toBeUndefined();
+      await store.lockStarted(item, `r${winner}`, "arn");
+      expect((await store.lockRead(item))!.arn).toBe("arn");
+      const moved = await Promise.all(["x", "y"].map((to) => store.lockMove(item, `r${winner}`, lock(to), 86_400_000)));
+      expect(moved.filter(Boolean)).toHaveLength(1);
+      expect((await store.lockRead(item))!.arn).toBeUndefined();
+      await store.lockFree(item, `r${winner}`);
+      expect(await store.lockRead(item)).toBeDefined();
+      await store.lockFree(item, (await store.lockRead(item))!.run);
+      expect(await store.lockRead(item)).toBeUndefined();
+    });
+
+    it("keeps the first failure of an attempt, whole, however large", async () => {
+      const store = make();
+      const r = `run-${run}-${n++}`;
+      const memo = { big: { v: `x${"é".repeat(200_000)}${"😀".repeat(120_000)}` }, bad: { e: { name: "E", message: "m" } } };
+      await Promise.all([1, 2].map((i) => store.putFailure(r, { attempt: 0, error: { name: "E", message: `${i}` }, delayMs: i, memo }, 86_400_000)));
+      await store.putFailure(r, { attempt: 1, error: { name: "E", message: "x" }, delayMs: 5, memo: {} }, 86_400_000);
+      const failures = await store.failures(r);
+      expect(failures.map((f) => f.attempt)).toEqual([0, 1]);
+      expect(failures[0].memo).toEqual(memo as any);
+      expect(failures[1].memo).toEqual({});
+    });
+
+    it("has one run wait for a signal, unless it's replaced or over", async () => {
+      const store = make();
+      const item = `G#contract-${run}-${n++}`;
+      const wait = (owner: string, ms = 60_000) => ({ callbackId: `cb-${owner}`, runId: owner, owner, expiresAt: Date.now() + ms });
+      expect(await store.signalWait(item, wait("a"), false)).toBe(true);
+      expect(await store.signalWait(item, wait("a"), false)).toBe(true);
+      expect(await store.signalWait(item, wait("b"), false)).toBe(false);
+      expect(await store.signalWait(item, wait("b"), true)).toBe(true);
+      await store.signalFree(item, "cb-a");
+      expect((await store.signalRead(item))!.runId).toBe("b");
+      await store.signalFree(item, "cb-b");
+      expect(await store.signalRead(item)).toBeUndefined();
+      expect(await store.signalWait(item, wait("c", -1000), false)).toBe(true);
+      expect(await store.signalRead(item)).toBeUndefined();
+      expect(await store.signalWait(item, wait("d"), false)).toBe(true);
+    });
+
     it("gives each start its own slot in a throttle, when many ask at once", async () => {
       const store = make();
       const item = `T#contract-${run}-${n++}`;

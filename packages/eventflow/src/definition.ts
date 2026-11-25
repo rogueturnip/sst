@@ -3,6 +3,7 @@ import { parseDuration, type DurationInput } from "./duration.js";
 import {
   compileKey,
   evaluate,
+  evaluateValue,
   parseExpression,
   type Expression,
   type KeyInput,
@@ -28,6 +29,36 @@ export interface FunctionOptions {
   throttle?: { limit: number; period: DurationInput; burst?: number; key?: KeyInput };
   rateLimit?: { limit: number; period: DurationInput; key?: KeyInput };
   idempotency?: KeyInput;
+  /**
+   * Wait for the events to stop: the run starts once none came for `period`, with the last
+   * one. With `timeout`, at the latest that long after the first. Each key, and each
+   * tenant, has its own wait.
+   */
+  debounce?: { period: DurationInput; timeout?: DurationInput; key?: KeyInput };
+  /**
+   * Start one run for many events, in `events`: up to `maxSize`, or those that came in
+   * `timeout`. Each key, and each tenant, has its own batch. An event that `if` isn't true
+   * for starts a run by itself.
+   */
+  batchEvents?: { maxSize: number; timeout: DurationInput; key?: KeyInput; if?: string };
+  /**
+   * Have one run at a time, of each key and each tenant. While it runs, `"skip"` skips
+   * another, and `"cancel"` cancels the one that's running and starts the other. A key that
+   * is `false` isn't a singleton.
+   */
+  singleton?: { mode: "skip" | "cancel"; key?: KeyInput };
+  /**
+   * Which of the runs that wait for a concurrency limit go first. `run` is how many seconds
+   * ahead of its turn, from -600 to 600.
+   */
+  priority?: { run?: string };
+  /**
+   * Cancel a run that hasn't started within `start` of its event, as behind a throttle or
+   * a concurrency limit, or hasn't finished within `finish` of starting.
+   */
+  timeouts?: { start?: DurationInput; finish?: DurationInput };
+  /** What wraps the function and its steps. See the guide. */
+  middleware?: MiddlewareClass[];
   onFailure?: (...args: any[]) => unknown;
   cancelOn?: CancelOnInput[];
   /** Accepted for Inngest compatibility. Steps are always checkpointed. */
@@ -35,6 +66,9 @@ export interface FunctionOptions {
   /** Accepted for Inngest compatibility. It has no effect. */
   optimizeParallelism?: unknown;
 }
+
+/** A middleware class, as Inngest's `Middleware.BaseMiddleware`. */
+export type MiddlewareClass = new (args: { client: any }) => any;
 
 export interface CancelOnInput {
   /** The event that cancels the run. */
@@ -56,12 +90,12 @@ export interface CancelOn {
 
 export type TriggerInput =
   | { event: string | { name: string }; if?: string }
-  | { cron: string; jitter?: unknown }
+  | { cron: string; jitter?: DurationInput }
   | { invoke: true };
 
 export type Trigger =
   | { kind: "event"; name: string; if?: Expression }
-  | { kind: "cron"; cron: Cron }
+  | { kind: "cron"; cron: Cron; jitterMs?: number }
   | { kind: "invoke" };
 
 export interface Limit {
@@ -88,18 +122,17 @@ export interface Definition {
   idempotency?: (scope: Record<string, unknown>) => string | undefined;
   onFailure?: (...args: any[]) => unknown;
   cancelOn: CancelOn[];
+  debounce?: { periodMs: number; timeoutMs?: number; key?: Key };
+  batch?: { maxSize: number; timeoutMs: number; key?: Key; if?: Expression };
+  singleton?: { mode: "skip" | "cancel"; key?: (scope: Record<string, unknown>) => string | undefined | false };
+  priority?: Expression;
+  timeouts?: { startMs?: number; finishMs?: number };
+  middleware: MiddlewareClass[];
 }
 
-export const DEFAULT_RETRIES = 4;
+type Key = (scope: Record<string, unknown>) => string | undefined;
 
-const UNSUPPORTED: Record<string, string> = {
-  debounce: "debounce",
-  batchEvents: "event batching",
-  priority: "priority",
-  timeouts: "timeouts (set timeout.execution on the EventFlow component instead)",
-  singleton: "singleton",
-  middleware: "middleware",
-};
+export const DEFAULT_RETRIES = 4;
 
 const KNOWN = new Set([
   "id",
@@ -113,6 +146,12 @@ const KNOWN = new Set([
   "idempotency",
   "onFailure",
   "cancelOn",
+  "debounce",
+  "batchEvents",
+  "singleton",
+  "priority",
+  "timeouts",
+  "middleware",
   "checkpointing",
   "optimizeParallelism",
 ]);
@@ -128,10 +167,6 @@ export function define(options: FunctionOptions): Definition {
   const where = `function "${id}"`;
 
   for (const key of Object.keys(options)) {
-    if (UNSUPPORTED[key])
-      throw new TypeError(
-        `The ${where} uses ${UNSUPPORTED[key]}, which EventFlow doesn't support yet. See the migration guide for what to use instead.`,
-      );
     if (!KNOWN.has(key))
       throw new TypeError(`The ${where} has an unknown option "${key}".`);
   }
@@ -141,6 +176,22 @@ export function define(options: FunctionOptions): Definition {
     throw new TypeError(`The ${where} has retries ${retries}. Use 0 to 20.`);
 
   const triggers = normalizeTriggers(options.triggers, where);
+  // As with Inngest, a batch's run has no one event for these to look at.
+  if (options.batchEvents)
+    for (const other of ["idempotency", "rateLimit", "cancelOn", "priority", "debounce", "singleton"] as const)
+      if (options[other] !== undefined)
+        throw new TypeError(`The ${where} has both "batchEvents" and "${other}", which don't go together.`);
+  if (options.middleware !== undefined && (!Array.isArray(options.middleware) || options.middleware.some((m) => typeof m !== "function")))
+    throw new TypeError(`The middleware of ${where} must be a list of classes.`);
+
+  const within = (input: DurationInput, label: string, min: number, max: number) => {
+    const ms = parseDuration(input, `${label} of ${where}`);
+    if (ms < min || ms > max) throw new TypeError(`The ${label} of ${where} must be from ${span(min)} to ${span(max)}.`);
+    return ms;
+  };
+  const keyOf = (key: KeyInput | undefined, label: string) =>
+    key === undefined ? undefined : compileKey(key, `${label} key of ${where}`);
+  const DAYS_7 = 7 * 86_400_000;
 
   const concurrency = normalizeConcurrency(options.concurrency, where);
 
@@ -179,8 +230,77 @@ export function define(options: FunctionOptions): Definition {
         ? undefined
         : compileKey(options.idempotency, `idempotency key of ${where}`),
     onFailure: options.onFailure,
+    debounce: options.debounce && {
+      periodMs: within(options.debounce.period, "debounce period", 1000, DAYS_7),
+      timeoutMs:
+        options.debounce.timeout === undefined ? undefined : within(options.debounce.timeout, "debounce timeout", 1000, 4 * DAYS_7),
+      key: keyOf(options.debounce.key, "debounce"),
+    },
+    batch: options.batchEvents && {
+      maxSize: batchSize(options.batchEvents.maxSize, where),
+      timeoutMs: within(options.batchEvents.timeout, "batchEvents timeout", 1000, DAYS_7),
+      key: keyOf(options.batchEvents.key, "batchEvents"),
+      if: options.batchEvents.if === undefined ? undefined : parseExpression(options.batchEvents.if, `batchEvents "if" of ${where}`),
+    },
+    singleton: options.singleton && normalizeSingleton(options.singleton, where),
+    priority: options.priority?.run === undefined ? undefined : parseExpression(options.priority.run, `priority of ${where}`),
+    timeouts: options.timeouts && {
+      startMs: options.timeouts.start === undefined ? undefined : within(options.timeouts.start, "start timeout", 1000, 366 * 86_400_000),
+      finishMs: options.timeouts.finish === undefined ? undefined : within(options.timeouts.finish, "finish timeout", 1000, 366 * 86_400_000),
+    },
+    middleware: options.middleware ?? [],
     cancelOn: normalizeCancelOn(options.cancelOn, where),
   };
+}
+
+/** The most events in a batch. */
+export const MAX_BATCH = 500;
+
+function span(ms: number) {
+  return ms >= 86_400_000 ? `${ms / 86_400_000}d` : `${ms / 1000}s`;
+}
+
+function batchSize(size: number, where: string) {
+  if (!Number.isInteger(size) || size < 1 || size > MAX_BATCH)
+    throw new TypeError(`The ${where} has a batchEvents maxSize of ${size}. Use 1 to ${MAX_BATCH}.`);
+  return size;
+}
+
+function normalizeSingleton(input: NonNullable<FunctionOptions["singleton"]>, where: string): Definition["singleton"] {
+  if (input.mode !== "skip" && input.mode !== "cancel")
+    throw new TypeError(`The singleton of ${where} has mode "${input.mode}". Use "skip" or "cancel".`);
+  if (input.key === undefined) return { mode: input.mode };
+  const source = input.key;
+  if (typeof source === "function")
+    return {
+      mode: input.mode,
+      key: (scope) => {
+        const value = source(scope.event);
+        return value === false ? false : value === undefined || value === null || value === "" ? undefined : typeof value === "string" ? value : JSON.stringify(value);
+      },
+    };
+  const text = compileKey(source, `singleton key of ${where}`);
+  const expr = parseExpression(source, `singleton key of ${where}`);
+  return {
+    mode: input.mode,
+    key: (scope) => {
+      try {
+        if (evaluateValue(expr, scope) === false) return false;
+      } catch {}
+      return text(scope);
+    },
+  };
+}
+
+/** How many ms ahead of its turn a run goes. An expression that has no value is none. */
+export function priorityMs(def: Definition, event: unknown) {
+  if (!def.priority) return 0;
+  try {
+    const value = Number(evaluateValue(def.priority, { event }));
+    return Number.isFinite(value) ? Math.max(-600, Math.min(600, Math.trunc(value))) * 1000 : 0;
+  } catch {
+    return 0;
+  }
 }
 
 function normalizeCancelOn(input: FunctionOptions["cancelOn"], where: string): CancelOn[] {
@@ -208,8 +328,8 @@ function normalizeTriggers(input: FunctionOptions["triggers"], where: string): T
     if (t && "event" in t) {
       const name = typeof t.event === "string" ? t.event : t.event?.name;
       if (!name) throw new TypeError(`A trigger of ${where} has no event name.`);
-      if (name.includes("*"))
-        throw new TypeError(`The trigger "${name}" of ${where} has a wildcard, which EventFlow doesn't support.`);
+      if (name.includes("*") && !/^[^*]+[/.]\*$/.test(name))
+        throw new TypeError(`The trigger "${name}" of ${where} has a wildcard that isn't last, after a "/" or ".", like "user/*".`);
       return {
         kind: "event",
         name,
@@ -217,9 +337,10 @@ function normalizeTriggers(input: FunctionOptions["triggers"], where: string): T
       };
     }
     if (t && "cron" in t) {
-      if ((t as any).jitter !== undefined)
-        throw new TypeError(`The cron trigger of ${where} has a jitter, which EventFlow doesn't support.`);
-      return { kind: "cron", cron: parseCron(t.cron) };
+      const jitterMs = t.jitter === undefined ? undefined : parseDuration(t.jitter, `cron jitter of ${where}`);
+      if (jitterMs !== undefined && (jitterMs < 1000 || jitterMs > 3_600_000))
+        throw new TypeError(`The cron jitter of ${where} must be from 1s to 1h.`);
+      return { kind: "cron", cron: parseCron(t.cron), ...(jitterMs === undefined ? {} : { jitterMs }) };
     }
     if (t && "invoke" in t) return { kind: "invoke" };
     throw new TypeError(`A trigger of ${where} isn't an event or a cron.`);
@@ -260,10 +381,15 @@ function normalizeConcurrency(input: FunctionOptions["concurrency"], where: stri
 
 export function matchesTrigger(def: Definition, event: { name: string; data: unknown }) {
   return def.triggers.some((t) => {
-    if (t.kind !== "event" || t.name !== event.name) return false;
+    if (t.kind !== "event" || !nameMatches(t.name, event.name)) return false;
     if (!t.if) return true;
     return evaluateSafe(t.if, { event });
   });
+}
+
+/** Whether an event's name is a trigger's, or under its wildcard. */
+export function nameMatches(trigger: string, name: string) {
+  return trigger.endsWith("*") ? name.startsWith(trigger.slice(0, -1)) && name.length >= trigger.length : trigger === name;
 }
 
 function evaluateSafe(expr: Expression, scope: Record<string, unknown>) {

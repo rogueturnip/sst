@@ -20,6 +20,13 @@ import type { WireEvent } from "./types.js";
 //   WF#…   the fields that waits for an event of a tenant match on
 //   W#…    the waits for an event, and the cancelOns
 //   R#…    an event that a wait could match, for an hour
+//   D#…    a debounce's window
+//   B#…    a batch: the events that aren't in a closed one, and the closed ones
+//   BE#…   an event of a batch
+//   S#…    a singleton: the run that has it
+//   F#…    how a run's attempts failed, and what its steps had returned
+//   G#…    a run that waits for a signal
+//   M#…    whether a run with a start timeout started, or was cancelled first
 
 export interface Limit {
   /** The item's key. */
@@ -56,7 +63,64 @@ export interface LeaseWaiter {
   expiresAt: number;
 }
 
-export type Admission = { decision: "start" } | { decision: "skip"; reason: string } | { decision: "hold"; at: number };
+export type Admission =
+  | { decision: "start" }
+  | { decision: "skip"; reason: string }
+  | { decision: "hold"; at: number }
+  /** It's in a debounce's window. */
+  | { decision: "debounce" }
+  /** It's in a batch. */
+  | { decision: "batch" };
+
+/** A debounce's window, as it's read. */
+export interface Debounce {
+  event: WireEvent;
+  /** What the event that's kept is ordered by. */
+  order: string;
+  /** When the first event came, and the last. */
+  opened: number;
+  last: number;
+  /** Its run is being started. Nothing joins the window any more. */
+  closing: boolean;
+}
+
+/** An event in a batch that isn't closed. */
+export interface Pending {
+  order: string;
+  at: number;
+  bytes: number;
+  /** The event's own item. */
+  ref: string;
+}
+
+/** The run that has a singleton. */
+export interface Lock {
+  run: string;
+  /** The run's execution, once it's started. */
+  arn?: string;
+  /** Until when a run that isn't found is taken for one that's still to start. */
+  until: number;
+}
+
+/** How a function's attempt failed, and what its steps had returned by then. */
+export interface Failure {
+  attempt: number;
+  error: { name: string; message: string };
+  delayMs: number;
+  memo: Record<string, Memo>;
+}
+
+/** A run that waits for a signal. */
+export interface SignalWait {
+  callbackId: string;
+  runId: string;
+  /** The wait's own, the same when its step is tried again. */
+  owner: string;
+  expiresAt: number;
+}
+
+/** A step's result, or the error it failed with. */
+export type Memo = { v: unknown } | { e: { name: string; message: string } };
 
 export interface Store {
   /**
@@ -72,6 +136,8 @@ export interface Store {
   putAdmission(item: string, admission: Admission, ttlMs: number): Promise<Admission>;
   /** True the first time the key is claimed in the window. */
   claim(item: string, owner: string, ttlMs: number): Promise<boolean>;
+  /** The owner of a key, if it has one. */
+  owner(item: string): Promise<string | undefined>;
   /** Records the owner of a key if it has none, and returns the owner it has. */
   successor(item: string, owner: string, ttlMs: number): Promise<string>;
   /** GCRA: 0 when allowed now, or how many ms until it would be. Takes the slot only when allowed. */
@@ -118,6 +184,56 @@ export interface Store {
   deleteWaiter(key: string, waiter: Pick<Waiter, "createdAt" | "callbackId">): Promise<void>;
   putRecent(key: string, event: WireEvent, receivedAt: number, ttlMs: number): Promise<void>;
   recent(key: string, since: number): Promise<{ event: WireEvent; receivedAt: number }[]>;
+  /**
+   * Puts an event in a debounce's window, in place of one that's older. "stale" when it's
+   * older itself, or the window that had it has closed. "closing" when the window's run is
+   * being started: finish that first, and try again.
+   */
+  debounceMerge(
+    item: string,
+    event: WireEvent,
+    order: string,
+    received: string,
+    now: number,
+    ttlMs: number,
+  ): Promise<{ opened: number; last: number } | "stale" | "closing">;
+  debounceRead(item: string): Promise<Debounce | undefined>;
+  /** Closes the window, if the event that's kept is still this one. */
+  debounceClose(item: string, order: string): Promise<boolean>;
+  /** The window's run started: the next event opens a new one. */
+  debounceDone(item: string, order: string): Promise<void>;
+  /**
+   * Adds an event to a batch that isn't closed. False when it's been in one already.
+   */
+  batchAdd(item: string, ref: string, order: string, event: WireEvent, at: number, ttlMs: number): Promise<boolean>;
+  /** The oldest events that aren't in a closed batch. */
+  batchPending(item: string, max: number): Promise<Pending[]>;
+  /** Events, by their items. One that's gone is left out. */
+  batchEvents(refs: string[]): Promise<WireEvent[]>;
+  /**
+   * Closes the next batch, with what `choose` takes of the events that are pending, or
+   * returns the one that was closed and isn't done. Each event is in one batch.
+   */
+  batchClose(item: string, max: number, choose: (pending: Pending[]) => Pending[], ttlMs: number): Promise<{ n: number; refs: string[]; at: number } | undefined>;
+  /** The batch's run started: the next one can be closed. */
+  batchDone(item: string, n: number): Promise<void>;
+  /** The events of a closed batch. */
+  batchRead(item: string, n: number): Promise<string[]>;
+  /** Takes a singleton for a run, or returns the one that has it. */
+  lockTake(item: string, lock: Lock, ttlMs: number): Promise<Lock | undefined>;
+  lockRead(item: string): Promise<Lock | undefined>;
+  /** Notes the execution of the run that has it. */
+  lockStarted(item: string, run: string, arn: string): Promise<void>;
+  /** Gives it from one run to another. False when that one no longer has it. */
+  lockMove(item: string, from: string, to: Lock, ttlMs: number): Promise<boolean>;
+  lockFree(item: string, run: string): Promise<void>;
+  /** Keeps how a function's attempt failed. The first one kept for an attempt stays. */
+  putFailure(run: string, failure: Failure, ttlMs: number): Promise<void>;
+  failures(run: string): Promise<Failure[]>;
+  /** The holder of a signal's name, or takes it. `replace` takes it from another. */
+  signalWait(item: string, wait: SignalWait, replace: boolean): Promise<boolean>;
+  signalRead(item: string): Promise<SignalWait | undefined>;
+  signalFree(item: string, callbackId: string): Promise<void>;
   /** For the admin API: the items whose key starts with a prefix. */
   scan(prefix: string, limit: number): Promise<Record<string, any>[]>;
 }
@@ -259,13 +375,17 @@ export class DynamoStore implements Store {
     }
   }
 
-  async successor(item: string, owner: string, ttlMs: number) {
-    if (await this.claim(item, owner, ttlMs)) return owner;
+  async owner(item: string) {
     const result = await this.db("GetItem", {
       Key: { pk: S(item), sk: S("-") },
       ConsistentRead: true,
     });
-    return String(result.Item?.owner?.S ?? owner);
+    return result.Item?.owner?.S as string | undefined;
+  }
+
+  async successor(item: string, owner: string, ttlMs: number) {
+    if (await this.claim(item, owner, ttlMs)) return owner;
+    return (await this.owner(item)) ?? owner;
   }
 
   // GCRA keeps one number per bucket: the time the next start is due. It's moved on in
@@ -1321,6 +1441,375 @@ export class DynamoStore implements Store {
     return out;
   }
 
+  async debounceMerge(item: string, event: WireEvent, order: string, received: string, now: number, ttlMs: number) {
+    try {
+      const result = await this.db("UpdateItem", {
+        Key: { pk: S(item), sk: S("-") },
+        UpdateExpression: "SET #e = :e, #o = :o, #l = :now, opened = if_not_exists(opened, :now), received = :r, expires = :x",
+        // Newer than the one that's kept, or the first since the last window closed, and
+        // not one that window had.
+        ConditionExpression:
+          "attribute_not_exists(closing) AND ((attribute_exists(#o) AND #o <= :o) OR (attribute_not_exists(#o) AND (attribute_not_exists(fired) OR fired < :r)))",
+        ExpressionAttributeNames: { "#e": "event", "#o": "order", "#l": "last" },
+        ExpressionAttributeValues: {
+          ":e": S(JSON.stringify(event)),
+          ":o": S(order),
+          ":r": S(received),
+          ":now": N(now),
+          ":x": { N: seconds(now + ttlMs) },
+        },
+        ReturnValues: "ALL_NEW",
+        ReturnValuesOnConditionCheckFailure: "ALL_OLD",
+      });
+      return { opened: Number(result.Attributes.opened.N), last: Number(result.Attributes.last.N) };
+    } catch (error) {
+      if (!isConditionFailure(error)) throw error;
+      return (error as AwsError).body?.Item?.closing ? ("closing" as const) : ("stale" as const);
+    }
+  }
+
+  async debounceRead(item: string): Promise<Debounce | undefined> {
+    const { Item } = await this.db("GetItem", { Key: { pk: S(item), sk: S("-") }, ConsistentRead: true });
+    if (!Item?.order) return undefined;
+    return {
+      event: JSON.parse(Item.event.S),
+      order: String(Item.order.S),
+      opened: Number(Item.opened.N),
+      last: Number(Item.last.N),
+      closing: Boolean(Item.closing),
+    };
+  }
+
+  async debounceClose(item: string, order: string) {
+    try {
+      await this.db("UpdateItem", {
+        Key: { pk: S(item), sk: S("-") },
+        UpdateExpression: "SET closing = :t",
+        ConditionExpression: "#o = :o",
+        ExpressionAttributeNames: { "#o": "order" },
+        ExpressionAttributeValues: { ":t": { BOOL: true }, ":o": S(order) },
+      });
+      return true;
+    } catch (error) {
+      if (isConditionFailure(error)) return false;
+      throw error;
+    }
+  }
+
+  async debounceDone(item: string, order: string) {
+    try {
+      await this.db("UpdateItem", {
+        Key: { pk: S(item), sk: S("-") },
+        UpdateExpression: "SET fired = received REMOVE closing, #o, #e, opened, #l, received",
+        ConditionExpression: "#o = :o AND attribute_exists(closing)",
+        ExpressionAttributeNames: { "#o": "order", "#e": "event", "#l": "last" },
+        ExpressionAttributeValues: { ":o": S(order) },
+      });
+    } catch (error) {
+      if (!isConditionFailure(error)) throw error;
+    }
+  }
+
+  // A batch's events that aren't in a closed one are in order at "q#…" under the batch, and
+  // each event is an item of its own, which says once it's been in one. A closed batch is
+  // its list of events at "m#<n>". At "-" is the number of the next one to close.
+  async batchAdd(item: string, ref: string, order: string, event: WireEvent, at: number, ttlMs: number) {
+    const body = JSON.stringify(event);
+    const expires = { N: seconds(at + ttlMs) };
+    try {
+      await this.db("PutItem", {
+        Item: { pk: S(ref), sk: S("-"), event: S(body), expires },
+        ConditionExpression: "attribute_not_exists(pk)",
+        ReturnValuesOnConditionCheckFailure: "ALL_OLD",
+      });
+    } catch (error) {
+      if (!isConditionFailure(error)) throw error;
+      if ((error as AwsError).body?.Item?.batch) return false;
+    }
+    await this.db("PutItem", {
+      Item: { pk: S(item), sk: S(`q#${order}`), ref: S(ref), at: N(at), bytes: N(Buffer.byteLength(body)), expires },
+    });
+    return true;
+  }
+
+  async batchPending(item: string, max: number): Promise<Pending[]> {
+    const items: any[] = [];
+    let start: any;
+    do {
+      const page = await this.db("Query", {
+        KeyConditionExpression: "pk = :pk AND begins_with(sk, :q)",
+        ExpressionAttributeValues: { ":pk": S(item), ":q": S("q#") },
+        ConsistentRead: true,
+        Limit: max - items.length,
+        ExclusiveStartKey: start,
+      });
+      items.push(...(page.Items ?? []));
+      start = page.LastEvaluatedKey;
+    } while (start && items.length < max);
+    return items.map((i) => ({ order: String(i.sk.S).slice(2), at: Number(i.at.N), bytes: Number(i.bytes.N), ref: String(i.ref.S) }));
+  }
+
+  async batchEvents(refs: string[]) {
+    const out: WireEvent[] = [];
+    for (let i = 0; i < refs.length; i += 20) {
+      const items = await Promise.all(
+        refs.slice(i, i + 20).map((ref) => this.db("GetItem", { Key: { pk: S(ref), sk: S("-") }, ConsistentRead: true })),
+      );
+      for (const { Item } of items) if (Item?.event) out.push(JSON.parse(Item.event.S));
+    }
+    return out;
+  }
+
+  async batchClose(item: string, max: number, choose: (pending: Pending[]) => Pending[], ttlMs: number) {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const head = await this.db("GetItem", { Key: { pk: S(item), sk: S("-") }, ConsistentRead: true });
+      const n = Number(head.Item?.next?.N ?? 0);
+      const closed = await this.manifest(item, n);
+      if (closed) return { n, ...closed };
+      const pending = await this.batchPending(item, max);
+      const chosen = choose(pending);
+      if (!chosen.length) return undefined;
+      // One that was put back in line after it was in a batch, as when its message came
+      // again just then, is taken out.
+      const states = await Promise.all(
+        chosen.map((p) => this.db("GetItem", { Key: { pk: S(p.ref), sk: S("-") }, ProjectionExpression: "#b", ExpressionAttributeNames: { "#b": "batch" }, ConsistentRead: true })),
+      );
+      const used = chosen.filter((_, i) => !states[i].Item || states[i].Item.batch);
+      if (used.length) {
+        await Promise.all(used.map((p) => this.db("DeleteItem", { Key: { pk: S(item), sk: S(`q#${p.order}`) } })));
+        continue;
+      }
+      const refs = chosen.map((p) => p.ref);
+      try {
+        await this.db("PutItem", {
+          Item: {
+            pk: S(item),
+            sk: S(`m#${pad(n)}`),
+            refs: S(JSON.stringify(refs)),
+            orders: S(JSON.stringify(chosen.map((p) => p.order))),
+            at: N(chosen[0].at),
+            expires: { N: seconds(Date.now() + ttlMs) },
+          },
+          ConditionExpression: "attribute_not_exists(pk)",
+        });
+        return { n, refs, at: chosen[0].at };
+      } catch (error) {
+        if (!isConditionFailure(error)) throw error;
+        // Another closed it first: finish that one.
+      }
+    }
+    throw new Error("A batch is busy.");
+  }
+
+  private async manifest(item: string, n: number): Promise<{ refs: string[]; at: number } | undefined> {
+    const { Item } = await this.db("GetItem", { Key: { pk: S(item), sk: S(`m#${pad(n)}`) }, ConsistentRead: true });
+    return Item ? { refs: JSON.parse(Item.refs.S), at: Number(Item.at.N) } : undefined;
+  }
+
+  async batchRead(item: string, n: number) {
+    return (await this.manifest(item, n))?.refs ?? [];
+  }
+
+  async batchDone(item: string, n: number) {
+    const { Item } = await this.db("GetItem", { Key: { pk: S(item), sk: S(`m#${pad(n)}`) }, ConsistentRead: true });
+    if (!Item) return;
+    const refs: string[] = JSON.parse(Item.refs.S);
+    const orders: string[] = JSON.parse(Item.orders.S);
+    // Each event says it's been in a batch before the next can be closed, so none is in two.
+    for (let i = 0; i < refs.length; i += 20)
+      await Promise.all(
+        refs.slice(i, i + 20).map((ref) =>
+          this.db("UpdateItem", {
+            Key: { pk: S(ref), sk: S("-") },
+            UpdateExpression: "SET #b = :b",
+            ConditionExpression: "attribute_exists(pk)",
+            ExpressionAttributeNames: { "#b": "batch" },
+            ExpressionAttributeValues: { ":b": S(`${item}#${n}`) },
+          }).catch((error) => {
+            if (!isConditionFailure(error)) throw error;
+          }),
+        ),
+      );
+    for (let i = 0; i < orders.length; i += 20)
+      await Promise.all(orders.slice(i, i + 20).map((order) => this.db("DeleteItem", { Key: { pk: S(item), sk: S(`q#${order}`) } })));
+    try {
+      await this.db("UpdateItem", {
+        Key: { pk: S(item), sk: S("-") },
+        UpdateExpression: "SET #n = :next, expires = :x",
+        ConditionExpression: "attribute_not_exists(#n) OR #n < :next",
+        ExpressionAttributeNames: { "#n": "next" },
+        // The numbers of batches outlive the batches, so a number isn't used again.
+        ExpressionAttributeValues: { ":next": N(n + 1), ":x": { N: seconds(Date.now() + 400 * DAY) } },
+      });
+    } catch (error) {
+      if (!isConditionFailure(error)) throw error;
+    }
+  }
+
+  async lockTake(item: string, lock: Lock, ttlMs: number) {
+    try {
+      await this.db("PutItem", {
+        Item: { pk: S(item), sk: S("-"), ...lockItem(lock), expires: { N: seconds(Date.now() + ttlMs) } },
+        ConditionExpression: "attribute_not_exists(pk)",
+        ReturnValuesOnConditionCheckFailure: "ALL_OLD",
+      });
+      return undefined;
+    } catch (error) {
+      if (!isConditionFailure(error)) throw error;
+      const held = lockOf((error as AwsError).body?.Item);
+      if (!held) return this.lockRead(item);
+      return held.run === lock.run ? undefined : held;
+    }
+  }
+
+  async lockRead(item: string) {
+    const { Item } = await this.db("GetItem", { Key: { pk: S(item), sk: S("-") }, ConsistentRead: true });
+    return lockOf(Item);
+  }
+
+  async lockStarted(item: string, run: string, arn: string) {
+    await this.ifHeld(item, run, { UpdateExpression: "SET arn = :arn", ExpressionAttributeValues: { ":arn": S(arn) } });
+  }
+
+  async lockMove(item: string, from: string, to: Lock, ttlMs: number) {
+    const set = { ...lockItem(to), expires: { N: seconds(Date.now() + ttlMs) } };
+    return this.ifHeld(item, from, {
+      UpdateExpression: `SET #run = :run, #until = :until, expires = :x${to.arn ? ", arn = :arn" : " REMOVE arn"}`,
+      ExpressionAttributeNames: { "#until": "until" },
+      ExpressionAttributeValues: { ":run": set.run, ":until": set.until, ":x": set.expires, ...(to.arn ? { ":arn": S(to.arn) } : {}) },
+    });
+  }
+
+  private async ifHeld(item: string, run: string, update: any) {
+    try {
+      await this.db("UpdateItem", {
+        Key: { pk: S(item), sk: S("-") },
+        ...update,
+        ConditionExpression: "#run = :held",
+        ExpressionAttributeNames: { "#run": "run", ...(update.ExpressionAttributeNames ?? {}) },
+        ExpressionAttributeValues: { ...update.ExpressionAttributeValues, ":held": S(run) },
+      });
+      return true;
+    } catch (error) {
+      if (isConditionFailure(error)) return false;
+      throw error;
+    }
+  }
+
+  async lockFree(item: string, run: string) {
+    await this.db("DeleteItem", {
+      Key: { pk: S(item), sk: S("-") },
+      ConditionExpression: "#run = :run",
+      ExpressionAttributeNames: { "#run": "run" },
+      ExpressionAttributeValues: { ":run": S(run) },
+    }).catch((error) => {
+      if (!isConditionFailure(error)) throw error;
+    });
+  }
+
+  // A failure's steps can be more than an item holds: they're in parts, and the failure
+  // itself goes last, so one that's there has all of them.
+  async putFailure(run: string, failure: Failure, ttlMs: number) {
+    const pk = S(keyOf("F", run));
+    const expires = { N: seconds(Date.now() + ttlMs) };
+    const body = JSON.stringify(failure.memo);
+    const parts: string[] = [];
+    for (let i = 0; i < body.length; ) {
+      let end = Math.min(body.length, i + 100_000);
+      // Not between the two halves of a character, which would each be lost.
+      if (end < body.length && /[\uD800-\uDBFF]/.test(body[end - 1])) end--;
+      parts.push(body.slice(i, end));
+      i = end;
+    }
+    const attempt = pad(failure.attempt);
+    const id = randomInt(2 ** 48 - 1).toString(36);
+    await Promise.all(
+      parts.map((part, i) => this.db("PutItem", { Item: { pk, sk: S(`p#${attempt}#${id}#${pad(i)}`), part: S(part), expires } })),
+    );
+    await this.db("PutItem", {
+      Item: {
+        pk,
+        sk: S(`f#${attempt}`),
+        error: S(JSON.stringify(failure.error)),
+        delay: N(failure.delayMs),
+        parts: S(id),
+        count: N(parts.length),
+        expires,
+      },
+      ConditionExpression: "attribute_not_exists(pk)",
+    }).catch((error) => {
+      if (!isConditionFailure(error)) throw error;
+    });
+  }
+
+  async failures(run: string) {
+    const pk = S(keyOf("F", run));
+    const { Items } = await this.db("Query", {
+      KeyConditionExpression: "pk = :pk AND begins_with(sk, :f)",
+      ExpressionAttributeValues: { ":pk": pk, ":f": S("f#") },
+      ConsistentRead: true,
+    });
+    const out: Failure[] = [];
+    for (const i of Items ?? []) {
+      const attempt = String(i.sk.S).slice(2);
+      const parts = await Promise.all(
+        Array.from({ length: Number(i.count.N) }, (_, n) =>
+          this.db("GetItem", { Key: { pk, sk: S(`p#${attempt}#${i.parts.S}#${pad(n)}`) }, ConsistentRead: true }),
+        ),
+      );
+      out.push({
+        attempt: Number(attempt),
+        error: JSON.parse(i.error.S),
+        delayMs: Number(i.delay.N),
+        memo: JSON.parse(parts.map((p) => p.Item.part.S).join("") || "{}"),
+      });
+    }
+    return out;
+  }
+
+  async signalWait(item: string, wait: SignalWait, replace: boolean) {
+    try {
+      await this.db("PutItem", {
+        Item: {
+          pk: S(item),
+          sk: S("-"),
+          callback: S(wait.callbackId),
+          run: S(wait.runId),
+          owner: S(wait.owner),
+          until: N(wait.expiresAt),
+          expires: { N: seconds(wait.expiresAt + DAY) },
+        },
+        ...(replace
+          ? {}
+          : {
+              ConditionExpression: "attribute_not_exists(pk) OR #o = :o OR #u < :now",
+              ExpressionAttributeNames: { "#o": "owner", "#u": "until" },
+              ExpressionAttributeValues: { ":o": S(wait.owner), ":now": N(Date.now()) },
+            }),
+      });
+      return true;
+    } catch (error) {
+      if (isConditionFailure(error)) return false;
+      throw error;
+    }
+  }
+
+  async signalRead(item: string): Promise<SignalWait | undefined> {
+    const { Item } = await this.db("GetItem", { Key: { pk: S(item), sk: S("-") }, ConsistentRead: true });
+    if (!Item || Number(Item.until.N) < Date.now()) return undefined;
+    return { callbackId: Item.callback.S, runId: Item.run.S, owner: Item.owner.S, expiresAt: Number(Item.until.N) };
+  }
+
+  async signalFree(item: string, callbackId: string) {
+    await this.db("DeleteItem", {
+      Key: { pk: S(item), sk: S("-") },
+      ConditionExpression: "callback = :cb",
+      ExpressionAttributeValues: { ":cb": S(callbackId) },
+    }).catch((error) => {
+      if (!isConditionFailure(error)) throw error;
+    });
+  }
+
   async scan(prefix: string, limit: number) {
     const items: Record<string, any>[] = [];
     let start: any;
@@ -1348,6 +1837,15 @@ interface ShardState {
   leases: Record<string, Lease>;
   /** Each lease's stored value, to give back only the one that was read. */
   raw: Record<string, string>;
+}
+
+function lockItem(lock: Lock) {
+  return { run: S(lock.run), until: N(lock.until), ...(lock.arn ? { arn: S(lock.arn) } : {}) };
+}
+
+function lockOf(item: any): Lock | undefined {
+  if (!item) return undefined;
+  return { run: String(item.run.S), until: Number(item.until.N), ...(item.arn ? { arn: String(item.arn.S) } : {}) };
 }
 
 /** When a tenant was marked as in a limit's line, and in how many lines. */

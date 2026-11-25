@@ -62,11 +62,12 @@ export class Cluster {
   handler: (event: any, context: any) => Promise<any>;
   flow: InstanceType<typeof sdk.EventFlow>;
 
-  constructor(build: (flow: InstanceType<typeof sdk.EventFlow>) => any[]) {
+  constructor(build: (flow: InstanceType<typeof sdk.EventFlow>) => any[], options: any = {}) {
     state.cluster = this;
     state.all.push(this);
     this.flow = new sdk.EventFlow({
       id: "test",
+      ...options,
       store: this.store,
       resource: {
         queueUrl: "https://sqs/queue",
@@ -132,6 +133,10 @@ export class Cluster {
       const runner = new LocalDurableTestRunner({ handlerFunction: this.handler as any });
       const record: RunRecord = { runId: name, payload: body, runner, result: runner.run({ payload: body }) };
       this.runs.set(name, record);
+      record.result.then(
+        (r: any) => this.ended.set(name, r.getStatus()),
+        () => this.ended.set(name, "FAILED"),
+      );
       return new Response(null, { status: 202, headers: { "X-Amz-Durable-Execution-Arn": `arn/${name}` } });
     }
     const listed = path.match(/^\/2025-12-01\/functions\/[^/]+\/durable-executions\?(.*)$/);
@@ -141,7 +146,7 @@ export class Cluster {
       // As AWS lists them: the latest first, or the oldest first with ReverseOrder.
       const all = [
         ...this.history.entries(),
-        ...[...this.runs.keys()].filter((id) => !this.history.has(id)).map((id) => [id, { status: "RUNNING", startedAt: 1 }] as const),
+        ...[...this.runs.keys()].filter((id) => !this.history.has(id)).map((id) => [id, { status: this.statusOf(id), startedAt: 1 }] as const),
       ]
         .filter(([id]) => !name || id === name)
         .map(([id, h]) => ({ DurableExecutionName: id, DurableExecutionArn: `arn/${id}`, Status: h.status, StartTimestamp: h.startedAt ?? 1 }))
@@ -152,13 +157,17 @@ export class Cluster {
     }
     const executions = path.match(/^\/2025-12-01\/durable-executions\/arn%2F([^/?]+)(\/history)?\?/);
     if (service === "lambda" && executions) {
-      const h = this.history.get(decodeURIComponent(executions[1]));
+      const id = decodeURIComponent(executions[1]);
+      const run = this.runs.get(id);
+      const h = this.history.get(id) ?? (run && { status: this.statusOf(id), payload: run.payload, events: [], error: undefined });
       if (!h) return new Response("ResourceNotFoundException", { status: 404 });
       if (executions[2]) return Response.json({ Events: h.events });
       return Response.json({ Status: h.status, InputPayload: JSON.stringify(h.payload), Error: h.error });
     }
     const stop = path.match(/^\/2025-12-01\/durable-executions\/(.+)\/stop$/);
     if (service === "lambda" && stop) {
+      const id = decodeURIComponent(stop[1]).replace(/^arn\//, "");
+      if (this.runs.has(id) && this.statusOf(id) !== "RUNNING") return new Response("ended", { status: 409 });
       this.stopped.push(decodeURIComponent(stop[1]));
       return Response.json({ StopTimestamp: Date.now() / 1000 });
     }
@@ -180,12 +189,45 @@ export class Cluster {
     throw new Error(`Unexpected AWS call ${service} ${target ?? ""} ${path}`);
   }
 
+  /** How the runs that ended did. */
+  ended = new Map<string, string>();
+  statusOf(id: string) {
+    if (this.stopped.includes(`arn/${id}`)) return "STOPPED";
+    return this.ended.get(id) ?? "RUNNING";
+  }
+
+  /** Every timer, with when it's due. They're delivered by `tick()`. */
+  timers: QueuedMessage[] = [];
+  /** Deliver the timers of a type as if they were due, with the clock moved on. */
+  async fire(type?: string) {
+    this.sortTimers();
+    const due = this.timers.filter((m) => !type || JSON.parse(m.body).timer.type === type);
+    this.timers = this.timers.filter((m) => !due.includes(m));
+    const now = Date.now;
+    const latest = Math.max(now(), ...due.map((m) => JSON.parse(m.body).at)) + 1000;
+    const offset = latest - now();
+    Date.now = () => now() + offset;
+    try {
+      for (const m of due) {
+        const result = await this.deliver([m]);
+        if (result.batchItemFailures.length) this.timers.push(m);
+      }
+    } finally {
+      Date.now = now;
+    }
+    this.sortTimers();
+  }
+  private sortTimers() {
+    this.timers.push(...this.queue.filter((m) => JSON.parse(m.body).kind === "timer"));
+    this.queue = this.queue.filter((m) => JSON.parse(m.body).kind !== "timer");
+  }
+
   private closed = new Set<string>();
 
   private async findCallback(id: string) {
     if (this.closed.has(id)) return undefined;
     for (const run of this.runs.values()) {
-      const names = ["event", "result"];
+      const names = ["event", "result", "signal"];
       for (let a = 1; a <= 3; a++)
         for (let l = 0; l <= 2; l++) for (let n = 0; n < 8; n++) names.push(`queued:${a}.${l}.${n}`);
       for (const name of names) {
@@ -206,7 +248,9 @@ export class Cluster {
 
   /** Deliver the queued messages to the router, as SQS would, until none are left. */
   async drain(options: { maxRounds?: number; ignoreDelay?: boolean } = {}) {
-    for (let round = 0; round < (options.maxRounds ?? 20) && this.queue.length; round++) {
+    for (let round = 0; round < (options.maxRounds ?? 20); round++) {
+      this.sortTimers();
+      if (!this.queue.length) break;
       const batch = this.queue.splice(0, 10);
       const result = await this.deliver(batch);
       const failed = new Set(result.batchItemFailures.map((f: any) => f.itemIdentifier));

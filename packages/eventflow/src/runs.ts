@@ -3,7 +3,8 @@ import type { Engine } from "./engine.js";
 import { replayId } from "./ids.js";
 import type { RunPayload, WireEvent } from "./types.js";
 import { key as keyOf } from "./ids.js";
-import { ONCE, type InvokeOutcome } from "./worker.js";
+import { sendSystemEvents } from "./system.js";
+import { ONCE, type InvokeOutcome, type Registered } from "./worker.js";
 
 /** How long a run's retry is remembered: as long as AWS keeps the run. */
 const RETENTION_MS = 90 * 86_400_000;
@@ -34,7 +35,7 @@ export interface RunSummary {
 export interface StepRecord {
   /** The step's ID, as the function names it. Steps in a step with a concurrency limit, a wait for an event, or an invoke are under it, like "charge/run". */
   id: string;
-  type: "step" | "sleep" | "waitForEvent" | "invoke" | "callback" | "group" | "other";
+  type: "step" | "sleep" | "waitForEvent" | "waitForSignal" | "invoke" | "callback" | "group" | "other";
   status: "running" | "succeeded" | "failed" | "waiting" | "timed out" | "cancelled";
   attempts: number;
   startedAt?: Date;
@@ -143,7 +144,7 @@ export async function listRuns(engine: Engine, input: ListInput = {}): Promise<R
   return runs.sort((a, b) => b.startedAt.getTime() - a.startedAt.getTime()).slice(0, limit);
 }
 
-async function find(engine: Engine, runId: string): Promise<RunSummary | undefined> {
+export async function findRun(engine: Engine, runId: string): Promise<RunSummary | undefined> {
   const params = new URLSearchParams({ DurableExecutionName: runId, MaxItems: "10" });
   const page = await lambda<any>(engine, `/functions/${encodeURIComponent(engine.worker.name)}/durable-executions?${params}`);
   const match = (page.DurableExecutions ?? []).find((e: any) => e.DurableExecutionName === runId);
@@ -167,8 +168,17 @@ async function detail(engine: Engine, arn: string) {
   return lambda<any>(engine, `/durable-executions/${encodeURIComponent(arn)}?IncludeExecutionData=true`);
 }
 
+/** Whether a run is running, and what it started with. */
+export async function runStatus(engine: Engine, arn: string): Promise<{ running: boolean; payload?: RunPayload }> {
+  const info = await detail(engine, arn);
+  return {
+    running: ["RUNNING", "PAUSED", "PAUSING"].includes(info.Status),
+    payload: parse(info.InputPayload) as RunPayload | undefined,
+  };
+}
+
 export async function getRun(engine: Engine, runId: string): Promise<Run | undefined> {
-  const found = await find(engine, runId);
+  const found = await findRun(engine, runId);
   if (!found) return undefined;
   const [info, events] = await Promise.all([detail(engine, found.arn), history(engine, found.arn)]);
   const payload = parse(info.InputPayload) as RunPayload | undefined;
@@ -193,8 +203,8 @@ export async function getRun(engine: Engine, runId: string): Promise<Run | undef
   };
 }
 
-export async function cancelRun(engine: Engine, runId: string) {
-  const found = await find(engine, runId);
+export async function cancelRun(engine: Engine, runId: string, registry: Map<string, Registered>) {
+  const found = await findRun(engine, runId);
   if (!found) throw new Error(`There's no run "${runId}".`);
   const info = await detail(engine, found.arn);
   const payload = parse(info.InputPayload) as RunPayload | undefined;
@@ -205,6 +215,11 @@ export async function cancelRun(engine: Engine, runId: string) {
       ok: false,
       error: { name: "Cancelled", message: "The run was cancelled." },
     } satisfies InvokeOutcome);
+  if (stopped && payload?.event) {
+    // Its singleton is free for the next.
+    if (payload.lock) await engine.store.lockFree(payload.lock, runId);
+    await sendSystemEvents(registry, engine, { fn: payload.fn, runId, event: payload.event, outcome: "cancelled" });
+  }
   return { id: runId, stopped };
 }
 
@@ -277,7 +292,7 @@ async function riskySteps(engine: Engine, events: any[], memo: Record<string, un
       out.push(`${child.name}, a run invoked too deep to check`);
       continue;
     }
-    const run = await find(engine, child.runId);
+    const run = await findRun(engine, child.runId);
     if (!run) continue;
     // The invoked run is started again from the start: it reuses nothing.
     const steps = await riskySteps(engine, await history(engine, run.arn), undefined, depth + 1);
@@ -292,7 +307,7 @@ export async function rerun(
   reuse: boolean,
   options: { force?: boolean; again?: boolean } = {},
 ): Promise<{ id: string; replayOf: string; reused: string[]; existing?: boolean }> {
-  const found = await find(engine, runId);
+  const found = await findRun(engine, runId);
   if (!found) throw new Error(`There's no run "${runId}".`);
   if (found.status === "RUNNING" || found.status === "PAUSED" || found.status === "PAUSING")
     throw new Error(`The run "${runId}" is still running. Cancel it first.`);
@@ -323,13 +338,18 @@ export async function rerun(
   if (!options.again) {
     const owner = await engine.store.successor(keyOf("RR", reuse ? "retry" : "replay", runId), id, RETENTION_MS);
     if (owner !== id) {
-      if (await find(engine, owner)) return { id: owner, replayOf: runId, reused: [], existing: true };
+      if (await findRun(engine, owner)) return { id: owner, replayOf: runId, reused: [], existing: true };
       // The first rerun was claimed and didn't start: start it, by its name.
       id = owner;
     }
   }
   const { sig: _sig, ...rest } = payload;
-  await engine.startRun({ ...rest, runId: id, root: payload.root ?? runId, replayOf: runId, memo });
+  // A singleton's rerun needs the singleton, like its run did.
+  if (payload.lock) {
+    const held = await engine.store.lockTake(payload.lock, { run: id, until: Date.now() + 45 * 60_000 }, RETENTION_MS);
+    if (held) throw new Error(`Another run, "${held.run}", has the singleton of "${runId}". Rerun it once that one has ended.`);
+  }
+  await engine.startRun({ ...rest, runId: id, root: payload.root ?? runId, replayOf: runId, memo, at: Date.now() });
   return { id, replayOf: runId, reused: memo ? Object.keys(memo) : [] };
 }
 
@@ -364,13 +384,13 @@ export async function rerunAll(
  * once. Before an EventFlow with many runs in flight is removed, this is faster than
  * `sst remove`, which stops them one at a time.
  */
-export async function cancelAll(engine: Engine, input: ListInput = {}) {
+export async function cancelAll(engine: Engine, input: ListInput, registry: Map<string, Registered>) {
   const runs: RunSummary[] = [];
   for (const status of input.status ? [input.status] : (["RUNNING", "PAUSED"] as RunStatus[]))
     runs.push(...(await listRuns(engine, { ...input, status, limit: Math.min(input.limit ?? 500, 500) })));
   const out: { id: string; stopped?: boolean; error?: string }[] = [];
   for (let i = 0; i < runs.length; i += 10) {
-    const results = await Promise.allSettled(runs.slice(i, i + 10).map((r) => cancelRun(engine, r.id)));
+    const results = await Promise.allSettled(runs.slice(i, i + 10).map((r) => cancelRun(engine, r.id, registry)));
     results.forEach((r, j) =>
       out.push(
         r.status === "fulfilled"
@@ -407,6 +427,7 @@ export function memoFrom(events: any[]): Record<string, unknown> {
       } else if (e.SubType === "EventFlowInvoke") {
         if (value?.ok) memo[name] = value.result;
       } else if (e.SubType === "EventFlowWait") memo[name] = value;
+      else if (e.SubType === "EventFlowSignal" && !value?.conflict) memo[name] = value?.value ?? null;
     }
   }
   return memo;
@@ -417,6 +438,7 @@ const SUBTYPES: Record<string, StepRecord["type"]> = {
   EventFlowStep: "step",
   EventFlowWait: "waitForEvent",
   EventFlowInvoke: "invoke",
+  EventFlowSignal: "waitForSignal",
 };
 
 const TYPES: Record<string, StepRecord["type"]> = {

@@ -22,11 +22,40 @@ export interface WireEvent {
 export type Message =
   // From a sender.
   | { kind: "event"; event: WireEvent }
-  // From the router: a run that a throttle held, to start at `at`. Signed, and good
-  // until `exp`.
-  | { kind: "start"; fn: string; event: WireEvent; at: number; runId: string; root: string; parent?: string; exp: number; sig: string }
+  // From a sender: data for the run that waits for a signal. `id` is the message's own.
+  | { kind: "signal"; signal: string; data: unknown; tenant?: string; id: string }
+  // From the router or the worker, about a run that ended. Signed, and good until `exp`.
+  | { kind: "system"; event: WireEvent; exp: number; sig: string }
+  // From the router: a run that's held, by a throttle or a cron's jitter, to start at `at`.
+  // Signed, and good until `exp`.
+  | {
+      kind: "start";
+      fn: string;
+      event: WireEvent;
+      at: number;
+      runId: string;
+      root: string;
+      parent?: string;
+      received?: number;
+      fired?: boolean;
+      batch?: { item: string; n: number };
+      exp: number;
+      sig: string;
+    }
   // From the worker: a run another run invokes. Signed, and good until `exp`.
-  | { kind: "invoke"; fn: string; event: WireEvent; parent: string; runId: string; root: string; exp: number; sig: string };
+  | { kind: "invoke"; fn: string; event: WireEvent; parent: string; runId: string; root: string; exp: number; sig: string }
+  // From the router or the worker: something to do at `at`. Signed, and good until `exp`.
+  | { kind: "timer"; timer: Timer; at: number; exp: number; sig: string };
+
+export type Timer =
+  /** A debounce's window may be over. `last` is when its last event came, as this timer knows it. */
+  | { type: "debounce"; fn: string; item: string; last: number; tenant?: string }
+  /** A batch's timeout. */
+  | { type: "batch"; fn: string; item: string; tenant?: string }
+  /** A run that hasn't started by now is cancelled. */
+  | { type: "start"; fn: string; runId: string; parent?: string; tenant?: string }
+  /** A run that hasn't finished by now is cancelled. */
+  | { type: "finish"; fn: string; runId: string; arn: string; parent?: string; tenant?: string };
 
 /** The payload a run starts with. Signed by the router or the worker. */
 export interface RunPayload {
@@ -48,6 +77,12 @@ export interface RunPayload {
    * step ID. Those steps return their result without running again.
    */
   memo?: Record<string, unknown>;
+  /** When its event came: the steps of runs that came first go first. */
+  at?: number;
+  /** For a run with a batch, which one. `event` is its first. */
+  batch?: { item: string; n: number };
+  /** For a singleton's run, the singleton it has. */
+  lock?: string;
   sig?: string;
 }
 
@@ -77,6 +112,9 @@ export interface EngineResource {
 export const CONTRACT = 1;
 /** The newest admin API this runtime serves. `sst eventflow` reads it. */
 export const ADMIN_VERSION = 1;
+
+/** The events about a run that ended. Runs they start send none, so they don't go on forever. */
+export const SYSTEM_EVENTS = ["inngest/function.finished", "inngest/function.failed", "inngest/function.cancelled"] as const;
 
 export const RUN_MARKER = "sst:eventflow" as const;
 export const TICK_MARKER = "sst:eventflow:tick" as const;

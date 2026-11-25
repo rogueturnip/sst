@@ -29,6 +29,7 @@ function post(action: string, body: any) {
       },
     }, (res) => {
       let text = "";
+      res.setEncoding("utf8");
       res.on("data", (c) => (text += c));
       res.on("end", () => resolve({ status: res.statusCode!, data: JSON.parse(text || "{}") }));
     });

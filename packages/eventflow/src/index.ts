@@ -5,15 +5,20 @@ import type { DurationInput } from "./duration.js";
 import { Engine, toWireEvent, type SendPayload } from "./engine.js";
 import { handleAdmin } from "./admin.js";
 import type { DeadLetter, FunctionInfo, LimitInfo, Overview, WaitInfo } from "./admin.js";
-import { runId as makeRunId } from "./ids.js";
+import { runId as makeRunId, ulid } from "./ids.js";
 import { loadKey } from "./sign.js";
 import { routeBatch, tick } from "./router.js";
 import type { ListInput, Run, RunSummary } from "./runs.js";
 import type { Store } from "./store.js";
 import { ADMIN_MARKER, TICK_MARKER, type EngineResource, type WireEvent } from "./types.js";
+import { BaseMiddleware, Hooks, registerMiddleware } from "./middleware.js";
+import type { AiModel } from "./tools.js";
+import type { MiddlewareClass } from "./definition.js";
+import { checkSignal } from "./engine.js";
 import { createWorker, type Registered } from "./worker.js";
 
-export { NonRetriableError, RetryAfterError, InvokeFailedError, StepFailedError } from "./worker.js";
+export { NonRetriableError, RetryAfterError, InvokeFailedError, SignalConflictError, StepFailedError } from "./errors.js";
+export type { StepInfo } from "./middleware.js";
 export { SendError } from "./engine.js";
 export type { Run, RunSummary, RunStatus, StepRecord, ListInput } from "./runs.js";
 export type { DeadLetter, FunctionInfo, LimitInfo, Overview, QueueInfo, WaitInfo } from "./admin.js";
@@ -89,29 +94,39 @@ export class EventFlow {
     // Inngest's options that change what happens, and that EventFlow doesn't have,
     // throw. The ones about Inngest's cloud are accepted, and do nothing.
     const unsupported: Record<string, string> = {
-      middleware: "EventFlow doesn't support middleware.",
       schemas: "EventFlow follows Inngest v4, which replaced `schemas` with `eventType()`. Declare each event with `eventType()`.",
-      logger: "EventFlow doesn't take a logger. Functions get one in their context, which writes to CloudWatch.",
       internalLogger: "EventFlow doesn't take a logger.",
       fetch: "EventFlow doesn't take a fetch. It calls AWS with your function's IAM role.",
       endpointAdapter: "EventFlow doesn't take an endpoint adapter. Use serve() as its handler.",
       sessionPropagation: "EventFlow doesn't support sessions.",
-      aiMetadata: "EventFlow doesn't support step.ai.",
+      aiMetadata: "EventFlow doesn't keep AI metadata.",
     };
     for (const key of Object.keys(options))
       if (unsupported[key] && (options as any)[key] !== undefined) throw new TypeError(unsupported[key]);
+    if (options.middleware !== undefined && (!Array.isArray(options.middleware) || options.middleware.some((m) => typeof m !== "function")))
+      throw new TypeError("The middleware of an EventFlow must be a list of classes.");
+    registerMiddleware(options.middleware ?? [], this, null);
     this.id = options.id;
     this.runs = new Runs(() => this.getEngine());
     this.admin = new Admin(() => this.getEngine());
   }
 
   /** @internal */
+  public workerOptions(): { client: unknown; middleware?: MiddlewareClass[]; logger?: Logger } {
+    return { client: this, middleware: this.options.middleware, logger: this.options.logger };
+  }
+
+  /** @internal */
   public getEngine() {
-    this.engine ??= Engine.resolve({
-      resource: this.options.resource,
-      aws: this.options.aws,
-      store: this.options.store,
-    });
+    if (!this.engine) {
+      this.engine = Engine.resolve({
+        resource: this.options.resource,
+        aws: this.options.aws,
+        store: this.options.store,
+      });
+      this.engine.appId = this.id;
+      this.engine.systemEvents = this.options.systemEvents === true;
+    }
     return this.engine;
   }
 
@@ -150,6 +165,7 @@ export class EventFlow {
     handler: (ctx: Context<EventOf<TTriggers>>) => TOutput | Promise<TOutput>,
   ): EventFlowFunction<TOutput> {
     const def = define(options as FunctionOptions);
+    registerMiddleware(def.middleware, this, { id: def.id, name: def.name });
     return { id: def.id, opts: { id: def.id }, [registration]: { def, handler } } as any;
   }
 
@@ -173,9 +189,34 @@ export class EventFlow {
   public async send(payload: SendPayload | SendPayload[]): Promise<{ ids: string[] }> {
     const list = Array.isArray(payload) ? payload : [payload];
     for (const p of list) await validate(p);
-    const events = list.map((p) => toWireEvent(p));
-    await this.getEngine().sendEvents(events);
-    return { ids: events.map((e) => e.id) };
+    const send = async (payloads: SendPayload[]) => {
+      const events = payloads.map((p) => toWireEvent(p));
+      await this.getEngine().sendEvents(events);
+      return { ids: events.map((e) => e.id) };
+    };
+    const hooks = new Hooks(this.options.middleware ?? [], this, null);
+    if (!hooks.any) return send(list);
+    const { events } = await hooks.transform("transformSendEvent", { events: list.map((p) => ({ ...p })) });
+    return hooks.wrap("wrapSendEvent", { events }, () => send(events));
+  }
+
+  /**
+   * Send a signal to the run that waits for it with `step.waitForSignal()`. It's sent
+   * through the queue, so it doesn't say whether a run waited: `step.sendSignal()` does.
+   *
+   * @example
+   * ```ts
+   * await flow.sendSignal({ signal: `approve-${orderId}`, data: { approved: true }, tenant });
+   * ```
+   */
+  public async sendSignal(payload: { signal: string; data?: unknown; tenant?: string }): Promise<void> {
+    checkSignal(payload);
+    await this.getEngine().sendMessages([
+      {
+        message: { kind: "signal", signal: payload.signal, data: payload.data ?? null, id: ulid(), ...(payload.tenant ? { tenant: payload.tenant } : {}) },
+        group: payload.tenant,
+      },
+    ]);
   }
 }
 
@@ -209,6 +250,17 @@ export interface EventFlowOptions {
   resource?: EngineResource;
   /** Options for the signed fetch the SDK uses to call AWS. */
   aws?: AwsOptions;
+  /** What wraps every function, every step, and every send, as Inngest's middleware. See the guide. */
+  middleware?: MiddlewareClass[];
+  /** The logger functions get in their context, like Pino's or Powertools'. It doesn't repeat itself when a function replays. */
+  logger?: Logger;
+  /**
+   * Send `inngest/function.finished`, `.failed` and `.cancelled` about every run, as for
+   * `step.waitForEvent()`. They're sent anyway where a function has one as a trigger.
+   *
+   * @default `false`
+   */
+  systemEvents?: boolean;
   /** @internal */
   store?: Store;
   /** Accepted for Inngest compatibility. It has no effect: sends are signed with the function's IAM role. */
@@ -267,7 +319,7 @@ export function serve(input: { client: EventFlow; functions: EventFlowFunction<a
     registry.set(entry.def.id, entry);
   }
   const engine = () => input.client.getEngine();
-  const worker = createWorker(registry, engine);
+  const worker = createWorker(registry, engine, input.client.workerOptions());
 
   return async (event: any, context: LambdaContext) => {
     // The router and the worker sign and check runs with a key they load once.
@@ -566,8 +618,8 @@ export function staticSchema<T>(): StandardSchemaV1<T, T> {
 }
 
 /** A cron trigger, as with Inngest's `cron()`. */
-export function cron(expression: string) {
-  return { cron: expression } as const;
+export function cron(expression: string, options?: { jitter?: DurationInput }) {
+  return { cron: expression, ...options } as const;
 }
 
 async function validate(payload: SendPayload) {
@@ -615,7 +667,7 @@ type EventOf<T> = T extends readonly (infer U)[] ? One<U> : T extends undefined 
 export interface Context<TEvent = FlowEvent> {
   /** The event that started the run. */
   event: TEvent;
-  /** The run's events. It's `[event]`, since EventFlow doesn't batch events. */
+  /** The run's events: more than one with `batchEvents`. */
   events: TEvent[];
   /** Durable steps. */
   step: Step;
@@ -623,8 +675,14 @@ export interface Context<TEvent = FlowEvent> {
   group: { parallel: <T>(fn: () => Promise<T>) => Promise<T> };
   /** The run's ID. */
   runId: string;
-  /** The most times a step is tried: the function's `retries`, plus one. */
+  /** The most times a step is tried, and the function: its `retries`, plus one. */
   maxAttempts: number;
+  /**
+   * The attempt, from 0: in a step, the step's, and outside of one, the function's. Read it
+   * where it's used, as `ctx.attempt`: one that's taken out of the context at the top of the
+   * function stays the function's.
+   */
+  readonly attempt: number;
   /**
    * The key of the step it's called in, for the step's side effect: pass it to a
    * payment provider, or any API that takes an idempotency key. It's the same in
@@ -700,10 +758,52 @@ export interface Step {
   /** Run another function of this EventFlow, and wait for what it returns. */
   invoke: <TOutput>(
     id: StepId,
-    options: { function: EventFlowFunction<TOutput>; data?: unknown; timeout?: DurationInput | Date },
+    options: { function: EventFlowFunction<TOutput> | FunctionReference<TOutput> | string; data?: unknown; timeout?: DurationInput | Date },
   ) => Promise<TOutput>;
   /** Send events from a run. A retried step sends the same event IDs, so they aren't sent twice. */
   sendEvent: (id: StepId, payload: SendPayload | SendPayload[]) => Promise<{ ids: string[] }>;
+  /**
+   * Wait for a signal, by its name. One run of a tenant waits for a name at a time: another
+   * that does throws, or with `onConflict: "replace"`, takes its place. It returns the
+   * signal, or `null` if none came before the timeout. A signal that's sent before it waits
+   * isn't kept.
+   */
+  waitForSignal: <TData = any>(
+    id: StepId,
+    options: { signal: string; timeout: DurationInput | Date; onConflict?: "fail" | "replace" },
+  ) => Promise<{ signal: string; data: TData } | null>;
+  /** Send a signal to the run that waits for it. `runId` is that run, if there was one. */
+  sendSignal: (id: StepId, options: { signal: string; data?: unknown }) => Promise<{ runId: string | undefined }>;
+  /**
+   * `fetch`, as a step: its response is saved, and it's tried again when the request fails.
+   * A response with an error status is a response. At most 700 KB.
+   */
+  fetch: typeof globalThis.fetch;
+  /** AI calls as steps. */
+  ai: {
+    /** Call a model, with an adapter like `openai()` of `@inngest/ai`. A rate limit is tried again when the provider says. */
+    infer: (id: StepId, options: { model: AiModel; body: any }) => Promise<any>;
+    /** Run a function as a step, with its input. */
+    wrap: <T, A extends any[]>(id: StepId, fn: (...args: A) => T | Promise<T>, ...args: A) => Promise<Awaited<T>>;
+  };
 }
+
+/** A function by its ID, as `referenceFunction()` makes it. */
+export interface FunctionReference<TOutput = unknown> {
+  readonly opts: { functionId: string; appId?: string };
+  /** @internal */
+  readonly __output?: TOutput;
+}
+
+/**
+ * Refer to a function of this EventFlow by its ID, to invoke it without importing it.
+ */
+export function referenceFunction<TOutput = unknown>(input: { functionId: string; appId?: string }): FunctionReference<TOutput> {
+  if (!input?.functionId) throw new TypeError("referenceFunction() needs a `functionId`.");
+  return { opts: { functionId: input.functionId, ...(input.appId ? { appId: input.appId } : {}) } };
+}
+
+/** What a middleware extends, as Inngest's `Middleware`. */
+export const Middleware = { BaseMiddleware };
 
 export type { SendPayload, FunctionOptions, TriggerInput, DurationInput, WireEvent };

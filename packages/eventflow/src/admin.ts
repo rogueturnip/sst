@@ -16,13 +16,18 @@ import type { Registered } from "./worker.js";
 export interface FunctionInfo {
   id: string;
   name: string;
-  triggers: ({ event: string; if?: string } | { cron: string; timezone: string } | { invoke: true })[];
+  triggers: ({ event: string; if?: string } | { cron: string; timezone: string; jitterSeconds?: number } | { invoke: true })[];
   retries: number;
   concurrency: { limit: number; scope: string; key?: string }[];
   throttle?: { perSecond: number; burst: number };
   rateLimit?: { perSecond: number };
   idempotency: boolean;
   cancelOn: { event: string; match?: string; if?: string }[];
+  debounce?: { periodSeconds: number; timeoutSeconds?: number };
+  batchEvents?: { maxSize: number; timeoutSeconds: number };
+  singleton?: "skip" | "cancel";
+  priority?: string;
+  timeouts?: { startSeconds?: number; finishSeconds?: number };
 }
 
 export interface QueueInfo {
@@ -82,7 +87,7 @@ function functionInfo(def: Definition): FunctionInfo {
       t.kind === "event"
         ? { event: t.name, ...(t.if ? { if: t.if.source } : {}) }
         : t.kind === "cron"
-          ? { cron: t.cron.expression, timezone: t.cron.timezone }
+          ? { cron: t.cron.expression, timezone: t.cron.timezone, ...(t.jitterMs ? { jitterSeconds: t.jitterMs / 1000 } : {}) }
           : { invoke: true as const },
     ),
     retries: def.retries,
@@ -92,6 +97,14 @@ function functionInfo(def: Definition): FunctionInfo {
       : undefined,
     rateLimit: def.rateLimit ? { perSecond: 1000 / def.rateLimit.intervalMs } : undefined,
     idempotency: Boolean(def.idempotency),
+    debounce: def.debounce && { periodSeconds: def.debounce.periodMs / 1000, timeoutSeconds: def.debounce.timeoutMs && def.debounce.timeoutMs / 1000 },
+    batchEvents: def.batch && { maxSize: def.batch.maxSize, timeoutSeconds: def.batch.timeoutMs / 1000 },
+    singleton: def.singleton?.mode,
+    priority: def.priority?.source,
+    timeouts: def.timeouts && {
+      startSeconds: def.timeouts.startMs && def.timeouts.startMs / 1000,
+      finishSeconds: def.timeouts.finishMs && def.timeouts.finishMs / 1000,
+    },
     cancelOn: def.cancelOn.map((c) => ({ event: c.name, ...(c.match ? { match: c.match } : {}), ...(c.if ? { if: c.if } : {}) })),
   };
 }
@@ -277,9 +290,9 @@ async function run(op: string, args: Record<string, any>, registry: Map<string, 
     case "runs.get":
       return (await getRun(engine, runId())) ?? null;
     case "runs.cancel":
-      return cancelRun(engine, runId());
+      return cancelRun(engine, runId(), registry);
     case "runs.cancelAll":
-      return cancelAll(engine, list());
+      return cancelAll(engine, list(), registry);
     case "runs.replay":
       return rerun(engine, runId(), false, { force: args.force === true, again: args.again === true });
     case "runs.retry":
