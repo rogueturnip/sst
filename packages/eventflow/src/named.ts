@@ -38,6 +38,8 @@ export interface NamedContext {
   readonly raw: durable.DurableContext;
   /** Whether an operation is done, and its result saved. */
   saved(name: string): boolean;
+  /** What an operation that was begun is. */
+  kind(name: string): string | undefined;
   /** Whether an operation was begun already. */
   known(name: string): boolean;
   readonly lambdaContext: durable.DurableContext["lambdaContext"];
@@ -94,6 +96,10 @@ export function named(ctx: durable.DurableContext, replay: Replay): NamedContext
   const context: NamedContext = {
     raw: ctx,
     saved: (name) => c._executionContext.getStepData(idOf(name))?.Status === "SUCCEEDED",
+    kind: (name) => {
+      const op = c._executionContext.getStepData(idOf(name)) as any;
+      return op && (op.Type === "CONTEXT" ? op.SubType : op.Type);
+    },
     known: (name) => c._executionContext.getStepData(idOf(name)) !== undefined,
     lambdaContext: ctx.lambdaContext,
     step: (name, fn, config) => at(name, () => ctx.step(name, fn, config)),

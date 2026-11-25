@@ -151,9 +151,9 @@ The [AWS EventFlow tenants example](/docs/examples/#aws-eventflow-tenants) has a
 | Replay | From the top, steps memoized | The same |
 | Retries | `retries`, per step, 4 by default | The same, per step, 4 by default, 0 to 20 |
 | Backoff | Exponential with jitter | Exponential from 2 s, doubling, 50% jitter, at most 10 minutes |
-| Errors outside a step | The function is retried | The same. Steps that ended keep their results |
+| Errors outside a step | The function is retried | The same. Steps that ended keep their results, and the rest go on where they were |
 | `NonRetriableError`, `RetryAfterError` | Yes | Yes, the same signatures |
-| Repeated step IDs | Suffixed `:1`, `:2` | The same |
+| Repeated step IDs | Suffixed `:1`, `:2` | The same. `idempotencyKey()` throws in the second use: say what it's of, `idempotencyKey(order.id)` |
 | `attempt` | In the context | Throws when read. `maxAttempts` is there |
 | Side effects | At least once | At least once. `idempotencyKey()`, called in a step, gives its key, which holds through retries, replays and retries after a fix. `step.run({ id, atMostOnce: true })` for calls without one |
 

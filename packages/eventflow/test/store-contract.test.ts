@@ -220,18 +220,6 @@ for (const [name, make] of stores) {
       expect(await store.getBlob(`${key}-none`)).toBeUndefined();
     });
 
-    it("keeps the first failure of an attempt, whole, however large", async () => {
-      const store = make();
-      const r = `run-${run}-${n++}`;
-      const memo = { big: { v: `x${"é".repeat(200_000)}${"😀".repeat(120_000)}` }, bad: { e: { name: "E", message: "m" } } };
-      await Promise.all([1, 2].map((i) => store.putFailure(r, { attempt: 0, error: { name: "E", message: `${i}` }, delayMs: i, memo }, 86_400_000)));
-      await store.putFailure(r, { attempt: 1, error: { name: "E", message: "x" }, delayMs: 5, memo: {} }, 86_400_000);
-      const failures = await store.failures(r);
-      expect(failures.map((f) => f.attempt)).toEqual([0, 1]);
-      expect(failures[0].memo).toEqual(memo as any);
-      expect(failures[1].memo).toEqual({});
-    });
-
     it("has one run wait for a signal, unless it's replaced or over", async () => {
       const store = make();
       const item = `G#contract-${run}-${n++}`;

@@ -108,14 +108,6 @@ export interface Lock {
   replaces?: { run: string; arn?: string }[];
 }
 
-/** How a function's attempt failed, and what its steps had returned by then. */
-export interface Failure {
-  attempt: number;
-  error: { name: string; message: string };
-  delayMs: number;
-  memo: Record<string, Memo>;
-}
-
 /** A run that waits for a signal. */
 export interface SignalWait {
   callbackId: string;
@@ -125,12 +117,6 @@ export interface SignalWait {
   createdAt: number;
   expiresAt: number;
 }
-
-/** A step's result, or the error it failed with. */
-export type Memo = ({ v: unknown } | { e: { name: string; message: string } }) & {
-  /** Its place in the order the function had them. */
-  o?: number;
-};
 
 export interface Store {
   /**
@@ -246,9 +232,6 @@ export interface Store {
   /** Keeps a text of any length. */
   putBlob(key: string, body: string, ttlMs: number): Promise<void>;
   getBlob(key: string): Promise<string | undefined>;
-  /** Keeps how a function's attempt failed. The first one kept for an attempt stays. */
-  putFailure(run: string, failure: Failure, ttlMs: number): Promise<void>;
-  failures(run: string): Promise<Failure[]>;
   /** The holder of a signal's name, or takes it. `replace` takes it from another. */
   signalWait(item: string, wait: SignalWait, replace: boolean | { over: string }): Promise<boolean>;
   signalRead(item: string): Promise<SignalWait | undefined>;
@@ -1986,64 +1969,6 @@ export class DynamoStore implements Store {
 
   // A failure's steps can be more than an item holds: they're in parts, and the failure
   // itself goes last, so one that's there has all of them.
-  async putFailure(run: string, given: Failure, ttlMs: number) {
-    const failure = { ...given, error: { name: given.error.name.slice(0, 256), message: given.error.message.slice(0, 8192) } };
-    const pk = S(keyOf("F", run));
-    const expires = { N: seconds(Date.now() + ttlMs) };
-    const body = JSON.stringify(failure.memo);
-    const parts = split(body);
-    const attempt = pad(failure.attempt);
-    const id = randomInt(2 ** 48 - 1).toString(36);
-    await Promise.all(
-      parts.map((part, i) => this.db("PutItem", { Item: { pk, sk: S(`p#${attempt}#${id}#${pad(i)}`), part: S(part), expires } })),
-    );
-    await this.db("PutItem", {
-      Item: {
-        pk,
-        sk: S(`f#${attempt}`),
-        error: S(JSON.stringify(failure.error)),
-        delay: N(failure.delayMs),
-        parts: S(id),
-        count: N(parts.length),
-        expires,
-      },
-      ConditionExpression: "attribute_not_exists(pk)",
-    }).catch((error) => {
-      if (!isConditionFailure(error)) throw error;
-    });
-  }
-
-  async failures(run: string) {
-    const pk = S(keyOf("F", run));
-    const items: any[] = [];
-    let start: any;
-    do {
-      const page = await this.db("Query", {
-        KeyConditionExpression: "pk = :pk AND begins_with(sk, :f)",
-        ExpressionAttributeValues: { ":pk": pk, ":f": S("f#") },
-        ConsistentRead: true,
-        ExclusiveStartKey: start,
-      });
-      items.push(...(page.Items ?? []));
-      start = page.LastEvaluatedKey;
-    } while (start);
-    const out: Failure[] = [];
-    for (const i of items) {
-      const attempt = String(i.sk.S).slice(2);
-      const parts = await Promise.all(
-        Array.from({ length: Number(i.count.N) }, (_, n) =>
-          this.db("GetItem", { Key: { pk, sk: S(`p#${attempt}#${i.parts.S}#${pad(n)}`) }, ConsistentRead: true }),
-        ),
-      );
-      out.push({
-        attempt: Number(attempt),
-        error: JSON.parse(i.error.S),
-        delayMs: Number(i.delay.N),
-        memo: JSON.parse(parts.map((p) => p.Item.part.S).join("") || "{}"),
-      });
-    }
-    return out;
-  }
 
   async signalWait(item: string, wait: SignalWait, replace: boolean | { over: string }) {
     try {

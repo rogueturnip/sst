@@ -1,4 +1,4 @@
-import { isMarker, placeOfError, unwrap } from "./order.js";
+import { isMarker, placeOfError, Places, unwrap, type Place } from "./order.js";
 import { awsFetch } from "./client.js";
 import { fat } from "./blobs.js";
 import type { Engine } from "./engine.js";
@@ -324,13 +324,13 @@ export async function rerun(
   if (!payload?.fn) throw new Error(`The run "${runId}" isn't an EventFlow run.`);
   if (payload.parent) throw new Error(`The run "${runId}" was invoked by another run. Retry or replay that run instead.`);
 
-  const found_ = reuse ? memoFrom(events) : undefined;
+  const found_ = reuse ? memoFrom(events, payload) : undefined;
   const memo = found_ ? { ...(payload.memo ?? {}), ...found_.memo } : undefined;
   const memoBlobs = found_ ? { ...(payload.memoBlobs ?? {}), ...found_.blobs } : undefined;
   if (memo && memoBlobs) for (const id of Object.keys(found_!.memo)) delete memoBlobs[id];
   const reused = [...Object.keys(memo ?? {}), ...Object.keys(memoBlobs ?? {})];
-  // What it was given comes before what it came to itself.
-  const memoOrder = found_ ? [...new Set([...(payload.memoOrder ?? []), ...found_.order])] : undefined;
+  const memoOrder = found_?.order;
+  const memoRest = found_?.rest;
   if (memo && Buffer.byteLength(JSON.stringify(memo)) > MAX_MEMO_BYTES)
     throw new Error(`The saved results of "${runId}" are over ${MAX_MEMO_BYTES} bytes. Replay it instead, to run every step again.`);
 
@@ -363,7 +363,7 @@ export async function rerun(
     const taken = await takeLock(engine, lockRuns, payload.lock, id, "skip");
     if (!taken) throw new Error(`Another run has the singleton of "${runId}". Rerun it once that one has ended.`);
   }
-  await engine.startRun({ ...rest, runId: id, root: payload.root ?? runId, replayOf: runId, memo, memoBlobs, memoOrder, at: Date.now() });
+  await engine.startRun({ ...rest, runId: id, root: payload.root ?? runId, replayOf: runId, memo, memoBlobs, memoOrder, memoRest, at: Date.now() });
   return { id, replayOf: runId, reused };
 }
 
@@ -427,13 +427,11 @@ function isWhole(text: string | undefined) {
  * The results of a run's top-level steps that succeeded, by step ID, from its
  * history. A retry passes them to its run, so those steps aren't run again.
  */
-export function memoFrom(events: any[]): { memo: Record<string, unknown>; blobs: Record<string, string>; order: string[] } {
+export function memoFrom(events: any[], earlier: Pick<RunPayload, "memo" | "memoBlobs" | "memoOrder" | "memoRest"> = {}): { memo: Record<string, unknown>; blobs: Record<string, string>; order: string[]; rest: string[] } {
   const memo: Record<string, unknown> = Object.create(null);
   const blobs: Record<string, string> = Object.create(null);
-  const places: { attempt: number; seq: number; id: string }[] = [];
-  const place = (p: ReturnType<typeof unwrap>["place"]) => {
-    if (p && /^\d+$/.test(p[0])) places.push({ attempt: Number(p[0]), id: p[1], seq: p[2] });
-  };
+  const saved: Place[] = [];
+  const place = (p: Place | undefined) => void (p?.[0] === "" && saved.push(p));
   for (const e of events) {
     if (e.ParentId) continue;
     const name: string | undefined = e.Name;
@@ -471,23 +469,23 @@ export function memoFrom(events: any[]): { memo: Record<string, unknown>; blobs:
             ? { value: inner(/^signal$/, "CallbackSucceeded") }
             : inner(e.SubType === "EventFlowWait" ? /^event$/ : /^result$/, "CallbackSucceeded");
       if (e.SubType === "EventFlowStep") {
-        if (value?.ok) memo[name] = value.value;
-      } else if (e.SubType === "EventFlowInvoke") {
         // A large result is in the table, and the memo says where.
+        if (value?.ok && value.blob) blobs[name] = value.blob;
+        else if (value?.ok) memo[name] = value.value;
+      } else if (e.SubType === "EventFlowInvoke") {
         if (value?.ok && value.blob) blobs[name] = value.blob;
         else if (value?.ok) memo[name] = value.result ?? null;
       } else if (e.SubType === "EventFlowWait") memo[name] = value;
       else if (e.SubType === "EventFlowSignal" && !value?.conflict) memo[name] = value?.value ?? null;
     }
   }
-  places.sort((a, b) => a.attempt - b.attempt || a.seq - b.seq);
+  const places = [...new Places("", saved, earlier.memoOrder).all()].sort(([, a], [, b]) => a.seq - b.seq);
   // Up to the first that's run again: what the function does after it may be another.
-  const order = new Set<string>();
-  for (const { id } of places) {
-    if (!(id in memo) && !(id in blobs)) break;
-    order.add(id);
-  }
-  return { memo, blobs, order: [...order] };
+  const kept = (id: string) => [memo, blobs, earlier.memo ?? {}, earlier.memoBlobs ?? {}].some((m) => Object.prototype.hasOwnProperty.call(m, id));
+  const ids = places.map(([id]) => id);
+  const first = ids.findIndex((id) => !kept(id));
+  const order = first < 0 ? ids : ids.slice(0, first);
+  return { memo, blobs, order, rest: [...new Set([...ids.slice(order.length).filter(kept), ...(earlier.memoRest ?? []).filter((id) => !ids.includes(id))])] };
 }
 
 // The child contexts EventFlow makes, by their subtype.

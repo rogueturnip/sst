@@ -69,13 +69,6 @@ it("an event redelivered with a new time, while its batch is open, is in it once
   expect(closed!.refs.length).toBe(1);
 });
 
-it("a failure whose error is large", async () => {
-  const s = make(); let error;
-  await s.putFailure("r2-" + run, { attempt: 0, error: { name: "E", message: "x".repeat(410_000) }, delayMs: 1, memo: {} }, 1e6).catch((e) => (error = e.message));
-  for (let i = 0; i < 6; i++) await s.putFailure("r2b-" + run, { attempt: i, error: { name: "E", message: "x".repeat(300_000) }, delayMs: 1, memo: {} }, 1e6);
-  expect(error).toBeUndefined();
-});
-
 it("batches under concurrent routers, lost answers and crashes: each event once", async () => {
   const item = "B#s1-" + run; const N = 120, max = 7; const starts = new Map<number, string[]>();
   const choose = (p: any[]) => (p.length >= max ? p.slice(0, max) : []);

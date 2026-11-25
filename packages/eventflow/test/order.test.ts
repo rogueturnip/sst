@@ -1,6 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { ExecutionStatus, LocalDurableTestRunner } from "@aws/durable-execution-sdk-js-testing";
 import { Cluster, finishRuns, sdk, settle } from "./harness.ts";
+import { currentStep } from "../src/worker.ts";
+import { missing } from "../src/order.ts";
 import { memoFrom, toSteps } from "../src/runs.ts";
 
 // A function is given its steps' results in one order, live and on each replay. In real time,
@@ -118,7 +120,7 @@ for (const [name, options] of kinds)
         while (pending.size) {
           const who: any = await Promise.race(pending.values());
           pending.delete(who);
-          out.push(await step.run("charge", () => { did.push(who); keys.set(idempotencyKey(), who); return who; }));
+          out.push(await step.run("charge", () => { did.push(who); keys.set(currentStep()!.key, who); return who; }));
         }
         if (tries === 1) throw new Error("outside a step");
         return out;
@@ -272,18 +274,174 @@ it("work between two steps isn't put off by a branch that calls another", async 
 }, 20_000);
 
 describe("a step the function doesn't call any more", () => {
-  it("is gone on without", async () => {
+  const ms = missing.ms;
+  beforeAll(() => void (missing.ms = 1500));
+  afterAll(() => void (missing.ms = ms));
+
+  it("ends the run, where it called it in the same attempt", async () => {
     let n = 0;
-    const c = await one({}, async ({ step }: any) => {
-      const first = n++ === 0;
-      if (first) await step.run("removed", () => 1);
+    const log: string[] = [];
+    const c = await one({ retries: 2 }, async ({ step }: any) => {
+      if (n++ === 0) await step.run("removed", () => 1);
       await step.run("b", () => 2);
       await step.sleep("s", "1s");
+      await step.run("charge", () => void log.push("charge"));
+    });
+    const r = await st(c.runOf("f"));
+    expect(r.s).toBe(ExecutionStatus.FAILED);
+    expect(r.e.errorMessage).toContain(`doesn't call the step "removed"`);
+    expect(log).toEqual([]);
+  }, 30_000);
+
+  it("is waited for, however late it comes", async () => {
+    const did: string[] = [];
+    let n = 0;
+    const c = await one({}, async ({ step }: any) => {
+      const slow = n++ > 0;
+      const card = (async () => { await settle(slow ? 900 : 5); return step.run("card", () => "card"); })();
+      const bank = step.run("bank", () => settle(150).then(() => "bank"));
+      const first = await Promise.race([card, bank]);
+      await step.run(`ship-${first}`, () => void did.push(first as string));
+      await Promise.all([card, bank]);
+      await step.sleep("s", "1s");
+    });
+    expect((await st(c.runOf("f"))).s).toBe(ExecutionStatus.SUCCEEDED);
+    expect(did).toEqual(["card"]);
+  }, 30_000);
+
+  it("is gone on without by a later attempt, once for all", async () => {
+    const at: number[] = [];
+    const c = await one({ retries: 2 }, async ({ step, attempt }: any) => {
+      if (attempt === 0) {
+        for (let i = 0; i < 4; i++) await step.run(`warm${i}`, () => 1);
+        throw new Error("outside");
+      }
+      at.push(Date.now());
+      await step.run("b", () => 1);
+      await step.sleep("s", "1s");
+      await step.run("c", () => 1);
       return "ok";
     });
     expect((await st(c.runOf("f"))).v).toBe("ok");
+    expect(at).toHaveLength(2);
+    expect(at[1] - at[0]).toBeLessThan(5000);
   }, 30_000);
 });
+
+describe("a function that's tried again after it was paused", () => {
+  for (const [name, options] of kinds)
+    it(`does nothing twice${name}`, async () => {
+      const log: string[] = [];
+      let passes = 0;
+      const c = new Cluster((flow) => [
+        flow.createFunction({ id: "f", triggers: { event: "go" }, ...options, retries: 3 }, async ({ step }: any) => {
+          // It throws as it goes on, before it comes to the steps that are done.
+          if (++passes === 2) throw new Error("the config service is down");
+          const branch = async (who: string, ms: number) => { await step.run(`check-${who}`, () => settle(ms)); return step.run("charge", () => { log.push(who); return who; }); };
+          const charged = await Promise.all([branch("alice", 120), branch("bob", 5)]);
+          await step.run({ id: "wire", atMostOnce: true }, () => void log.push("wire"));
+          await step.invoke("child", { function: "child", timeout: "1h" });
+          await step.sleep("a-day", "2s");
+          return charged;
+        }),
+        flow.createFunction({ id: "child", retries: 0 }, async ({ step }: any) => step.run({ id: "pay", atMostOnce: true }, () => void log.push("child"))),
+      ]);
+      await c.flow.send({ name: "go" });
+      await c.pump(4000);
+      expect((await st(c.runOf("f"))).v).toEqual(["alice", "bob"]);
+      expect(passes).toBeGreaterThan(2);
+      expect(log).toEqual(["bob", "alice", "wire", "child"]);
+    }, 40_000);
+
+  it("is its onFailure, too", async () => {
+    const log: string[] = [];
+    let passes = 0;
+    const c = await one(
+      { retries: 2, onFailure: async ({ step }: any) => {
+        passes++;
+        await step.run("refund", () => void log.push("refund"));
+        if (passes === 1) throw new Error("the config service is down");
+        await step.run("mail", () => void log.push("mail"));
+      } },
+      async () => { throw new NonRetriableError("no"); },
+    );
+    expect((await st(c.runOf("f"))).s).toBe(ExecutionStatus.FAILED);
+    expect(log).toEqual(["refund", "mail"]);
+  }, 30_000);
+});
+
+describe("a run that's retried", () => {
+  it("gives no result to another branch", async () => {
+    const charged: string[] = [];
+    let tries = 0;
+    const c = new Cluster((flow) => [
+      flow.createFunction({ id: "f", triggers: { event: "go" }, retries: 0 }, async ({ step }: any) => {
+        const first = tries++ === 0;
+        const speeds: any = { carol: 5, bob: 60, alice: 150 };
+        const branch = async (who: string) => {
+          await step.run(`check-${who}`, async () => { await settle(speeds[who]); if (first && who === "carol") throw new Error("check failed"); });
+          return step.run("charge", () => { if (first && who === "alice") throw new Error("charge failed"); charged.push(who); return who; });
+        };
+        const all = await Promise.allSettled(["alice", "bob", "carol"].map(branch));
+        if (all.some((r) => r.status === "rejected")) throw new NonRetriableError("not all");
+        return all.map((r: any) => r.value);
+      }),
+    ]);
+    await c.flow.send({ name: "go" });
+    await c.drain();
+    const run = c.runOf("f");
+    await st(run);
+    c.history.set(run.runId, { status: "FAILED", payload: run.payload, events: (await run.result).getHistoryEvents() });
+    const again = await c.flow.runs.retry(run.runId);
+    const r = await st(c.run(again.id));
+    expect(charged).toEqual(["bob"]);
+    expect(r.s).toBe(ExecutionStatus.FAILED);
+    expect(r.e.errorMessage).toContain("which result is whose can't be told");
+  }, 30_000);
+
+  it("has the same order for a result that's read from the table", async () => {
+    const did: string[] = [];
+    const big = { x: "y".repeat(150_000) };
+    const c = new Cluster((flow) => [
+      flow.createFunction({ id: "f", triggers: { event: "go" }, retries: 0, concurrency: 3 }, async ({ step }: any) => {
+        const quote = step.run("quote", () => big).then(() => "quote");
+        const check = step.run("check", () => settle(30)).then(() => "check");
+        const first = await Promise.race([quote, check]);
+        await step.run(`pay-${first}`, () => void did.push(first));
+        await step.sleep("s", "1s");
+        return first;
+      }),
+    ]);
+    await c.flow.send({ name: "go" });
+    await c.drain();
+    const run = c.runOf("f");
+    await st(run);
+    // Its order isn't known, as that of what came after a step that's run again.
+    const { blobs } = memoFrom((await run.result).getHistoryEvents());
+    expect(Object.keys(blobs)).toEqual(["quote"]);
+    did.length = 0;
+    const getBlob = c.store.getBlob.bind(c.store);
+    let reads = 0;
+    c.store.getBlob = async (k: string) => { await settle(reads++ ? 400 : 5); return getBlob(k); };
+    c.history.set(run.runId, { status: "FAILED", payload: { ...run.payload }, events: (await run.result).getHistoryEvents().filter((e: any) => e.Name === "quote" || e.ParentId) });
+    const again = await c.flow.runs.retry(run.runId);
+    expect((await st(c.run(again.id))).s).toBe(ExecutionStatus.SUCCEEDED);
+    expect(did).toHaveLength(1);
+  }, 30_000);
+});
+
+it("code that runs as the function ends isn't cut off", async () => {
+  const log: string[] = [];
+  const c = await one({}, async ({ step }: any) => {
+    const pay = step.run("pay", async () => { await settle(400); log.push("paid"); });
+    await Promise.race([pay, step.run("check", () => settle(5))]);
+    return "ok";
+  });
+  const r = await c.runOf("f").result;
+  expect(r.getResult()).toBe("ok");
+  expect(log).toEqual(["paid"]);
+  expect(toSteps(r.getHistoryEvents()).find((s) => s.id === "pay")).toMatchObject({ status: "succeeded" });
+}, 20_000);
 
 describe("what's saved", () => {
   it("has the order for a rerun, up to the first step that's run again", async () => {
@@ -343,7 +501,7 @@ describe("any function", () => {
             const limit = limiter(2);
             const act = async (id: string, who: string) => {
               const v = await step.run(id, async () => {
-                const key = idempotencyKey();
+                const key = currentStep()!.key;
                 ran.set(key, (ran.get(key) ?? new Set()).add(who));
                 await settle(Math.random() * 60);
                 if (Math.random() < 0.1 && !fails.has(key)) { fails.add(key); throw new Error("again"); }

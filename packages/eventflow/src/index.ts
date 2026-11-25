@@ -795,7 +795,11 @@ export interface Context<TEvent = FlowEvent> {
    * );
    * ```
    */
-  idempotencyKey: () => string;
+  /**
+   * With a step ID that's used more than once, as in a loop, say what the side effect is of,
+   * like `idempotencyKey(order.id)`: which use is which can be another in a replay.
+   */
+  idempotencyKey: (of?: string | number) => string;
   /** A logger that doesn't repeat itself when the function replays. */
   logger: Logger;
   /** The sessions that all of the run's events are in. */

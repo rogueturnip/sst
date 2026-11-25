@@ -48,17 +48,19 @@ describe("idempotency keys", () => {
     expect(idempotencyKey("order-XYZ", "", "charge")).not.toBe(key);
   });
 
-  it("are the step's own, in every occurrence of a loop", async () => {
+  it("are what they're of, in a loop, and refused where that isn't said", async () => {
     const keys: string[] = [];
     const cluster = new Cluster((flow) => [
       flow.createFunction({ id: "payouts", triggers: { event: "go" } }, async ({ step, idempotencyKey }: any) => {
-        for (const payee of ["a", "b", "c"]) await step.run("pay", () => keys.push(idempotencyKey()));
-        void payee;
+        for (const payee of ["a", "b", "c"]) await step.run("pay", () => keys.push(idempotencyKey(payee)));
+        await step.run("one", () => keys.push(idempotencyKey()));
+        await step.run("one", () => keys.push(idempotencyKey()));
       }),
     ]);
     await cluster.flow.send({ name: "go" });
-    await runOne(cluster);
-    expect(new Set(keys).size).toBe(3);
+    const result = (await runOne(cluster)).result as any;
+    expect(new Set(keys).size).toBe(4);
+    expect(() => result.getResult()).toThrow("used more than once");
   });
 
   it("are the same in a retry or replay of a run, whatever the function ID's length", async () => {
@@ -102,7 +104,7 @@ describe("idempotency keys", () => {
     expect(keys.onFailure).not.toBe(keys.main);
   });
 
-  it("can only be had in a step, and take no arguments", async () => {
+  it("can only be had in a step, and take what they're of", async () => {
     const errors: string[] = [];
     const cluster = new Cluster((flow) => [
       flow.createFunction({ id: "misuse", triggers: { event: "go" } }, async ({ step, idempotencyKey }: any) => {
@@ -113,7 +115,7 @@ describe("idempotency keys", () => {
         }
         await step.run("charge", () => {
           try {
-            idempotencyKey("charge");
+            idempotencyKey({ order: 1 });
           } catch (error: any) {
             errors.push(error.message);
           }
@@ -123,7 +125,7 @@ describe("idempotency keys", () => {
     await cluster.flow.send({ name: "go" });
     await runOne(cluster);
     expect(errors[0]).toContain("inside step.run");
-    expect(errors[1]).toContain("no arguments");
+    expect(errors[1]).toContain("what the step's side effect is of");
   });
 
   it("charge once when the step is retried after the provider took the charge", async () => {

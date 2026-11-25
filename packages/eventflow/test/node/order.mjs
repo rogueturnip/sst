@@ -11,8 +11,7 @@ const unhandled = [];
 process.on("unhandledRejection", (e) => unhandled.push(e));
 const run = async (handler, options = {}) => {
   const def = { id: "f", name: "f", retries: 2, concurrency: [], cancelOn: [], middleware: [], triggers: [], ...options };
-  const failures = [];
-  const store = { failures: async () => failures, putFailure: async (_run, f) => void failures.push(JSON.parse(JSON.stringify(f))) };
+  const store = {};
   const engine = { resource: {}, store, apps: {}, propagateSessions: false, systemEvents: false };
   const worker = createWorker(new Map([["f", { def, handler }]]), () => engine, {});
   const payload = sign({ "sst:eventflow": 1, fn: "f", runId: "r1", root: "r1", event: { id: "e", name: "go", data: {}, ts: 1 } });

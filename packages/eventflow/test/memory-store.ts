@@ -402,16 +402,6 @@ export class MemoryStore implements Store {
     return this.blobs.get(key);
   }
 
-  failed = new Map<string, Failure[]>();
-  async putFailure(run: string, failure: Failure) {
-    const list = this.failed.get(run) ?? [];
-    if (!list.some((f) => f.attempt === failure.attempt)) list.push(JSON.parse(JSON.stringify(failure)));
-    this.failed.set(run, list);
-  }
-  async failures(run: string) {
-    return this.failed.get(run) ?? [];
-  }
-
   signals = new Map<string, SignalWait>();
   async signalWait(item: string, wait: SignalWait, replace: boolean | { over: string }) {
     const held = this.signals.get(item);

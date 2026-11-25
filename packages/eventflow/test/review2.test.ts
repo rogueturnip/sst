@@ -132,8 +132,6 @@ describe("work between steps", () => {
       await p;
       return "ok";
     })]);
-    const real = c.store.putFailure.bind(c.store);
-    c.store.putFailure = async (a: any, b: any) => { await settle(150); return real(a, b); };
     await c.flow.send({ name: "go" });
     await c.drain();
     await st(c.runOf("f"), 25_000);

@@ -540,10 +540,10 @@ describe("retries of the function", () => {
       const cluster = new Cluster((flow) => [flow.createFunction({ id: "f", triggers: { event: "go" }, retries: 1 }, async (ctx: any) => (calls++, body(ctx)))]);
       await cluster.flow.send({ name: "go" });
       await cluster.drain();
-      await cluster.runOf("f").result;
+      const result = await cluster.runOf("f").result;
       // A step that's tried again starts the function again, from its saved steps. The
       // function itself isn't tried again.
-      expect(cluster.store.failed.size).toBe(0);
+      expect(result.getHistoryEvents().some((e: any) => /^sst:failed/.test(e.Name ?? ""))).toBe(false);
       expect(calls).toBeLessThanOrEqual(2);
     }
   });

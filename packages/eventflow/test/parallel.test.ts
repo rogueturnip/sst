@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { LocalDurableTestRunner } from "@aws/durable-execution-sdk-js-testing";
 import { readFileSync } from "node:fs";
+import { currentStep } from "../src/worker.ts";
 import { Cluster, finishRuns, sdk, settle } from "./harness.ts";
 
 // Steps are found by their names, as Inngest's are, so branches that run at once can finish
@@ -94,7 +95,7 @@ describe("step names", () => {
   it("are one step's each, also those that look like an occurrence", async () => {
     const keys: string[] = [];
     const result = await run({}, async ({ step, idempotencyKey }: any) => {
-      const go = (id: string, v: number) => step.run(id, () => (keys.push(idempotencyKey()), v));
+      const go = (id: string, v: number) => step.run(id, () => (keys.push(currentStep()!.key), v));
       const out = [await go("a", 1), await go("a:1", 2), await go("a", 3), await go("a:1", 4), await go("a", 5)];
       await step.sleep("pause", "1h");
       return out;

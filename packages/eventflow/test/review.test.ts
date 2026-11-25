@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { LocalDurableTestRunner } from "@aws/durable-execution-sdk-js-testing";
 import { Cluster, finishRuns, sdk, settle, waitFor } from "./harness.ts";
 import { hash, key, runId } from "../src/ids.ts";
+import { currentStep } from "../src/worker.ts";
 import { memoFrom } from "../src/runs.ts";
 
 // Each was a defect that a review reproduced: a step run twice, a run or an event lost, a
@@ -54,21 +55,6 @@ it("a middleware with onRunError and a function retry", async () => {
   expect(r.getStatus()).toBe("SUCCEEDED");
 });
 
-it("one error reading the failures doesn't end the run without telling its parent", async () => {
-  let failed = 0;
-  const cluster = new Cluster((flow) => [
-    flow.createFunction({ id: "parent", triggers: { event: "go" }, retries: 0 }, async ({ step }: any) => step.invoke("c", { function: "child", data: {}, timeout: "10d" })),
-    flow.createFunction({ id: "child", triggers: { event: "x" }, retries: 2, onFailure: async () => { failed++; } }, async ({ step }: any) => { await step.run("charge", () => 1); await step.sleep("s", "1h"); return "ok"; }),
-  ]);
-  const real = cluster.store.failures.bind(cluster.store); let n = 0;
-  cluster.store.failures = async (id: string) => { if (id.startsWith("child") && ++n === 2) throw new TypeError("fetch failed: ECONNRESET"); return real(id); };
-  await cluster.flow.send({ name: "go" }); await cluster.drain(); 
-  await waitFor(() => cluster.queue.length || undefined); await cluster.drain();
-  const r = await cluster.runOf("child").result;
-  await settle(300);
-  expect(cluster.succeeded.length).toBe(1);
-});
-
 it("a parallel branch that goes on after its attempt failed doesn't run a step twice", async () => {
   let attempts = 0; let charges = 0;
   const cluster = new Cluster((flow) => [
@@ -81,8 +67,6 @@ it("a parallel branch that goes on after its attempt failed doesn't run a step t
       return "ok";
     }),
   ]);
-  const real = cluster.store.putFailure.bind(cluster.store);
-  cluster.store.putFailure = async (a: any, b: any) => { await settle(10); return (real as any)(a, b); }; // a DynamoDB write's latency
   await cluster.flow.send({ name: "go" }); await cluster.drain();
   const r = await cluster.runOf("f").result;
   expect(charges).toBe(1);
@@ -96,7 +80,7 @@ it("steps with one ID, in parallel, keep their occurrence with middleware", asyn
       const c = call++; await settle(c % 4 === 0 ? 30 : c % 4 === 1 ? 0 : c % 4 === 2 ? 0 : 30); } }
   const cluster = new Cluster((flow) => [
     flow.createFunction({ id: "f", triggers: { event: "go" }, retries: 2, middleware: [Slow as any] }, async ({ step, idempotencyKey }: any) => {
-      const out = await Promise.all(["alice", "bob"].map((who) => step.run("charge", () => { (keys[who] ??= new Set()).add(idempotencyKey()); return who; })));
+      const out = await Promise.all(["alice", "bob"].map((who) => step.run("charge", () => { (keys[who] ??= new Set()).add(currentStep()!.key); return who; })));
       await step.sleep("s", "1h");
       return out;
     }),
@@ -114,7 +98,7 @@ it("a step's idempotency key is its own in every attempt, with middleware", asyn
   const cluster = new Cluster((flow) => [
     flow.createFunction({ id: "f", triggers: { event: "go" }, retries: 2, middleware: [Slow as any] }, async ({ step, idempotencyKey }: any) => {
       const n = attempts++;
-      const out = await Promise.all(["alice", "bob"].map((who) => step.run("charge", () => { (keys[who] ??= new Set()).add(idempotencyKey()); return who; })));
+      const out = await Promise.all(["alice", "bob"].map((who) => step.run("charge", () => { (keys[who] ??= new Set()).add(currentStep()!.key); return who; })));
       if (n === 0) throw new Error("outside");
       return out;
     }),
@@ -333,8 +317,8 @@ it("a retry reuses a large result of a step with a concurrency limit", async () 
   const c = new Cluster((flow) => [flow.createFunction({ id: "f", triggers: { event: "go" }, retries: 0, concurrency: 5 }, async ({ step }: any) => { await step.run("charge", () => "x".repeat(300_000)); await step.run("small", () => 1); throw new Error("later"); })]);
   await c.flow.send({ name: "go" }); await c.drain();
   const r = await c.runOf("f").result;
-  const { memo } = memoFrom(r.getHistoryEvents());
-  expect(Object.keys(memo)).toContain("charge");
+  const { memo, blobs } = memoFrom(r.getHistoryEvents());
+  expect([...Object.keys(memo), ...Object.keys(blobs)]).toContain("charge");
 });
 it("parallel step.fetch of Requests with bodies", async () => {
   const real = globalThis.fetch; let call = 0;
