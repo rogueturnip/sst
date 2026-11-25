@@ -1,5 +1,5 @@
 import type { AwsOptions } from "./client.js";
-import { randomInt } from "node:crypto";
+import { createHash, randomInt } from "node:crypto";
 import { AwsError, dynamo, isConditionFailure, isTransient } from "./aws.js";
 import { hash, key as keyOf } from "./ids.js";
 import type { WireEvent } from "./types.js";
@@ -15,7 +15,7 @@ import type { WireEvent } from "./types.js";
 //   A#…    what the router decided for a function and an event: start, skip or hold
 //   I#…    an idempotency key of a function and a tenant, for 24 hours
 //   T#…    a throttle or rate limit bucket
-//   C#…    one concurrency limit: its leases, and the count of each tenant
+//   C#…    one concurrency limit, or a shard of it: its leases, and each tenant's count
 //   Q#…    the steps waiting for a lease on a limit, oldest first
 //   WF#…   the fields that waits for an event of a tenant match on
 //   W#…    the waits for an event, and the cancelOns
@@ -76,8 +76,11 @@ export interface Store {
   successor(item: string, owner: string, ttlMs: number): Promise<string>;
   /** GCRA: 0 when allowed now, or how many ms until it would be. Takes the slot only when allowed. */
   take(item: string, intervalMs: number, toleranceMs: number): Promise<number>;
-  /** GCRA: reserves the next slot, and returns when it starts. */
-  reserve(item: string, intervalMs: number, toleranceMs: number): Promise<number>;
+  /**
+   * GCRA: reserves the next slot, and returns when it starts. Infinity when that's more
+   * than `maxWaitMs` away: then no slot is taken.
+   */
+  reserve(item: string, intervalMs: number, toleranceMs: number, maxWaitMs?: number): Promise<number>;
   /**
    * Takes a lease on every limit at once, or on none: "granted" when the step holds
    * them all, including when it already did; "full" when one has no room, or steps
@@ -98,9 +101,11 @@ export interface Store {
    * resumes a step, and returns false if it can't, as when its run stopped; then its
    * leases are given back. A wake that throws may not have reached the step: its
    * leases are given back and it's put back in line, in its place, for a later
-   * dispatch. Returns how many it woke.
+   * dispatch. `joined` is the step that dispatches as it joined the line: a limit with many
+   * leases only looks to that step, as each that joins looks to itself, and a step that's
+   * done to the rest. Returns how many it woke.
    */
-  dispatch(limit: Limit, wake: (w: LeaseWaiter) => Promise<boolean>): Promise<number>;
+  dispatch(limit: Limit, wake: (w: LeaseWaiter) => Promise<boolean>, joined?: LeaseWaiter): Promise<number>;
   /**
    * Give back a step's leases, handing them straight to the next step in line, in one
    * write where it can, and wake it. Then hand out what else is free.
@@ -263,52 +268,75 @@ export class DynamoStore implements Store {
     return String(result.Item?.owner?.S ?? owner);
   }
 
-  // GCRA keeps one number per bucket: the time the next start is due.
-  private async gcra(item: string, intervalMs: number, toleranceMs: number, reserve: boolean): Promise<number> {
-    for (let attempt = 0; attempt < 8; attempt++) {
+  // GCRA keeps one number per bucket: the time the next start is due. It's moved on in
+  // one write, so starts that come at once take their turn, and none is let through
+  // because others were in the way.
+  private async gcra(item: string, intervalMs: number, toleranceMs: number, reserve: boolean, maxWaitMs = Infinity): Promise<number> {
+    const Key = { pk: S(item), sk: S("-") };
+    for (;;) {
       const now = Date.now();
-      const result = await this.db("GetItem", {
-        Key: { pk: S(item), sk: S("-") },
-        ConsistentRead: true,
-      });
-      const stored = result.Item?.tat ? Number(result.Item.tat.N) : undefined;
-      const tat = Math.max(stored ?? now, now);
-      const wait = Math.max(0, tat - toleranceMs - now);
-      if (wait > 0 && !reserve) return wait;
+      // The latest the next start may be due for this one to go, or be held.
+      const latest = reserve ? now + toleranceMs + maxWaitMs : now + toleranceMs;
+      // Longer than a backlog of held runs, which a start can be due after.
+      const expires = { N: seconds(now + 60 * DAY) };
       try {
-        await this.db("PutItem", {
-          Item: {
-            pk: S(item),
-            sk: S("-"),
-            tat: N(tat + intervalMs),
-            expires: { N: seconds(tat + intervalMs + toleranceMs + DAY) },
-          },
-          ConditionExpression: stored === undefined ? "attribute_not_exists(tat)" : "tat = :tat",
-          ExpressionAttributeValues: stored === undefined ? undefined : { ":tat": N(stored) },
+        const bounded = Number.isFinite(latest);
+        const result = await this.db("UpdateItem", {
+          Key,
+          UpdateExpression: "SET expires = :e ADD tat :i",
+          ConditionExpression: `tat >= :now${bounded ? " AND tat <= :latest" : ""}`,
+          ExpressionAttributeValues: { ":i": N(intervalMs), ":now": N(now), ":e": expires, ...(bounded ? { ":latest": N(latest) } : {}) },
+          ReturnValues: "UPDATED_NEW",
+          ReturnValuesOnConditionCheckFailure: "ALL_OLD",
         });
-        return reserve ? now + wait : 0;
+        const due = Number(result.Attributes.tat.N) - intervalMs - toleranceMs;
+        return reserve ? Math.max(now, due) : 0;
+      } catch (error) {
+        if (!isConditionFailure(error)) throw error;
+        const stored = (error as AwsError).body?.Item?.tat?.N;
+        if (stored !== undefined && Number(stored) >= now) {
+          // Over the limit, or held for longer than it may be.
+          const wait = Number(stored) - toleranceMs - now;
+          if (!reserve) return Math.max(1, wait);
+          return Infinity;
+        }
+      }
+      // Nothing's due: the bucket starts again from now.
+      try {
+        await this.db("UpdateItem", {
+          Key,
+          UpdateExpression: "SET tat = :tat, expires = :e",
+          ConditionExpression: "attribute_not_exists(tat) OR tat < :now",
+          ExpressionAttributeValues: { ":tat": N(now + intervalMs), ":now": N(now), ":e": expires },
+        });
+        return reserve ? now : 0;
       } catch (error) {
         if (!isConditionFailure(error)) throw error;
       }
     }
-    // Contended: say it's due one interval from now, and let the caller ask again.
-    return reserve ? Date.now() + intervalMs : intervalMs;
   }
 
   take(item: string, intervalMs: number, toleranceMs: number) {
     return this.gcra(item, intervalMs, toleranceMs, false);
   }
 
-  reserve(item: string, intervalMs: number, toleranceMs: number) {
-    return this.gcra(item, intervalMs, toleranceMs, true);
+  reserve(item: string, intervalMs: number, toleranceMs: number, maxWaitMs?: number) {
+    return this.gcra(item, intervalMs, toleranceMs, true, maxWaitMs);
   }
 
-  // A limit is an item with its leases, at sort key "-": `cap`; `active`, the number of
-  // leases; `leases`, each lease's expiry and tenant; and `tenants`, each tenant's
-  // leases, with no zero counts kept. And an item for each tenant in its line, at
-  // "w#<tenant>": `n`, its steps in line; and `at`, when that last changed. They're apart
-  // so that many tenants, or a burst, don't make one item large or hot. A step's entries
-  // in line are items of their own, one line per limit and tenant.
+  // A limit's leases are in one item, or, for a limit over SHARD_LEASES, spread over
+  // shards: an item each, whose caps add up to the limit. DynamoDB takes 1,000 write units
+  // a second on an item's key, and a write costs by the item's size, so one item with
+  // hundreds of leases would do only a few steps a second. A shard's item is at sort key
+  // "-": `cap`; `active`, the number of leases; `leases`, each lease's expiry and tenant;
+  // and `tenants`, each tenant's leases, with no zero counts kept.
+  //
+  // All the shards have one line, so a lease that's given back in any of them goes to the
+  // step whose turn it is. The line is per tenant: a step's entry is an item under its
+  // limit and tenant. An item at "w#<tenant>" under the limit marks that the tenant may
+  // have steps in line. It's put there after an entry goes in, if it isn't there, and
+  // taken out when the line's found empty, which then looks at the line again. Each writes
+  // first and reads second, so one of them sees the other, and a step isn't hidden.
   //
   // None of it is written in a transaction. On a busy limit, transactions on one item
   // fail each other, where plain writes take their turn. Each write is conditioned, so
@@ -344,31 +372,62 @@ export class DynamoStore implements Store {
     }
   }
 
+  // Take a lease on one of a limit's shards. The shards with room are tried at random, so
+  // steps that ask at once spread out. `rooms` is what's known of it, from the limit as it
+  // was read. An error gives back what may have been written.
+  private async takeAny(limit: Limit, leaseId: string, tenant: string, value: string, rooms?: Rooms): Promise<Limit | "held" | "full"> {
+    let shards = shardsOf(limit);
+    if (shards.length > 1) {
+      const known = rooms ?? new Map(await Promise.all(shards.map(async (s) => [s.item, await this.room(s)] as const)));
+      // A few: where others are taking the last of the room, it's the line's turn.
+      shards = shuffle(shards.filter((s) => (known.get(s.item) ?? 0) > 0)).slice(0, 6);
+    }
+    for (const shard of shards) {
+      let took: "taken" | "held" | "full";
+      try {
+        took = await this.takeOne(shard, leaseId, tenant, value);
+      } catch (error) {
+        await this.releaseOne(shard.item, leaseId, tenant, value).catch(() => {});
+        throw error;
+      }
+      if (took === "held") return "held";
+      rooms?.set(shard.item, took === "taken" ? (rooms.get(shard.item) ?? 0) - 1 : 0);
+      if (took === "taken") return shard;
+    }
+    return "full";
+  }
+
   // Take every lease, in order, or give back the ones taken. One the step has already,
   // as from a grant in progress that may yet be undone, is made this step's own, so
   // undoing the grant doesn't give it back.
-  private async takeAll(limits: Limit[], leaseId: string, tenant: string, value: string, held: Map<string, string>) {
+  private async takeAll(limits: Limit[], leaseId: string, tenant: string, value: string, held: Map<string, Copy>, rooms: Rooms[]) {
     const taken: Limit[] = [];
     const undo = async () => {
       for (const t of taken) await this.releaseOne(t.item, leaseId, tenant, value).catch(() => {});
     };
-    for (const limit of limits) {
+    for (const [i, limit] of limits.entries()) {
       const old = held.get(limit.item);
-      // Given back by its value if the next is full, or if this one fails, which may
-      // be after it was written.
-      taken.push(limit);
       try {
-        if (old === undefined ? (await this.takeOne(limit, leaseId, tenant, value)) === "taken" : await this.setLease(limit.item, leaseId, old, value))
-          continue;
+        if (old) {
+          // Given back by its value if it fails, which may be after it was written.
+          taken.push(old.shard);
+          if (await this.setLease(old.shard.item, leaseId, old.raw, value)) continue;
+          taken.pop();
+        } else {
+          const took = await this.takeAny(limit, leaseId, tenant, value, rooms[i]);
+          if (typeof took === "object") {
+            taken.push(took);
+            continue;
+          }
+        }
       } catch (error) {
         await undo();
         throw error;
       }
-      taken.pop();
       await undo();
-      return false;
+      return undefined;
     }
-    return true;
+    return taken;
   }
 
   // Replace a lease's value, if it's still the one that was read.
@@ -391,53 +450,99 @@ export class DynamoStore implements Store {
 
   async acquire(limits: Limit[], leaseId: string, tenant: string, leaseMs: number) {
     const unique = ordered(limits);
-    for (let attempt = 0; attempt < 4; attempt++) {
-      const items = await Promise.all(unique.map((l) => this.readLimit(l.item, "any")));
-      const missing = unique.filter((_, i) => !items[i]);
-      if (missing.length) {
-        await Promise.all(missing.map((l) => this.createLimit(l)));
-        continue;
-      }
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const states = await Promise.all(unique.map((l) => this.readLimit(l, "some")));
+      if ((await Promise.all(states.map((s) => this.createSome(s)))).some(Boolean)) continue;
       // Already ours, as given to it while it asked again: it claims it, so a wake of
       // its old callback that fails doesn't give it back.
-      if (items.every((item) => item!.leases[leaseId]) && (await this.renew(unique, leaseId, leaseMs, true)))
-        return "granted" as const;
+      if (states.every((s) => s.leases[leaseId]) && (await this.renew(unique, leaseId, leaseMs, true))) return "granted" as const;
       const now = Date.now();
       // Give back leases that expired, as when a run crashed, then look again.
-      if (await this.reap(unique, items as LimitState[], now)) continue;
-      // A step in line goes first, and a full limit has no room: don't ask.
-      if (items.some((item, i) => item!.queued > 0 || Object.keys(item!.leases).length >= unique[i].limit))
-        return "full" as const;
-      const held = new Map(unique.flatMap((l, i) => (items[i]!.raw[leaseId] ? [[l.item, items[i]!.raw[leaseId]] as const] : [])));
-      if (await this.takeAll(unique, leaseId, tenant, leaseValue(now + leaseMs, tenant, "own"), held)) return "granted" as const;
+      if (await this.reap(states, now)) continue;
+      // A full limit has no room, and a step in line goes first: don't ask.
+      if (states.some((s) => s.free <= 0)) return "full" as const;
+      const lines = await Promise.all(unique.map((l, i) => this.anyInLine(l, states[i])));
+      if (lines.some(Boolean)) return "full" as const;
+      const held = new Map(unique.flatMap((l, i) => (states[i].copies(leaseId).length ? [[l.item, states[i].copies(leaseId)[0]] as const] : [])));
+      const taken = await this.takeAll(unique, leaseId, tenant, leaseValue(now + leaseMs, tenant, "own"), held, states.map((s) => s.rooms()));
+      if (taken) {
+        taken.forEach((shard, i) => this.remember(unique[i], leaseId, shard));
+        return "granted" as const;
+      }
       // Another step took the room first.
     }
     return "full" as const;
   }
 
+  // Whether a step waits in line. Markers are kept a while after a line empties, so look
+  // at the lines of a few, and take more to mean yes.
+  private async anyInLine(limit: Limit, state: LimitState) {
+    const marks = Object.entries(state.waiting);
+    if (!marks.length) return false;
+    if (marks.reduce((n, [, m]) => n + m.lines, 0) > 16) return true;
+    const heads = await Promise.all(marks.map(([t, m]) => this.lineEmpty(limit.item, t, m.lines)));
+    return heads.some((empty) => !empty);
+  }
+
+  private async lineEmpty(item: string, t: string, lines: number) {
+    const pages = await Promise.all(
+      Array.from({ length: lines }, (_, line) =>
+        this.db("Query", {
+          KeyConditionExpression: "pk = :pk",
+          ExpressionAttributeValues: { ":pk": S(lineKey(item, t, line)) },
+          ProjectionExpression: "pk",
+          ConsistentRead: true,
+          Limit: 1,
+        }),
+      ),
+    );
+    return pages.every((p) => !p.Items?.length);
+  }
+
+  // The shard a lease is in, as this process last saw it, so the step that renewed it
+  // gives it back without looking for it.
+  private readonly places = new Map<string, Limit>();
+  private remember(limit: Limit, leaseId: string, shard: Limit) {
+    if (shard.item === limit.item && shardsOf(limit).length === 1) return;
+    if (this.places.size > 10_000) this.places.clear();
+    this.places.set(`${limit.item}|${leaseId}`, shard);
+  }
+
   async renew(limits: Limit[], leaseId: string, leaseMs: number, claim = false) {
     const now = Date.now();
     const unique = uniqueLimits(limits);
-    const items = await Promise.all(unique.map((l) => this.readLimit(l.item, "none")));
-    for (const item of items) {
-      const lease = item?.leases[leaseId];
-      // An expired lease may be given back at any moment: it isn't renewed.
-      if (!item?.raw[leaseId] || !lease || lease.expires <= now) return false;
+    const states = await Promise.all(unique.map((l) => this.readLimit(l, "none")));
+    // Its lease on each limit. Two grants that race can leave it two, in two shards: it
+    // keeps its own, or the one that lasts, and gives back the rest.
+    const mine: Copy[] = [];
+    const extra: Copy[] = [];
+    for (const state of states) {
+      const copies = state
+        .copies(leaseId)
+        // An expired lease may be given back at any moment: it isn't renewed.
+        .filter((c) => c.lease.expires > now)
+        .sort((a, b) => Number(a.lease.granted) - Number(b.lease.granted) || b.lease.expires - a.lease.expires);
+      if (!copies.length) return false;
+      mine.push(copies[0]);
+      extra.push(...copies.slice(1));
     }
+    unique.forEach((l, i) => this.remember(l, leaseId, mine[i].shard));
+    const tidy = async () => {
+      for (const c of extra) await this.releaseOne(c.shard.item, leaseId, c.lease.tenant, c.raw).catch(() => {});
+      return true;
+    };
     // A lease the step took itself, that lasts past this invocation, needs no write. One
     // it was given is made its own, so whoever gave it can't give it back any more, as
     // when the wake reached the step but its answer was lost.
-    if (!claim && items.every((item) => !item!.leases[leaseId].granted && item!.leases[leaseId].expires >= now + leaseMs))
-      return true;
+    if (!claim && mine.every((c) => !c.lease.granted && c.lease.expires >= now + leaseMs)) return tidy();
     const renewed: [Limit, string, string][] = [];
     try {
-      for (const [i, limit] of unique.entries()) {
-        const lease = items[i]!.leases[leaseId];
+      for (const { shard, lease, raw } of mine) {
         // One it was given lasts long enough to resume. From here it lasts this invocation.
         const expires = lease.granted ? now + leaseMs : Math.max(now + leaseMs, lease.expires);
         const value = leaseValue(expires, lease.tenant, "own");
-        renewed.push([limit, lease.tenant, value]);
-        if (await this.setLease(limit.item, leaseId, items[i]!.raw[leaseId], value)) continue;
+        renewed.push([shard, lease.tenant, value]);
+        if (await this.setLease(shard.item, leaseId, raw, value)) continue;
         renewed.pop();
         await this.giveBackAll(renewed, leaseId);
         return false;
@@ -446,17 +551,29 @@ export class DynamoStore implements Store {
       await this.giveBackAll(renewed, leaseId);
       throw error;
     }
-    return true;
+    return tidy();
   }
 
   // A claim that lost one of its leases gives back the ones it made its own: whoever
   // granted them no longer can.
   private async giveBackAll(leases: [Limit, string, string][], leaseId: string) {
-    for (const [limit, tenant, value] of leases) await this.releaseOne(limit.item, leaseId, tenant, value).catch(() => {});
+    for (const [shard, tenant, value] of leases) await this.releaseOne(shard.item, leaseId, tenant, value).catch(() => {});
   }
 
-  async release(limits: Limit[], leaseId: string, tenant: string, only?: string) {
-    await Promise.all(uniqueLimits(limits).map((l) => this.releaseOne(l.item, leaseId, tenant, only)));
+  async release(limits: Limit[], leaseId: string, tenant: string) {
+    await Promise.all(uniqueLimits(limits).map((l) => this.releaseFrom(l, leaseId, tenant)));
+  }
+
+  // Give back a step's lease on a limit, wherever it is.
+  private async releaseFrom(limit: Limit, leaseId: string, tenant: string) {
+    const shards = shardsOf(limit);
+    if (shards.length === 1) return void (await this.releaseOne(limit.item, leaseId, tenant));
+    const key = `${limit.item}|${leaseId}`;
+    const known = this.places.get(key);
+    this.places.delete(key);
+    if (known && (await this.releaseOne(known.item, leaseId, tenant))) return;
+    const state = await this.readLimit(limit, "none");
+    for (const c of state.copies(leaseId)) await this.releaseOne(c.shard.item, leaseId, tenant);
   }
 
   private async releaseOne(item: string, leaseId: string, tenant: string, only?: string) {
@@ -491,21 +608,23 @@ export class DynamoStore implements Store {
     });
   }
 
-  private async reap(limits: Limit[], items: LimitState[], now: number) {
+  private async reap(states: LimitState[], now: number) {
     let reaped = false;
-    for (const [i, limit] of limits.entries())
-      for (const [id, lease] of Object.entries(items[i].leases))
-        if (lease.expires <= now && (await this.releaseOne(limit.item, id, lease.tenant, items[i].raw[id])))
-          reaped = true;
+    for (const state of states)
+      for (const shard of state.shards)
+        for (const [id, lease] of Object.entries(shard.leases))
+          if (lease.expires <= now && (await this.releaseOne(shard.limit.item, id, lease.tenant, shard.raw[id]))) reaped = true;
     return reaped;
   }
 
   private entryKey(limit: Limit, waiter: Pick<LeaseWaiter, "tenant" | "at" | "leaseId">) {
-    return { pk: S(queueKey(limit.item, waiter.tenant)), sk: S(`${pad(waiter.at)}#${waiter.leaseId}`) };
+    return { pk: S(lineKey(limit.item, tenantKey(waiter.tenant), lineOf(limit, waiter.leaseId))), sk: S(`${pad(waiter.at)}#${waiter.leaseId}`) };
   }
 
-  private entry(waiter: LeaseWaiter) {
+  private entry(limit: Limit, waiter: LeaseWaiter) {
     return {
+      // For the admin API, to count a limit's line.
+      limit: S(limit.item),
       lease: S(waiter.leaseId),
       tenant: S(waiter.tenant),
       callback: S(waiter.callbackId),
@@ -523,29 +642,75 @@ export class DynamoStore implements Store {
     for (const limit of ordered(waiter.limits)) await this.join(limit, waiter);
   }
 
-  // Put a step in a limit's line, or say it's there already. It's counted before its
-  // entry goes in, so wherever this stops, the count isn't one short: that would hide a
-  // step that waits. One too many is found with no step behind it, and taken out.
+  // Put a step in a limit's line, or say it's there already. Then mark that its tenant has
+  // steps in line. One that stops in between, as when the worker crashes, is seen when the
+  // step, or another of its tenant, asks again.
   private async join(limit: Limit, waiter: LeaseWaiter) {
-    await this.count(limit.item, waiter.tenant, 1);
+    let joined = true;
     try {
       await this.db("PutItem", {
-        Item: { ...this.entryKey(limit, waiter), ...this.entry(waiter) },
+        Item: { ...this.entryKey(limit, waiter), ...this.entry(limit, waiter) },
         ConditionExpression: "attribute_not_exists(pk)",
       });
-      return true;
     } catch (error) {
       if (!isConditionFailure(error)) throw error;
-      await this.count(limit.item, waiter.tenant, -1);
-      return false;
+      joined = false;
     }
+    await this.mark(limit.item, tenantKey(waiter.tenant), linesOf(limit));
+    return joined;
+  }
+
+  // Mark that a tenant may have steps in a limit's line, and in how many it's split, if it
+  // isn't. A limit that was changed may have more lines in runs on another version.
+  private async mark(item: string, t: string, lines: number, put = false) {
+    const Key = { pk: S(item), sk: S(`w#${t}`) };
+    const now = Date.now();
+    const { Item } = await this.db("GetItem", { Key, ConsistentRead: true });
+    const marked = Number(Item?.n?.N ?? 0);
+    // Renewed now and then, so it's kept as long as its line is.
+    if (!put && Item && marked >= lines && Number(Item.at?.N ?? 0) > now - MARK_FRESH_MS) return;
+    await this.db("UpdateItem", {
+      Key,
+      UpdateExpression: "SET #at = :at, expires = :e, #n = if_not_exists(#n, :zero) + :more",
+      ConditionExpression: Item ? "#n = :marked" : "attribute_not_exists(pk)",
+      ExpressionAttributeNames: { "#at": "at", "#n": "n" },
+      ExpressionAttributeValues: {
+        ":at": N(now),
+        ":e": { N: seconds(now + DAY) },
+        ":zero": N(0),
+        ":more": N(Math.max(0, lines - marked)),
+        ...(Item ? { ":marked": N(marked) } : {}),
+      },
+    }).catch((error) => {
+      // Another marked it, or took the mark out: look again.
+      if (isConditionFailure(error)) return this.mark(item, t, lines, put);
+      throw error;
+    });
+  }
+
+  // Take out the mark of a tenant whose line was found empty, if it hasn't changed. Then
+  // look at the line again: a step that joined in between may have seen the mark, and
+  // left it.
+  private async unmark(item: string, t: string, mark: Mark) {
+    try {
+      await this.db("DeleteItem", {
+        Key: { pk: S(item), sk: S(`w#${t}`) },
+        ConditionExpression: "#at = :at AND #n = :lines",
+        ExpressionAttributeNames: { "#at": "at", "#n": "n" },
+        ExpressionAttributeValues: { ":at": N(mark.at), ":lines": N(mark.lines) },
+      });
+    } catch (error) {
+      if (isConditionFailure(error)) return;
+      throw error;
+    }
+    if (!(await this.lineEmpty(item, t, mark.lines))) await this.mark(item, t, mark.lines, true);
   }
 
   // Wake a step that was given its leases. If it can't be woken, give them back: only
   // those, since a step that asked again may have found them and claimed them. One
   // that may not have been told goes back in line, and isn't tried again in this
   // dispatch, so an outage doesn't keep it busy.
-  private async tell(w: LeaseWaiter, value: string, wake: (w: LeaseWaiter) => Promise<boolean>, skip: Set<string>) {
+  private async tell(w: LeaseWaiter, grant: Granted, wake: (w: LeaseWaiter) => Promise<boolean>, skip: Set<string>) {
     let woken: boolean | undefined;
     try {
       woken = await wake(w);
@@ -555,74 +720,8 @@ export class DynamoStore implements Store {
       skip.add(w.leaseId);
       await this.requeue(w).catch(() => {});
     }
-    await this.release(w.limits, w.leaseId, w.tenant, value);
+    for (const shard of grant.at) await this.releaseOne(shard.item, w.leaseId, w.tenant, grant.value);
     return false;
-  }
-
-  // Count a step in, or out of, a limit's line. One counted out twice, as when an answer
-  // was lost, doesn't go below zero.
-  private async count(item: string, tenant: string, n: 1 | -1) {
-    const Key = { pk: S(item), sk: S(`w#${tenantKey(tenant)}`) };
-    let left = 0;
-    try {
-      const result = await this.db("UpdateItem", {
-        Key,
-        UpdateExpression: "SET #at = :now, expires = :exp ADD #n :n",
-        ...(n < 0 ? { ConditionExpression: "#n > :zero" } : {}),
-        ExpressionAttributeNames: { "#n": "n", "#at": "at" },
-        ExpressionAttributeValues: {
-          ":now": N(Date.now()),
-          ":exp": { N: seconds(Date.now() + DAY) },
-          ":n": N(n),
-          ...(n < 0 ? { ":zero": N(0) } : {}),
-        },
-        ReturnValues: "UPDATED_NEW",
-      });
-      left = Number(result.Attributes?.n?.N ?? 1);
-    } catch (error) {
-      if (!isConditionFailure(error)) throw error;
-    }
-    if (n > 0 || left > 0) return;
-    await this.dropLine(Key, 0);
-    // A step is counted before it's in line, so one in line here isn't counted. Count
-    // it, so it's seen. If it left in the meantime, take that back.
-    const inLine = async () => {
-      const page = await this.db("Query", {
-        KeyConditionExpression: "pk = :pk",
-        ExpressionAttributeValues: { ":pk": S(queueKey(item, tenant)) },
-        ConsistentRead: true,
-        Limit: 1,
-      });
-      return !!page.Items?.length;
-    };
-    if (!(await inLine())) return;
-    const at = Date.now();
-    try {
-      await this.db("UpdateItem", {
-        Key,
-        UpdateExpression: "SET #n = :one, #at = :now, expires = :exp",
-        ConditionExpression: "attribute_not_exists(#n) OR #n <= :zero",
-        ExpressionAttributeNames: { "#n": "n", "#at": "at" },
-        ExpressionAttributeValues: { ":one": N(1), ":zero": N(0), ":now": N(at), ":exp": { N: seconds(at + DAY) } },
-      });
-    } catch (error) {
-      if (isConditionFailure(error)) return;
-      throw error;
-    }
-    if (!(await inLine())) await this.dropLine(Key, 1, at);
-  }
-
-  // Take a tenant out of a limit's line, if its count is still this, and if given, hasn't
-  // changed since.
-  private async dropLine(Key: Record<string, unknown>, n: number, at?: number) {
-    await this.db("DeleteItem", {
-      Key,
-      ConditionExpression: at === undefined ? "#n = :n" : "#n = :n AND #at = :at",
-      ExpressionAttributeNames: { "#n": "n", ...(at === undefined ? {} : { "#at": "at" }) },
-      ExpressionAttributeValues: { ":n": N(n), ...(at === undefined ? {} : { ":at": N(at) }) },
-    }).catch((error) => {
-      if (!isConditionFailure(error)) throw error;
-    });
   }
 
   async enqueue(waiter: LeaseWaiter) {
@@ -633,11 +732,10 @@ export class DynamoStore implements Store {
       for (const l of limits) await this.leave(l, waiter);
       return "held" as const;
     };
-    const items = await Promise.all(limits.map((l) => this.readLimit(l.item, "none")));
-    if (items.every((item) => item?.leases[waiter.leaseId]) && (await this.renew(limits, waiter.leaseId, GRANT_MS, true)))
-      return held();
-    await Promise.all(limits.filter((_, i) => !items[i]).map((l) => this.createLimit(l)));
-    const entry = this.entry(waiter);
+    const states = await Promise.all(limits.map((l) => this.readLimit(l, "none")));
+    if (states.every((s) => s.leases[waiter.leaseId]) && (await this.renew(limits, waiter.leaseId, GRANT_MS, true))) return held();
+    await Promise.all(states.map((s) => this.createSome(s)));
+    const entry = this.entry(limits[0], waiter);
     for (let attempt = 0; attempt < 3; attempt++) {
       let gone = false;
       for (const limit of limits) {
@@ -672,55 +770,91 @@ export class DynamoStore implements Store {
       if (!gone) return "queued" as const;
       // An entry went in between: the step was given its leases, or given them and
       // they were given back, as its old callback had timed out. Then it joins again.
-      const again = await Promise.all(limits.map((l) => this.readLimit(l.item, "none")));
-      if (again.every((item) => item?.leases[waiter.leaseId]) && (await this.renew(limits, waiter.leaseId, GRANT_MS, true)))
-        return held();
+      const again = await Promise.all(limits.map((l) => this.readLimit(l, "none")));
+      if (again.every((s) => s.leases[waiter.leaseId]) && (await this.renew(limits, waiter.leaseId, GRANT_MS, true))) return held();
     }
     return "queued" as const;
   }
 
-  async dispatch(limit: Limit, wake: (w: LeaseWaiter) => Promise<boolean>, skip = new Set<string>()) {
+  async dispatch(limit: Limit, wake: (w: LeaseWaiter) => Promise<boolean>, joined?: LeaseWaiter) {
+    if (joined && shardsOf(limit).length > 1) return this.dispatchOne(limit, joined, wake);
+    return this.dispatchAll(limit, wake, new Set());
+  }
+
+  // Give a step that joined the line its leases, if they're free. Steps that join a wide
+  // limit at once would all try to give the same oldest steps the same room.
+  private async dispatchOne(limit: Limit, w: LeaseWaiter, wake: (w: LeaseWaiter) => Promise<boolean>) {
+    const skip = new Set<string>();
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const state = await this.readLimit(limit);
+      if (await this.reap([state], Date.now())) continue;
+      if (state.leases[w.leaseId]) return 0;
+      if (await this.createSome(state)) continue;
+      if (state.free <= 0) return 0;
+      if (!(await this.hasRoom(w.limits.filter((l) => l.item !== limit.item)))) return 0;
+      const grant = await this.grant(w, [limit], { rooms: new Map([[limit.item, state.rooms()]]) });
+      if (grant.granted) return (await this.tell(w, grant.granted, wake, skip)) ? 1 : 0;
+      // Another is giving it its leases.
+      if (grant.raced) return 0;
+      // The room went to another, or it was put back: look again.
+      await new Promise((r) => setTimeout(r, Math.random() * 40));
+    }
+    // The room keeps going to others. Leave none free, for this or another step.
+    return this.dispatchAll(limit, wake, skip);
+  }
+
+  private async dispatchAll(limit: Limit, wake: (w: LeaseWaiter) => Promise<boolean>, skip: Set<string>) {
     let woken = 0;
-    let again = false;
+    let again = 0;
+    let races = 0;
     // Bounded by time, not by tries: a step that's gone, as when its run was stopped, is
     // taken out of line, and a step that another dispatch got to first is being woken.
     const end = Date.now() + DISPATCH_MS;
     while (woken < limit.limit + 5 && Date.now() < end) {
-      const item = await this.readLimit(limit.item);
-      if (!item) return woken;
-      if (await this.reap([limit], [item], Date.now())) continue;
-      if (Object.keys(item.leases).length >= limit.limit) return woken;
-      let granted: LeaseWaiter | undefined;
-      let value: string | undefined;
+      const state = await this.readLimit(limit);
+      if (state.missing.length === state.shards.length) return woken;
+      if (await this.reap([state], Date.now())) continue;
+      if (await this.createSome(state)) continue;
+      if (state.free <= 0) return woken;
+      // One at a time, so each is given to whoever is fairest by then. A limit with shards
+      // has many to give at once, as many to each tenant as keeps it fair.
+      const width = state.shards.length === 1 ? 1 : Math.min(state.free, 25);
+      const rooms = state.rooms();
       let undone = false;
       let raced = false;
-      for await (const c of this.candidates(limit, item, skip)) {
-        if (!(await this.hasRoom(c.limits.filter((l) => l.item !== limit.item)))) continue;
-        const grant = await this.grant(c, [limit]);
+      let given = 0;
+      const give = async (c: LeaseWaiter) => {
+        if (!(await this.hasRoom(c.limits.filter((l) => l.item !== limit.item)))) return;
+        const grant = await this.grant(c, [limit], { rooms: new Map([[limit.item, rooms]]) });
         undone ||= grant.undone;
         raced ||= grant.raced;
-        value = grant.value;
-        if (value) {
-          granted = c;
-          break;
-        }
-      }
-      if (granted) {
+        if (!grant.granted) return;
+        given++;
         // A step that's gone, or asked again with a new callback, gives its leases back
         // to the next one.
-        if (await this.tell(granted, value!, wake, skip)) woken++;
-        continue;
+        if (await this.tell(c, grant.granted, wake, skip)) woken++;
+      };
+      let batch: LeaseWaiter[] = [];
+      for await (const c of this.candidates(limit, state, skip)) {
+        batch.push(c);
+        if (batch.length < width - given) continue;
+        await Promise.all(batch.map(give));
+        batch = [];
+        if (given >= width) break;
       }
+      await Promise.all(batch.map(give));
+      if (given) continue;
       // Another dispatch got to a step first: there may be room, and another step.
       if (raced) {
-        await new Promise((r) => setTimeout(r, 5 + Math.random() * 20));
+        await new Promise((r) => setTimeout(r, 5 + Math.random() * Math.min(500, 20 * 2 ** races++)));
         continue;
       }
       // No step in line can have all it needs now. A release of the limit it's missing
-      // gives it to it. A lease that was taken and given back was gone for a moment,
-      // and another step may have found the limit full then: look again, once.
-      if (!undone || again) return woken;
-      again = true;
+      // gives it to it. One that was taken out of line, or whose lease was taken, and was
+      // put back, was gone for a moment, and another dispatch may have missed it: look
+      // again, a few times.
+      if (!undone || ++again > 3) return woken;
+      await new Promise((r) => setTimeout(r, Math.random() * 20));
     }
     return woken;
   }
@@ -730,57 +864,76 @@ export class DynamoStore implements Store {
   // it needs, as when its own tenant's limit is full, doesn't keep the lease from the
   // next. Tenants are looked at 16 at a time, at random among those with as many leases,
   // up to MAX_TENANTS in all.
-  private async *candidates(limit: Limit, item: LimitState, skip: Set<string>): AsyncGenerator<LeaseWaiter> {
-    const held = (t: string) => item.tenants[t] ?? 0;
-    // Any that's counted, even at zero: its line says if a step waits.
-    const tenants = Object.keys(item.waiting)
+  private async *candidates(limit: Limit, state: LimitState, skip: Set<string>): AsyncGenerator<LeaseWaiter> {
+    const held = (t: string) => state.tenants[t] ?? 0;
+    const tenants = Object.keys(state.waiting)
       .map((t) => ({ t, tie: Math.random() }))
       .sort((a, b) => held(a.t) - held(b.t) || a.tie - b.tie)
       .slice(0, MAX_TENANTS);
-    for (let from = 0; from < tenants.length; from += 16) {
-      const heads = await Promise.all(tenants.slice(from, from + 16).map(({ t }) => this.head(limit, item, t, skip)));
-      const steps = heads.filter((w) => w !== undefined);
-      yield* steps.sort((a, b) => held(tenantKey(a.tenant)) - held(tenantKey(b.tenant)) || a.at - b.at);
+    // The fairest, then the next fairest if it's given one, and so on.
+    const given: Record<string, number> = Object.create(null);
+    const load = (w: LeaseWaiter) => held(tenantKey(w.tenant)) + (given[w.tenant] ?? 0);
+    const chunk = state.shards.length === 1 ? 16 : 8;
+    for (let from = 0; from < tenants.length; from += chunk) {
+      const lines = (await Promise.all(tenants.slice(from, from + chunk).map(({ t }) => this.heads(limit, state, t, skip)))).filter((l) => l.length);
+      while (lines.length) {
+        let best = 0;
+        for (let i = 1; i < lines.length; i++) {
+          const d = load(lines[i][0]) - load(lines[best][0]);
+          if (d < 0 || (d === 0 && lines[i][0].at < lines[best][0].at)) best = i;
+        }
+        const next = lines[best].shift()!;
+        if (!lines[best].length) lines.splice(best, 1);
+        given[next.tenant] = (given[next.tenant] ?? 0) + 1;
+        yield next;
+      }
     }
   }
 
-  // A tenant's oldest step in line that can be given a lease.
-  private async head(limit: Limit, item: LimitState, t: string, skip: Set<string>): Promise<LeaseWaiter | undefined> {
-    let start: any;
+  // A tenant's oldest step in line that can be given a lease. Of a limit with shards, many
+  // are given back at once, so it's some of the oldest, from one of its lines, in any
+  // order: dispatches that all went for the one oldest step would get in each other's way.
+  private async heads(limit: Limit, state: LimitState, t: string, skip: Set<string>): Promise<LeaseWaiter[]> {
+    const mark = state.waiting[t];
+    const wide = state.shards.length > 1;
+    const wanted = wide ? 12 : 1;
+    const found: LeaseWaiter[] = [];
     let empty = true;
-    for (let pages = 0; pages < 10; pages++) {
-      const page = await this.db("Query", {
-        KeyConditionExpression: "pk = :pk",
-        ExpressionAttributeValues: { ":pk": S(lineKey(limit.item, t)) },
-        ConsistentRead: true,
-        Limit: pages ? 25 : 3,
-        ExclusiveStartKey: start,
-      });
-      if (page.Items?.length) empty = false;
-      // A step that holds its lease here is being given it right now, or was put back in
-      // line and had been told after all. One that couldn't be told it was given one
-      // waits for the next dispatch.
-      const e = (page.Items ?? []).find((e: any) => !item.leases[String(e.lease.S)] && !skip.has(String(e.lease.S)));
-      if (e)
-        return {
-          leaseId: String(e.lease.S),
-          tenant: String(e.tenant.S),
-          callbackId: String(e.callback.S),
-          runId: String(e.run.S),
-          at: Number(e.at.N),
-          // As it was put in line, so it keeps it if it's put back.
-          expiresAt: Number(e.expires.N) * 1000 - DAY,
-          limits: JSON.parse(e.limits.S),
-        };
-      start = page.LastEvaluatedKey;
-      if (!start) break;
+    for (const line of shuffle(Array.from({ length: mark.lines }, (_, i) => i))) {
+      let start: any;
+      for (let pages = 0; pages < 10 && found.length < wanted; pages++) {
+        const page = await this.db("Query", {
+          KeyConditionExpression: "pk = :pk",
+          ExpressionAttributeValues: { ":pk": S(lineKey(limit.item, t, line)) },
+          ConsistentRead: true,
+          Limit: wide ? 12 : pages ? 25 : 3,
+          ExclusiveStartKey: start,
+        });
+        if (page.Items?.length) empty = false;
+        for (const e of page.Items ?? []) {
+          // A step that holds its lease here is being given it right now, or was put back in
+          // line and had been told after all. One that couldn't be told it was given one
+          // waits for the next dispatch.
+          if (found.length >= wanted || state.leases[String(e.lease.S)] || skip.has(String(e.lease.S))) continue;
+          found.push({
+            leaseId: String(e.lease.S),
+            tenant: String(e.tenant.S),
+            callbackId: String(e.callback.S),
+            runId: String(e.run.S),
+            at: Number(e.at.N),
+            // As it was put in line, so it keeps it if it's put back.
+            expiresAt: Number(e.expires.N) * 1000 - DAY,
+            limits: JSON.parse(e.limits.S),
+          });
+        }
+        start = page.LastEvaluatedKey;
+        if (!start) break;
+      }
+      if (found.length) break;
     }
-    // A count goes up before its entry goes in, and down after it comes out, so one can
-    // be seen without its entry for a moment. It's taken for a stale one, as when entries
-    // expired, only if it hasn't changed in a while.
-    if (empty && Date.now() - (item.waitingAt[t] ?? 0) > STALE_LINE_MS)
-      await this.dropLine({ pk: S(limit.item), sk: S(`w#${t}`) }, item.waiting[t], item.waitingAt[t]).catch(() => {});
-    return undefined;
+    // Kept a while after its line empties, so steps that come and go don't write it each time.
+    if (empty && Date.now() - mark.at > STALE_LINE_MS) await this.unmark(limit.item, t, mark).catch(() => {});
+    return wide ? shuffle(found) : found;
   }
 
   async handoff(limits: Limit[], leaseId: string, tenant: string, wake: (w: LeaseWaiter) => Promise<boolean>) {
@@ -790,8 +943,8 @@ export class DynamoStore implements Store {
       await this.pass(unique, leaseId, tenant, wake, skip);
     } catch (error) {
       // Give back what it still holds, so an error doesn't keep it until it expires.
-      for (const l of unique) await this.releaseOne(l.item, leaseId, tenant).catch(() => {});
-      for (const l of unique) await this.dispatch(l, wake, skip).catch(() => {});
+      for (const l of unique) await this.releaseFrom(l, leaseId, tenant).catch(() => {});
+      for (const l of unique) await this.dispatchAll(l, wake, skip).catch(() => {});
       throw error;
     }
   }
@@ -805,107 +958,124 @@ export class DynamoStore implements Store {
   ) {
     // The limit with the most tenants in line first: that's where it's decided whose
     // turn is fair. A tenant's own limit has only its own steps in line.
-    const items = await Promise.all(unique.map((l) => this.readLimit(l.item)));
-    const tenantsInLine = (i: number) => Object.keys(items[i]?.waiting ?? {}).length;
+    const states = await Promise.all(unique.map((l) => this.readLimit(l)));
+    const at = new Map(unique.flatMap((l, i) => (states[i].copies(leaseId).length ? [[l.item, states[i].copies(leaseId)[0].shard] as const] : [])));
+    const tenantsInLine = (i: number) => Object.keys(states[i].waiting).length;
     const order = unique.map((_, i) => i).sort((a, b) => tenantsInLine(b) - tenantsInLine(a) || unique[b].limit - unique[a].limit);
     for (const i of order) {
-      const item = items[i];
-      if (!item?.leases[leaseId]) continue;
+      const shard = at.get(unique[i].item);
+      if (!shard) continue;
       // Over the limit, as when it was lowered: give it back.
-      if (Object.keys(item.leases).length > unique[i].limit) break;
-      for await (const next of this.candidates(unique[i], item, skip)) {
-        const { value, passed } = await this.grant(next, unique, { limits: unique, leaseId, tenant });
-        if (!value) continue;
+      const there = states[i].shards.find((s) => s.limit.item === shard.item)!;
+      if (Object.keys(there.leases).length > there.limit.limit) break;
+      for await (const next of this.candidates(unique[i], states[i], skip)) {
+        const { granted, passed } = await this.grant(next, unique, { from: { leaseId, tenant, at } });
+        if (!granted) continue;
         // Give back what wasn't passed: a limit the next step doesn't need, or one it
         // got a lease of its own on.
-        const kept = unique.filter((l) => !passed.some((p) => p.item === l.item));
+        const kept = unique.filter((l) => !passed?.some((p) => p.item === l.item));
         await this.release(kept, leaseId, tenant);
-        if (!(await this.tell(next, value, wake, skip)))
-          for (const l of uniqueLimits(next.limits)) await this.dispatch(l, wake, skip);
-        for (const l of kept) await this.dispatch(l, wake, skip);
+        for (const l of unique) this.places.delete(`${l.item}|${leaseId}`);
+        if (!(await this.tell(next, granted, wake, skip))) for (const l of uniqueLimits(next.limits)) await this.dispatchAll(l, wake, skip);
+        for (const l of kept) await this.dispatchAll(l, wake, skip);
         return;
       }
       break;
     }
     await this.release(unique, leaseId, tenant);
-    for (const i of order) await this.dispatch(unique[i], wake, skip);
+    for (const i of order) await this.dispatchAll(unique[i], wake, skip);
   }
 
   // Whether each limit has room, or didn't when it was looked at. Looking first saves
   // taking one lease to give it back, as when a tenant's own limit is full.
   private async hasRoom(limits: Limit[]) {
     const rooms = await Promise.all(
-      uniqueLimits(limits).map(async (l) => {
-        const { Item } = await this.db("GetItem", {
-          Key: { pk: S(l.item), sk: S("-") },
-          ProjectionExpression: "active",
-          ConsistentRead: true,
-        });
-        return !!Item && Number(Item.active?.N ?? 0) < l.limit;
-      }),
+      uniqueLimits(limits).map(async (l) => (await Promise.all(shardsOf(l).map((s) => this.room(s)))).some((r) => r > 0)),
     );
     return rooms.every(Boolean);
   }
 
-  // Give a step in line every lease it needs, one at a time, in order, or none. With
-  // `from`, a step that's done gives its lease on a limit they share straight to it,
-  // in one write. Then take the step out of its lines. It returns the leases' value,
-  // to give back only those, or none; and which leases were passed. The step that's
-  // done still holds the others.
+  private async room(shard: Limit) {
+    const { Item } = await this.db("GetItem", {
+      Key: { pk: S(shard.item), sk: S("-") },
+      ProjectionExpression: "active",
+      ConsistentRead: true,
+    });
+    return Item ? shard.limit - Number(Item.active?.N ?? 0) : 0;
+  }
+
+  // Give a step in line every lease it needs, or none. First it's taken out of its first
+  // line, which one grant only can do: two can't give it leases at once, and the one that's
+  // late has only tried to delete an entry. If it can't have them all, it's put back, in
+  // its place. Then it's taken out of its other lines. With `from`, a step that's done
+  // gives its lease on a limit they share straight to it, in one write. It returns the
+  // leases, to give back only those, and which were passed. The step that's done still
+  // holds the others.
+  // A worker that stops part way leaves the step out of line, with no lease or one that
+  // expires: the step asks again when its callback times out.
   // `current` are the limits as the caller has them: a step's are as it joined the line,
   // and a limit that was lowered since is held to.
-  private async grant(w: LeaseWaiter, current: Limit[], from?: { limits: Limit[]; leaseId: string; tenant: string }) {
+  private async grant(
+    w: LeaseWaiter,
+    current: Limit[],
+    with_: { from?: { leaseId: string; tenant: string; at: Map<string, Limit> }; rooms?: Map<string, Rooms> } = {},
+  ): Promise<Grant> {
+    const { from, rooms } = with_;
     const value = leaseValue(Date.now() + GRANT_MS, w.tenant, "granted");
-    const mine = ordered(w.limits).map((l) => ({
+    // Its entries are where it joined: in the lines of the limits as it has them.
+    const joined = ordered(w.limits);
+    const [first, ...rest] = joined;
+    const mine = joined.map((l) => ({
       ...l,
       limit: Math.min(l.limit, current.find((c) => c.item === l.item)?.limit ?? l.limit),
     }));
-    const theirs = from ? uniqueLimits(from.limits) : [];
+    // Its entry as it was read: one that asked again with a new callback isn't given
+    // leases with the old one. One that's gone was read before another grant took it out:
+    // its other entries with this callback are left over.
+    const left = await this.leave(first, w, w.callbackId).catch(() => "unknown" as const);
+    if (left === "gone") for (const l of rest) await this.leave(l, w, w.callbackId).catch(() => {});
+    if (left === "unknown") await this.join(first, w).catch(() => {});
+    if (left !== "left") return { undone: left === "unknown", raced: left !== "unknown" };
+
     const passed: Limit[] = [];
-    const taken: Limit[] = [];
-    const undo = async (raced: boolean) => {
-      for (const l of [...passed, ...taken]) await this.releaseOne(l.item, w.leaseId, w.tenant, value).catch(() => {});
-      return { value: undefined, passed, undone: passed.length + taken.length > 0, raced };
+    const at: Limit[] = [];
+    const undo = async (inLine: boolean): Promise<Grant> => {
+      for (const shard of at) await this.releaseOne(shard.item, w.leaseId, w.tenant, value).catch(() => {});
+      if (inLine) await this.join(first, w);
+      else for (const l of rest) await this.leave(l, w, w.callbackId).catch(() => {});
+      return { undone: true, raced: false };
     };
-    for (const limit of mine) {
-      // Given back by its value on an error, which may come after it was written.
-      taken.push(limit);
-      try {
-        if (from && theirs.some((l) => l.item === limit.item) && (await this.passOne(limit, from, w, value))) {
-          taken.pop();
-          passed.push(limit);
-          continue;
+    try {
+      for (const limit of mine) {
+        // The shard the step that's done has its lease in, if this step may use it.
+        const theirs = from?.at.get(limit.item);
+        const shard = theirs && shardsOf(limit).find((s) => s.item === theirs.item);
+        if (from && shard) {
+          // Given back by its value on an error, which may come after it was written.
+          at.push(shard);
+          if (await this.passOne(shard, from, w, value)) {
+            passed.push(limit);
+            continue;
+          }
+          at.pop();
         }
         // The step that's done no longer holds it, or it isn't one it has: take it
         // like any other.
-        const took = await this.takeOne(limit, w.leaseId, w.tenant, value);
-        if (took === "taken") continue;
-        taken.pop();
-        return undo(took === "held");
-      } catch (error) {
-        await undo(false);
-        throw error;
+        const took = await this.takeAny(limit, w.leaseId, w.tenant, value, rooms?.get(limit.item));
+        // One that's held is the step's own: it asked again, and found room. It's out of
+        // line, or joins it again itself.
+        if (typeof took !== "object") return await undo(took === "full");
+        at.push(took);
       }
+    } catch (error) {
+      await undo(true).catch(() => {});
+      throw error;
     }
-    // Out of every line. Its entry in the first, as it was read, is taken out by one
-    // grant only. One that finds it gone read it before another grant took it out, and
-    // the step may be done by now. Its callback may still be open, as when it found its
-    // leases itself, so waking it wouldn't tell. One that finds it changed read it before
-    // the step asked again with a new callback. An error leaves an entry or a count
-    // that's found stale later.
-    const [first, ...rest] = mine;
-    const left = await this.leave(first, w, w.callbackId).catch(() => "left" as const);
-    if (left === "left") {
-      for (const l of rest) await this.leave(l, w).catch(() => {});
-      return { value, passed, undone: false, raced: false };
-    }
-    if (left === "gone") for (const l of rest) await this.leave(l, w, w.callbackId).catch(() => {});
-    return undo(true);
+    for (const l of rest) await this.leave(l, w).catch(() => {});
+    return { granted: { value, at }, passed, undone: false, raced: false };
   }
 
   // Take a step out of a line: with `callbackId`, if its entry still has that callback.
-  // Only an entry that was there is counted out, so the count isn't one short, which
-  // would hide a step that waits.
   private async leave(limit: Limit, waiter: Pick<LeaseWaiter, "tenant" | "at" | "leaseId">, callbackId?: string) {
     try {
       await this.db(
@@ -924,7 +1094,6 @@ export class DynamoStore implements Store {
       if (!isConditionFailure(error)) throw error;
       return (error as AwsError).body?.Item ? ("rejoined" as const) : ("gone" as const);
     }
-    await this.count(limit.item, waiter.tenant, -1);
     return "left" as const;
   }
 
@@ -955,32 +1124,43 @@ export class DynamoStore implements Store {
     return true;
   }
 
-  // A limit's leases, and its line: each tenant in it, or whether there's any.
-  private async readLimit(item: string, line: "all" | "any" | "none" = "all"): Promise<LimitState | undefined> {
-    const [leasesItem, tenantsInLine] = await Promise.all([
-      this.db("GetItem", { Key: { pk: S(item), sk: S("-") }, ConsistentRead: true }),
-      line === "none" ? [] : this.readLine(item, line === "any"),
+  // A limit's leases, from its shards, and the tenants marked as in its line: all of them,
+  // or the first ones, or none.
+  private async readLimit(limit: Limit, line: "all" | "some" | "none" = "all"): Promise<LimitState> {
+    const limits = shardsOf(limit);
+    const [items, marks] = await Promise.all([
+      Promise.all(limits.map((l) => this.db("GetItem", { Key: { pk: S(l.item), sk: S("-") }, ConsistentRead: true }))),
+      line === "none" ? [] : this.readMarks(limit.item, line === "some"),
     ]);
-    if (!leasesItem.Item) return undefined;
-    const leases: LimitState["leases"] = Object.create(null);
-    const raw: Record<string, string> = Object.create(null);
-    for (const [id, value] of Object.entries<any>(leasesItem.Item.leases?.M ?? {})) {
-      raw[id] = String(value.S);
-      leases[id] = parseLease(raw[id]);
-    }
     const tenants: Record<string, number> = Object.create(null);
-    for (const [t, v] of Object.entries<any>(leasesItem.Item.tenants?.M ?? {})) tenants[t] = Number(v.N);
-    const waiting: Record<string, number> = Object.create(null);
-    const waitingAt: Record<string, number> = Object.create(null);
-    for (const i of tenantsInLine) {
-      const t = String(i.sk.S).slice(2);
-      waiting[t] = Number(i.n?.N ?? 0);
-      waitingAt[t] = Number(i.at?.N ?? 0);
-    }
-    return { leases, raw, tenants, waiting, waitingAt, queued: Object.values(waiting).reduce((n, v) => n + Math.max(0, v), 0) };
+    const leases: Record<string, Lease> = Object.create(null);
+    const missing: Limit[] = [];
+    const shards = limits.map((l, i): ShardState => {
+      const shard: ShardState = { limit: l, leases: Object.create(null), raw: Object.create(null) };
+      const item = items[i].Item;
+      if (!item) missing.push(l);
+      for (const [id, value] of Object.entries<any>(item?.leases?.M ?? {})) {
+        shard.raw[id] = String(value.S);
+        leases[id] = shard.leases[id] = parseLease(shard.raw[id]);
+      }
+      for (const [t, v] of Object.entries<any>(item?.tenants?.M ?? {})) tenants[t] = (tenants[t] ?? 0) + Number(v.N);
+      return shard;
+    });
+    const waiting: Record<string, Mark> = Object.create(null);
+    for (const i of marks) waiting[String(i.sk.S).slice(2)] = { at: Number(i.at?.N ?? 0), lines: Number(i.n?.N ?? 1) };
+    return {
+      shards,
+      missing,
+      leases,
+      tenants,
+      waiting,
+      free: shards.reduce((n, s) => n + (missing.includes(s.limit) ? 0 : Math.max(0, s.limit.limit - Object.keys(s.leases).length)), 0),
+      rooms: () => new Map(shards.map((s) => [s.limit.item, missing.includes(s.limit) ? 0 : s.limit.limit - Object.keys(s.leases).length])),
+      copies: (id) => shards.filter((s) => s.leases[id]).map((s) => ({ shard: s.limit, lease: s.leases[id], raw: s.raw[id] })),
+    };
   }
 
-  private async readLine(item: string, any: boolean) {
+  private async readMarks(item: string, some: boolean) {
     const items: any[] = [];
     let start: any;
     do {
@@ -989,12 +1169,20 @@ export class DynamoStore implements Store {
         ExpressionAttributeValues: { ":pk": S(item), ":w": S("w#") },
         ConsistentRead: true,
         ExclusiveStartKey: start,
-        ...(any ? { Limit: 1 } : {}),
+        ...(some ? { Limit: 17 } : {}),
       });
       items.push(...(page.Items ?? []));
-      start = any ? undefined : page.LastEvaluatedKey;
+      start = some ? undefined : page.LastEvaluatedKey;
     } while (start);
     return items;
+  }
+
+  // Put some of a limit's shards in the table, where the ones it has are full. A few, at
+  // random, so steps that ask at once share the work.
+  private async createSome(state: LimitState) {
+    if (!state.missing.length || state.free > 0) return false;
+    await Promise.all(shuffle([...state.missing]).slice(0, 3).map((l) => this.createLimit(l)));
+    return true;
   }
 
   private async createLimit(limit: Limit) {
@@ -1149,22 +1337,120 @@ export class DynamoStore implements Store {
   }
 }
 
-interface LimitState {
-  leases: Record<string, { expires: number; tenant: string; granted: boolean }>;
+interface Lease {
+  expires: number;
+  tenant: string;
+  granted: boolean;
+}
+
+interface ShardState {
+  limit: Limit;
+  leases: Record<string, Lease>;
   /** Each lease's stored value, to give back only the one that was read. */
   raw: Record<string, string>;
+}
+
+/** When a tenant was marked as in a limit's line, and in how many lines. */
+interface Mark {
+  at: number;
+  lines: number;
+}
+
+/** A step's lease in a shard. */
+interface Copy {
+  shard: Limit;
+  lease: Lease;
+  raw: string;
+}
+
+interface LimitState {
+  shards: ShardState[];
+  /** The shards that aren't in the table yet. */
+  missing: Limit[];
+  /** Every lease, whichever shard it's in. */
+  leases: Record<string, Lease>;
   tenants: Record<string, number>;
-  waiting: Record<string, number>;
-  /** When each tenant's count last changed. */
-  waitingAt: Record<string, number>;
-  queued: number;
+  /** The tenants marked as in line. */
+  waiting: Record<string, Mark>;
+  /** How many more leases it has room for, in the shards that are in the table. */
+  free: number;
+  /** How many more each shard has room for. */
+  rooms(): Rooms;
+  copies(leaseId: string): Copy[];
+}
+
+type Rooms = Map<string, number>;
+
+/** The leases a grant gave: their value, and the shards they're in. */
+interface Granted {
+  value: string;
+  at: Limit[];
+}
+
+interface Grant {
+  granted?: Granted;
+  /** The limits whose lease was passed from a step that's done. */
+  passed?: Limit[];
+  /** It took some, and gave them back. */
+  undone: boolean;
+  /** Another grant got to the step first. */
+  raced: boolean;
 }
 
 /**
- * How long a tenant's count goes without a change, with no step in its line, before it's
- * taken for a stale one: far longer than it takes to join a line.
+ * How many leases of a limit are in one item: few enough that the item is 2 KB, and a
+ * write to it 2 units. Those of a limit over 500 have more, as each dispatch reads every
+ * shard.
  */
+export const SHARD_LEASES = 25;
+
+function shardCount(cap: number) {
+  if (cap <= 500) return Math.max(1, Math.ceil(cap / SHARD_LEASES));
+  return Math.min(120, 20 + Math.ceil((cap - 500) / 100));
+}
+
+/**
+ * A limit's shards, whose caps add up to it. The first one's item is the limit's, so a
+ * limit that has one, as most do, is that item.
+ */
+export function shardsOf(limit: Limit): Limit[] {
+  const n = shardCount(limit.limit);
+  if (n === 1) return [limit];
+  return Array.from({ length: n }, (_, i) => ({
+    item: i ? `${limit.item}.${i}` : limit.item,
+    limit: Math.floor(limit.limit / n) + (i < limit.limit % n ? 1 : 0),
+    label: limit.label,
+  }));
+}
+
+/**
+ * How many lines a tenant has on a limit. Of a limit with shards many steps join and leave
+ * at once, so the line is split, and a step is in the one its lease's ID says. Each is in
+ * the order its steps joined.
+ */
+function linesOf(limit: Limit) {
+  const n = shardCount(limit.limit);
+  return n === 1 ? 1 : Math.min(16, Math.ceil(n / 2));
+}
+
+function lineOf(limit: Limit, leaseId: string) {
+  const n = linesOf(limit);
+  return n === 1 ? 0 : createHash("sha256").update(leaseId).digest().readUInt32BE(0) % n;
+}
+
+function shuffle<T>(list: T[]) {
+  for (let i = list.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [list[i], list[j]] = [list[j], list[i]];
+  }
+  return list;
+}
+
+/** How long a tenant's mark is kept once its line is empty. */
 const STALE_LINE_MS = 60_000;
+
+/** How long before a mark is put again, so it outlives its line. */
+const MARK_FRESH_MS = 3_600_000;
 
 /** How long a dispatch looks for steps to wake. */
 const DISPATCH_MS = 10_000;
@@ -1178,13 +1464,9 @@ const MAX_TENANTS = 200;
  */
 export const GRANT_MS = 15 * 60_000 + 10_000;
 
-/** The line of a limit, for one tenant. */
-export function queueKey(item: string, tenant: string) {
-  return lineKey(item, tenantKey(tenant));
-}
-
-function lineKey(item: string, mapKey: string) {
-  return keyOf("Q", item, mapKey);
+/** A line of a limit, for one tenant. */
+function lineKey(item: string, tenant: string, line: number) {
+  return line ? keyOf("Q", item, tenant, line) : keyOf("Q", item, tenant);
 }
 
 /** A step's limits, each once, in the order every step takes them. */

@@ -76,9 +76,10 @@ export class MemoryStore implements Store {
     return 0;
   }
 
-  async reserve(item: string, intervalMs: number, toleranceMs: number) {
+  async reserve(item: string, intervalMs: number, toleranceMs: number, maxWaitMs = Infinity) {
     const now = this.now();
     const tat = Math.max(this.buckets.get(item) ?? now, now);
+    if (tat - toleranceMs - now > maxWaitMs) return Infinity;
     this.buckets.set(item, tat + intervalMs);
     return now + Math.max(0, tat - toleranceMs - now);
   }
@@ -164,7 +165,7 @@ export class MemoryStore implements Store {
     return "queued" as const;
   }
 
-  async dispatch(limit: Limit, wake: (w: LeaseWaiter) => Promise<boolean>, just?: string, skip = new Set<string>()) {
+  async dispatch(limit: Limit, wake: (w: LeaseWaiter) => Promise<boolean>, _joined?: LeaseWaiter, just?: string, skip = new Set<string>()) {
     const l = this.item(limit);
     let woken = 0;
     for (;;) {
@@ -224,7 +225,7 @@ export class MemoryStore implements Store {
     const inLine = (l: Limit) => [...this.item(l).lines.values()].filter((line) => line.length).length;
     const skip = new Set<string>();
     for (const l of uniqueLimits(limits).sort((a, b) => inLine(b) - inLine(a) || b.limit - a.limit))
-      await this.dispatch(l, wake, tenant, skip);
+      await this.dispatch(l, wake, undefined, tenant, skip);
   }
 
   private canGrant(w: LeaseWaiter) {

@@ -119,16 +119,21 @@ async function queueInfo(engine: Engine, url: string | undefined) {
 }
 
 async function limits(engine: Engine): Promise<LimitInfo[]> {
-  const found = await engine.store.scan("C#", MAX_SCAN);
-  // A limit is an item with its leases, and one for each tenant in its line.
+  const [found, lines] = await Promise.all([engine.store.scan("C#", MAX_SCAN), engine.store.scan("Q#", MAX_SCAN)]);
+  const queued = new Map<string, number>();
+  for (const i of lines) queued.set(String(i.limit), (queued.get(String(i.limit)) ?? 0) + 1);
+  // A limit is an item, or one for each of its shards: "C#…", "C#….1", and so on.
   const byLimit = new Map<string, Record<string, any>>();
   for (const i of found) {
-    const l = byLimit.get(String(i.pk)) ?? { queued: 0 };
-    if (String(i.sk).startsWith("w#")) l.queued += Math.max(0, Number(i.n ?? 0));
-    else Object.assign(l, i);
-    byLimit.set(String(i.pk), l);
+    if (i.leases === undefined) continue;
+    const item = String(i.pk).replace(/\.\d+$/, "");
+    const l = byLimit.get(item) ?? { pk: item, label: i.label, cap: 0, leases: {}, tenants: {}, queued: queued.get(item) ?? 0 };
+    l.cap += Number(i.cap ?? 0);
+    Object.assign(l.leases, i.leases);
+    for (const [t, n] of Object.entries<any>(i.tenants ?? {})) l.tenants[t] = (l.tenants[t] ?? 0) + Number(n);
+    byLimit.set(item, l);
   }
-  const items = [...byLimit.values()].filter((i) => i.leases !== undefined);
+  const items = [...byLimit.values()];
   const now = Date.now();
   return items.map((i) => ({
     label: String(i.label ?? i.pk),

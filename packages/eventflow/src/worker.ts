@@ -309,7 +309,7 @@ function makeStep(state: RunState) {
       // between. If they're the step's, it goes on without waiting.
       const mine = await child.step(`enqueue:${t}`, async () => {
         const at = place.joined!;
-        const result = await engine.store.enqueue({
+        const waiter = {
           leaseId,
           limits,
           tenant,
@@ -317,7 +317,8 @@ function makeStep(state: RunState) {
           runId: state.runId,
           at,
           expiresAt: Date.now() + leaseWaitSeconds(round) * 1000,
-        });
+        };
+        const result = await engine.store.enqueue(waiter);
         if (result === "held") return true;
         let mine = false;
         for (const limit of limits)
@@ -325,7 +326,7 @@ function makeStep(state: RunState) {
             if (w.callbackId !== callbackId) return wake(w);
             mine = true;
             return true;
-          });
+          }, waiter);
         return mine;
       });
       if (mine) return;

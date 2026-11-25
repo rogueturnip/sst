@@ -49,7 +49,7 @@ describe("DynamoDB errors", () => {
     calls.length = 0;
     const item = limitItem({ other: `${Date.now() + 60_000}|o1|a` });
     respond = (action, body, n) => {
-      if (action === "GetItem") return Response.json({ Item: item });
+      if (action === "GetItem") return Response.json(body.Key.sk.S === "-" ? { Item: item } : {});
       if (action === "PutItem" && n === 1) return err(400, "TransactionConflictException");
       if (action === "PutItem" || action === "UpdateItem") return Response.json({});
       throw new Error(action);
@@ -57,7 +57,7 @@ describe("DynamoDB errors", () => {
     const store = new DynamoStore("t");
     expect(await store.enqueue(waiter)).toBe("queued");
     expect(calls.filter((c) => c.action === "PutItem")).toHaveLength(2);
-    // Its count is on its tenant's item in the line, not the leases'.
+    // Its tenant's mark is an item of its own, not the leases'.
     expect(calls.filter((c) => c.action === "UpdateItem").map((c) => c.body.Key.sk.S)).toEqual(["w#b"]);
   });
 
@@ -80,7 +80,7 @@ describe("DynamoDB errors", () => {
     calls.length = 0;
     const item = limitItem({ other: `${Date.now() + 60_000}|o1|a` });
     respond = (action, body, n) => {
-      if (action === "GetItem") return Response.json({ Item: item });
+      if (action === "GetItem") return Response.json(body.Key.sk.S === "-" ? { Item: item } : {});
       if (action === "PutItem" && n === 1) return err(400, "ConditionalCheckFailedException");
       if (action === "UpdateItem" && !body.Key.sk.S.startsWith("w#")) return err(400, "ConditionalCheckFailedException");
       if (action === "PutItem" || action === "UpdateItem") return Response.json({});

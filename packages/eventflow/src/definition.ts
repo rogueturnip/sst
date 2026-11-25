@@ -230,7 +230,7 @@ function normalizeTriggers(input: FunctionOptions["triggers"], where: string): T
 }
 
 /** The largest concurrency limit. */
-export const MAX_CONCURRENCY = 1000;
+export const MAX_CONCURRENCY = 10_000;
 
 function normalizeConcurrency(input: FunctionOptions["concurrency"], where: string): Limit[] {
   if (input === undefined) return [];
@@ -239,7 +239,7 @@ function normalizeConcurrency(input: FunctionOptions["concurrency"], where: stri
   return list
     .filter((c) => c.limit !== 0)
     .map((c) => {
-      // Every lease of a limit is in one table item, which DynamoDB caps at 400 KB.
+      // Every lease of a limit's shard is in one table item, which DynamoDB caps at 400 KB.
       if (!Number.isInteger(c.limit) || c.limit < 1 || c.limit > MAX_CONCURRENCY)
         throw new TypeError(
           `The ${where} has a concurrency limit of ${c.limit}. Use a whole number from 1 to ${MAX_CONCURRENCY}.`,
