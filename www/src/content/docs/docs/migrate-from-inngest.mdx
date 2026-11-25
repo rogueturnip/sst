@@ -215,28 +215,34 @@ Every option of `createFunction()` in v4.27.0, and the step tools.
 |---|---|---|
 | `id`, `name`, `description` | Supported | |
 | `triggers`: event, `if`, cron with `TZ=` | Supported | |
-| cron `jitter` | Throws | Stagger the minute |
-| wildcard event names | Throws | List each event |
+| cron `jitter` | Supported, up to 1 hour | |
+| wildcard event names | Supported | |
 | `retries` | Supported | |
 | `concurrency` | Supported | |
 | `throttle`, `rateLimit`, `idempotency` | Supported | |
 | `onFailure` | Supported | |
 | `checkpointing`, `optimizeParallelism` | Accepted, no effect | Steps are always checkpointed |
-| `debounce` | Throws | A `step.sleep` then a check of the latest state |
-| `batchEvents` | Throws | Send one event with many items |
-| `priority` | Throws | A second function, with its own limits |
+| `debounce` | Supported, per key and tenant | |
+| `batchEvents` | Supported, per key and tenant | |
+| `priority` | Supported, for steps that wait for a concurrency limit | |
 | `cancelOn` | Supported: `event`, `match`, `if`, `timeout` | |
-| `timeouts` | Throws | `timeout.execution` on the component |
-| `singleton` | Throws | `concurrency: { limit: 1, key }` queues instead of skipping |
-| `middleware` | Throws | Wrap the handler |
+| `timeouts` | Supported | |
+| `singleton` | Supported, per key and tenant | |
+| `middleware` | Supported, without `wrapRequest` and `functions` | |
 | `step.run`, `sleep`, `sleepUntil`, `waitForEvent`, `invoke`, `sendEvent` | Supported | |
 | `group.parallel` | Runs the function | `Promise.all` of steps |
-| `step.fetch`, `step.ai`, `step.waitForSignal`, `step.sendSignal`, `step.realtime` | Throws | A `step.run` with the call |
-| `step.invoke` by function ID | Throws | Pass the function, as v4 does |
-| `ctx.attempt`, `ctx.defer`, `ctx.sessions` | Throw when read | |
+| `step.fetch`, `step.ai.infer`, `step.ai.wrap` | Supported. They wait in your Lambda | Model adapters from `@inngest/ai` |
+| `step.waitForSignal`, `step.sendSignal` | Supported, per tenant | |
+| `step.realtime` | Throws | A `step.run` that publishes to [`Realtime`](/docs/component/aws/realtime) |
+| `step.invoke` by function ID, `referenceFunction()` | Supported, in the same app | An event to another app, and a wait |
+| `ctx.attempt` | Supported. Read it as `ctx.attempt`, in the step | |
+| an error outside a step | Retries the function | |
+| `inngest/function.finished`, `.failed`, `.cancelled` | Supported, as triggers | `systemEvents` to wait for them |
+| `ctx.defer`, `ctx.sessions` | Throw when read | |
 | `ctx.maxAttempts` | Supported | |
 | `Inngest({ eventKey, signingKey, signingKeyFallback, isDev, env, appVersion, baseUrl, checkpointing, optimizeParallelism })` | Accepted, no effect | |
-| `Inngest({ middleware, schemas, logger, fetch, endpointAdapter, sessionPropagation, aiMetadata })` | Throws | `eventType()` for schemas; the context's `logger` |
+| `Inngest({ middleware, logger })` | Supported | |
+| `Inngest({ schemas, fetch, endpointAdapter, sessionPropagation, aiMetadata })` | Throws | `eventType()` for schemas |
 
 ---
 

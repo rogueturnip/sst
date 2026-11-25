@@ -169,16 +169,26 @@ flow.createFunction(
 );
 ```
 
-- **Triggers.** Up to 10. An event trigger, with an optional `if`. A cron trigger, with 5 fields, in UTC or with a `TZ=` prefix. A function without triggers can only be invoked.
+- **Triggers.** Up to 10. An event trigger, with an optional `if`. Its name can end in a wildcard, after a `/` or `.`, like `user/*`. A cron trigger, with 5 fields, in UTC or with a `TZ=` prefix, and an optional `jitter`, up to an hour, that spreads runs out. A function without triggers can only be invoked.
 - **Cron.** The schedule ticks once a minute, and each cron trigger is checked against that minute. The run ID comes from the function and the minute, so a tick that's delivered twice starts one run. A tick that's lost isn't caught up.
 - **Registration.** A function runs once it's in the list passed to `serve()`, and the EventFlow is deployed. `serve()` throws for two functions with the same ID.
-- **Unsupported options throw.** `createFunction()` throws for an option EventFlow doesn't support, like `debounce`, and for an expression it can't evaluate. It doesn't ignore them. See [what's not supported](#not-supported).
+- **Unsupported options throw.** `createFunction()` throws for an option EventFlow doesn't have, and for an expression it can't evaluate. It doesn't ignore them. See [what's not supported](#not-supported).
 
-A function's context has `event`, `events` (`[event]`), `step`, `group`, `runId` and `logger`. Reading `attempt` throws, since steps retry on their own and the handler isn't re-run for each attempt.
+A function's context has `event`, `events` (more than one with [`batchEvents`](#batches)), `step`, `group`, `runId`, `logger`, `attempt`, `maxAttempts` and `idempotencyKey`. `attempt` starts at 0: in a step it's the step's, and outside of one it's the function's. Read it where you use it, as `ctx.attempt`: taken out of the context at the top of the function, it stays the function's.
 
 ### Expressions
 
-Keys, trigger `if`s and wait `if`s are a small part of [CEL](https://cel.dev): paths like `event.data.customerId`, string, number, `true`, `false` and `null` literals, the comparisons `==`, `!=`, `<`, `<=`, `>` and `>=`, and `&&`. Anything else, like `||`, `!`, `in` or a function call, throws when the function is created. A key can also be a function: `key: (event) => event.data.customerId`.
+Keys, `if`s and `priority` are [CEL](https://cel.dev) expressions, as with Inngest:
+
+| | |
+|---|---|
+| Values | Paths like `event.data.items[0].sku` and `event.data["odd-key"]`, strings, numbers, `true`, `false`, `null`, lists |
+| Operators | `==` `!=` `<` `<=` `>` `>=` `&&` `||` `!` `+` `-` `*` `/` `%` `in` `? :` |
+| Functions | `has()` `size()` `string()` `int()` `double()` `bool()` |
+| Of strings | `contains()` `startsWith()` `endsWith()` `lowerAscii()` `upperAscii()` `trim()` `split()` `size()` |
+| Of lists | `exists()` `all()` `exists_one()` `filter()` `map()` `join()` `size()` |
+
+Anything else throws when the function is created. `matches()` isn't there: JavaScript's regular expressions can take forever on text that a sender chooses. Order only compares numbers with numbers, and strings with strings, so a string can't pass `event.data.amount > 100`. A key can also be a function: `key: (event) => event.data.customerId`.
 
 ---
 
@@ -202,7 +212,7 @@ A step that throws is retried, up to the function's `retries`, which is **4** by
 - Throw `RetryAfterError("…", "30s")` to choose when. It takes a duration, a `Date`, or a time string.
 - A step that runs out of retries throws, with the error's message. Catch it to handle the failure, or let it fail the run. `onFailure` runs when the run fails.
 
-An error thrown outside a step fails the run. It isn't retried, unlike Inngest, where the function is.
+An error thrown outside a step retries the function, up to its `retries`, with the same backoff. The steps that ended aren't run again: they return their saved results, or throw the errors they failed with. The steps in flight end first, so they aren't run twice. A sleep or a wait that hasn't ended begins again. An error that came out of a step, a `NonRetriableError`, and a step used as it can't be aren't retried: the run fails.
 
 A step is **at least once**. If the worker crashes after the step's code ran, but before its result was saved, it runs again. Make side effects idempotent with `idempotencyKey`, or run the step `atMostOnce`: see [moving money](#moving-money).
 
@@ -229,6 +239,26 @@ const [user, plan] = await Promise.all([
   step.run("plan", () => getPlan(id)),
 ]);
 ```
+
+### Signals
+
+```ts
+const approval = await step.waitForSignal("approval", { signal: `approve-${id}`, timeout: "3d" });
+
+await flow.sendSignal({ signal: `approve-${id}`, data: { by: user.id }, tenant });
+```
+
+A signal goes to the one run of its tenant that waits for its name. A second run that waits for it throws a `SignalConflictError`, or takes its place with `onConflict: "replace"`. A signal that's sent before a run waits isn't kept. `step.sendSignal()` returns the `runId` it went to, if any.
+
+### Fetch and AI
+
+```ts
+const res = await step.fetch("https://api.example.com/orders");          // a Response, saved
+const answer = await step.ai.infer("ask", { model: openai({ model: "gpt-5" }), body: { messages } });
+const summary = await step.ai.wrap("summarize", generateText, { model, prompt });
+```
+
+`step.fetch` is `fetch` as a step: the request runs in your worker, and its response, up to 700 KB, is saved. It's tried again when the request fails, not for an error status. `step.ai.infer` takes a model adapter, like those of [`@inngest/ai`](https://www.npmjs.com/package/@inngest/ai). It's tried again for a rate limit, when the provider says, or a server error. Unlike Inngest's, both wait in your Lambda, so they're billed while they do.
 
 ---
 
@@ -365,6 +395,12 @@ Flow control is set on each function. The three kinds limit different things.
 | `throttle` | Runs started per period | The run is held, and starts later | The router |
 | `rateLimit` | Runs started per period | The run is skipped | The router |
 | `idempotency` | One run per key in 24 hours | The run is skipped | The router |
+| `singleton` | One run per key at a time | The run is skipped, or the other cancelled | The router |
+| `debounce` | One run once events stop | Earlier events are replaced | The router |
+| `batchEvents` | One run for many events | The event waits for its batch | The router |
+| `timeouts` | How long a run takes to start, and to finish | The run is cancelled | The router |
+
+An event goes through them in this order: batch, rate limit, debounce, idempotency, singleton, throttle. A run that's invoked isn't debounced or batched.
 
 ### Concurrency
 
@@ -377,9 +413,10 @@ concurrency: [
 
 - **What's counted.** A step that's running its code. Sleeps, waits, invokes and the code between steps don't hold a lease, so a run that sleeps gives its place to another. Steps started together each take one.
 - **Scope.** `"fn"`, the default, counts the function's steps. `"env"` and `"account"` need a `key`, and count the steps of every function of the EventFlow with the same key value, like `key: '"openai"'` for a shared API.
-- **Up to two, of up to 1,000 each.** A step has to fit both, for example 5 per tenant and 50 in all. It takes them one at a time, always in the same order, and gives back the first if the second is full. So a step never waits holding a lease, and two steps that need two limits, like a transfer that locks both accounts, can't each hold one and wait for the other. Each write is conditioned, so a limit can't go over, and none is a transaction: on a busy limit, transactions fail each other, where plain writes take their turn. A limit's leases are one DynamoDB item, so a limit of hundreds, of short steps, is bounded by that item's writes, 1,000 units a second: it's made for limits of tens.
+- **Up to two, of up to 10,000 each.** A step has to fit both, for example 5 per tenant and 50 in all. It takes them one at a time, always in the same order, and gives back the first if the second is full. So a step never waits holding a lease, and two steps that need two limits, like a transfer that locks both accounts, can't each hold one and wait for the other. Each write is conditioned, so a limit can't go over, and none is a transaction: on a busy limit, transactions fail each other, where plain writes take their turn. A limit over 25 is split into shards, each a DynamoDB item, whose caps add up to the limit: so the writes of a wide limit aren't on one item, which takes 1,000 units a second. They share one line.
 - **Leases.** Each attempt of a step takes a lease from the table before it runs, and gives it back when it ends. A retry takes a new one. A lease expires after the worker's invocation timeout plus 10 seconds, so a crash doesn't keep it. One that's given to a step in line lasts 15 minutes until the step resumes, which makes it its own before its code runs: from then on, nothing else gives it back. A step that runs again after a crash renews its lease before its code runs, and takes a new one if it expired. A lease that expired is taken back only if it's still the one that expired, so it can't be taken from a step that just renewed it.
 - **Waiting in line.** A step that doesn't get a lease joins the line for it, and its run stops, holding no Lambda. When a lease is given back, it goes straight to the next step in line, which resumes. If that step can't be told, as when the callback API throttles, it's tried again, and then put back in line, in its place. A newcomer can't take a free lease while steps wait. A step that isn't woken in 3 minutes, as when a wake was lost, asks again, and keeps its place in line. The longer it waits, the less often it asks, up to every 15 minutes, so a long wait doesn't fill its run's history.
+- **Order.** A tenant's steps go in the order their runs' events came, so runs that have begun finish first. `priority: { run: "event.data.plan == 'pro' ? 120 : 0" }` moves a run up to 600 seconds ahead, or behind. A limit with shards gives to a few of the oldest at once, in any order.
 - **Fairness.** Each tenant has its own line. The next step is the oldest of the tenant that holds the fewest leases on the limit, then the one that's waited longest. So a tenant with a backlog of thousands can't keep the others out. The tenant is the event's `tenant`, or the value of the function's concurrency key. It looks at up to 200 tenants in line for each lease. It's best effort: it doesn't promise a latency. [Measured below](#performance).
 
 ### Throttle
@@ -405,6 +442,61 @@ idempotency: "event.data.orderId",
 ```
 
 One run per key value, per tenant, in 24 hours. Others are skipped.
+
+### Singleton
+
+```ts
+singleton: { mode: "skip", key: "event.data.accountId" },
+```
+
+One run at a time, of each key and tenant. With `"skip"`, another is skipped, and with `"cancel"`, the one that's running is cancelled. It's held while a run is held by a throttle, sleeps, or waits. A run that ended without giving it back, as when it was stopped, loses it to the next. A key that's `false` isn't a singleton.
+
+### Debounce
+
+```ts
+debounce: { period: "10s", timeout: "1m", key: "event.data.documentId" },
+```
+
+The run starts once no event came for `period`, with the last one by its `ts`, or at the latest `timeout` after the first. Each key and tenant has its own.
+
+### Batches
+
+```ts
+batchEvents: { maxSize: 100, timeout: "30s", key: "event.data.accountId" },
+```
+
+One run for up to `maxSize` events, 500 at most, or 10 MB of them, or those that came in `timeout`, in `events`. Each key and tenant has its own. Each event is in one batch, also when messages come again or a router stops part way. An event that `if` isn't true for starts a run by itself. It doesn't go with `idempotency`, `rateLimit`, `cancelOn`, `priority`, `debounce` or `singleton`, as with Inngest.
+
+### Timeouts
+
+```ts
+timeouts: { start: "10m", finish: "1h" },
+```
+
+A run that hasn't started within `start` of its event, as behind a throttle or a concurrency limit, or hasn't finished within `finish` of starting, is cancelled. A step in flight isn't interrupted. `onFailure` doesn't run.
+
+---
+
+## Middleware
+
+```ts
+import { EventFlow, Middleware } from "@sst-community/eventflow";
+
+class Tracing extends Middleware.BaseMiddleware {
+  readonly id = "tracing";
+  async wrapStepHandler({ stepInfo, next }) {
+    return tracer.startActiveSpan(stepInfo.options.id, () => next());
+  }
+}
+
+export const flow = new EventFlow({ id: "my-app", middleware: [Tracing] });
+```
+
+On the EventFlow, or on a function. It has the hooks of Inngest's: `transformFunctionInput`, `transformStepInput`, `transformSendEvent`, `wrapFunctionHandler`, `wrapStep`, `wrapStepHandler`, `wrapSendEvent`, `onRunStart`, `onRunComplete`, `onRunError`, `onStepStart`, `onStepComplete`, `onStepError` and `onMemoizationEnd`. `wrapRequest` throws, since there's no request, and `stepInfo.memoized` is `undefined` before a step runs. `wrapFunctionHandler` and `wrapStep` run each time the function replays. The run hooks are a step each, so they run once, and one more operation.
+
+## Events about runs
+
+`inngest/function.finished` is sent for each run that ends, and `inngest/function.failed` or `inngest/function.cancelled`, where a function has a trigger for one. To wait for one in a step, send them for every run with `new EventFlow({ id, systemEvents: true })`. Runs they start send none, so they don't go on forever. A run that AWS ends, as one over its execution timeout, sends none. A sender can't send events whose names start with `inngest/`.
 
 ---
 
@@ -529,7 +621,7 @@ The [AWS EventFlow use cases example](/docs/examples/#aws-eventflow-use-cases) h
 | **AI chains**: model calls as steps, limited per tenant | steps in parallel, `concurrency`, `throttle` |
 | **Human in the loop**: wait for a person to approve | `waitForEvent` with `if` |
 
-Two things Inngest's AI pages use aren't here: `step.ai.infer`, so call the model in a `step.run`, and `priority`.
+The AI pages' `step.ai.infer` and `priority` work too: see [fetch and AI](#fetch-and-ai) and [concurrency](#concurrency).
 
 ---
 
@@ -615,7 +707,8 @@ The worker is a published version. A run keeps the version it started on, throug
 | Operations per run | 30,000. A step is 1, a step with a concurrency limit 3 or more, a wait for an event 3 |
 | Step result | 1 MB |
 | Triggers per function | 10 |
-| Concurrency limits per function | 2 |
+| Concurrency limits per function | 2, of up to 10,000 |
+| Events in a batch | 500, or 10 MB |
 | Throttle delay per hold | 15 minutes; longer waits are held again |
 | Cron | Minute resolution |
 
@@ -654,6 +747,10 @@ Check [Lambda](https://aws.amazon.com/lambda/pricing/), [SQS](https://aws.amazon
 ---
 
 ## Performance
+
+:::note
+These were measured before limits were split into shards. A limit of 20, as here, is one item as before.
+:::
 
 Measured on 2026-11-24 and 25 in _ca-central-1_, with the [AWS EventFlow tenants example](/docs/examples/#aws-eventflow-tenants): its defaults, 1 GB worker, 512 MB router, batches of 10. The load came from a Lambda function in the same region. Each step that's measured records its start and end in a table, and the example's `Report` function turns them into these numbers. Times are from `send()` returning to the start of the run's first protected step, so they include the queue, the router, starting the run, its first step, and taking a lease.
 
@@ -709,12 +806,12 @@ To reproduce it, deploy the tenants example and follow its steps.
 
 ## Not supported
 
-These throw when the function is created:
+These throw, when the function is created or they're used:
 
-- `debounce`, `batchEvents`, `priority`, `timeouts`, `singleton`, `middleware`
-- a cron `jitter`, wildcard event triggers, and CEL beyond [the part EventFlow evaluates](#expressions)
-- `step.fetch`, `step.ai`, `step.waitForSignal`, `step.sendSignal`, `step.realtime`
-- `ctx.attempt`, which throws when read
-- `step.invoke()` with a function ID string, or a function of another EventFlow
+- `step.realtime`, `ctx.defer` and `ctx.sessions`
+- `matches()` in an expression
+- `step.invoke()` of a function of another EventFlow
+- middleware's `wrapRequest` and `functions`
+- the client's `fetch`, `schemas`, `internalLogger`, `endpointAdapter`, `sessionPropagation` and `aiMetadata`
 
 The [migration guide](/docs/migrate-from-inngest#compatibility) has what to use instead.
