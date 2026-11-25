@@ -56,7 +56,7 @@ jobs:
         run: npm run build
 
       - name: Test
-        run: npm test
+        run: npm test && npm run test:node
 
       - name: Test the table's contract
         run: npm run test:table

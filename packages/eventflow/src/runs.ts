@@ -1,3 +1,4 @@
+import { isMarker, placeOfError, unwrap } from "./order.js";
 import { awsFetch } from "./client.js";
 import { fat } from "./blobs.js";
 import type { Engine } from "./engine.js";
@@ -328,6 +329,8 @@ export async function rerun(
   const memoBlobs = found_ ? { ...(payload.memoBlobs ?? {}), ...found_.blobs } : undefined;
   if (memo && memoBlobs) for (const id of Object.keys(found_!.memo)) delete memoBlobs[id];
   const reused = [...Object.keys(memo ?? {}), ...Object.keys(memoBlobs ?? {})];
+  // What it was given comes before what it came to itself.
+  const memoOrder = found_ ? [...new Set([...(payload.memoOrder ?? []), ...found_.order])] : undefined;
   if (memo && Buffer.byteLength(JSON.stringify(memo)) > MAX_MEMO_BYTES)
     throw new Error(`The saved results of "${runId}" are over ${MAX_MEMO_BYTES} bytes. Replay it instead, to run every step again.`);
 
@@ -360,7 +363,7 @@ export async function rerun(
     const taken = await takeLock(engine, lockRuns, payload.lock, id, "skip");
     if (!taken) throw new Error(`Another run has the singleton of "${runId}". Rerun it once that one has ended.`);
   }
-  await engine.startRun({ ...rest, runId: id, root: payload.root ?? runId, replayOf: runId, memo, memoBlobs, at: Date.now() });
+  await engine.startRun({ ...rest, runId: id, root: payload.root ?? runId, replayOf: runId, memo, memoBlobs, memoOrder, at: Date.now() });
   return { id, replayOf: runId, reused };
 }
 
@@ -414,37 +417,54 @@ export async function cancelAll(engine: Engine, input: ListInput, registry: Map<
   return out;
 }
 
+/** Whether a step's result is in what's saved: a large one's place is, without it. */
+function isWhole(text: string | undefined) {
+  if (!text) return false;
+  return JSON.parse(text).v !== undefined || unwrap(text).place === undefined;
+}
+
 /**
  * The results of a run's top-level steps that succeeded, by step ID, from its
  * history. A retry passes them to its run, so those steps aren't run again.
  */
-export function memoFrom(events: any[]): { memo: Record<string, unknown>; blobs: Record<string, string> } {
+export function memoFrom(events: any[]): { memo: Record<string, unknown>; blobs: Record<string, string>; order: string[] } {
   const memo: Record<string, unknown> = Object.create(null);
   const blobs: Record<string, string> = Object.create(null);
+  const places: { attempt: number; seq: number; id: string }[] = [];
+  const place = (p: ReturnType<typeof unwrap>["place"]) => {
+    if (p && /^\d+$/.test(p[0])) places.push({ attempt: Number(p[0]), id: p[1], seq: p[2] });
+  };
   for (const e of events) {
     if (e.ParentId) continue;
     const name: string | undefined = e.Name;
-    if (!name || name.startsWith("sst:")) continue;
+    if (!name) continue;
     const type = String(e.EventType ?? "");
+    if (isMarker(name) && type === "StepSucceeded") place(unwrap(e.StepSucceededDetails?.Result?.Payload).place);
+    if (type === "StepFailed") place(placeOfError(e.StepFailedDetails?.Error?.Payload?.ErrorData));
+    if (name.startsWith("sst:")) continue;
     const payload = (d: any) => {
       if (d?.Result?.Truncated) throw new Error(`The result of step "${name}" is too large to reuse. Replay the run instead.`);
       const text = d?.Result?.Payload;
-      return text === undefined || text === "" ? null : JSON.parse(text);
+      if (text === undefined || text === "") return null;
+      const found = unwrap(text);
+      place(found.place);
+      return found.value ?? null;
     };
     // A large result isn't in the context's own event: it's in the one of what's in it.
     const inner = (names: RegExp, type: string) => {
       const found = events.filter((o) => o.ParentId === e.Id && o.EventType === type && names.test(String(o.Name))).pop();
       const text = found?.[`${type}Details`]?.Result?.Payload;
       if (!text) throw new Error(`The result of step "${name}" is too large to reuse. Replay the run instead.`);
-      return JSON.parse(text);
+      return unwrap(text).value ?? null;
     };
     if (type === "StepSucceeded") memo[name] = payload(e.StepSucceededDetails);
     else if (type === "WaitSucceeded") memo[name] = true;
     else if (type === "ContextSucceeded") {
       const own = /^EventFlow(Step|Wait|Invoke|Signal)$/.test(String(e.SubType));
-      const large = own && !e.ContextSucceededDetails?.Result?.Payload;
+      const large = own && !isWhole(e.ContextSucceededDetails?.Result?.Payload);
+      const whole = payload(e.ContextSucceededDetails);
       const value = !large
-        ? payload(e.ContextSucceededDetails)
+        ? whole
         : e.SubType === "EventFlowStep"
           ? inner(/^run(:|$)/, "StepSucceeded")
           : e.SubType === "EventFlowSignal"
@@ -460,7 +480,14 @@ export function memoFrom(events: any[]): { memo: Record<string, unknown>; blobs:
       else if (e.SubType === "EventFlowSignal" && !value?.conflict) memo[name] = value?.value ?? null;
     }
   }
-  return { memo, blobs };
+  places.sort((a, b) => a.attempt - b.attempt || a.seq - b.seq);
+  // Up to the first that's run again: what the function does after it may be another.
+  const order = new Set<string>();
+  for (const { id } of places) {
+    if (!(id in memo) && !(id in blobs)) break;
+    order.add(id);
+  }
+  return { memo, blobs, order: [...order] };
 }
 
 // The child contexts EventFlow makes, by their subtype.
@@ -486,7 +513,7 @@ export function toSteps(events: any[]): StepRecord[] {
   for (const e of events) {
     const type = String(e.EventType ?? "");
     const match = type.match(/^(Step|Wait|Callback|Context|ChainedInvoke)(Started|Succeeded|Failed|TimedOut|Cancelled|Stopped)$/);
-    if (!match || !e.Id) continue;
+    if (!match || !e.Id || isMarker(e.Name)) continue;
     const [, kind, phase] = match;
     let op = ops.get(e.Id);
     if (!op) {
@@ -518,7 +545,7 @@ export function toSteps(events: any[]): StepRecord[] {
       if (kind === "Context" && (e.SubType === "EventFlowStep" || e.SubType === "EventFlowInvoke")) {
         let outcome: any;
         try {
-          outcome = JSON.parse(details.Result?.Payload ?? "null");
+          outcome = unwrap(details.Result?.Payload).value;
         } catch {}
         if (outcome && outcome.ok === false) {
           op.status = "failed";

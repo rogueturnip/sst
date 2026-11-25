@@ -133,7 +133,7 @@ describe("runs", () => {
     await cluster.drain();
     const run = cluster.runOf("loop");
     await run.result;
-    expect(run.runner.getOperation("item:2").getStepDetails()?.result).toBe(2);
+    expect(run.runner.getOperation("item:2").getStepDetails()?.result).toMatchObject({ v: 2 });
   });
 
   it("runs steps started together", async () => {

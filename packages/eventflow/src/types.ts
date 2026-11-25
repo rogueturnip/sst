@@ -91,6 +91,8 @@ export interface RunPayload {
   memo?: Record<string, unknown>;
   /** Those of them that are large, by step ID: where they are. */
   memoBlobs?: Record<string, string>;
+  /** The order the function had them in, up to the first step that's run again. */
+  memoOrder?: string[];
   /** When its event came: the steps of runs that came first go first. */
   at?: number;
   /** For a run with a batch, which one. `event` is its first. */

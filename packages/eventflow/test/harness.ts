@@ -184,7 +184,14 @@ export class Cluster {
       this.callbackAttempts.set(id, attempt);
       const fail = this.callbackFails?.(id, attempt);
       if (fail) return new Response('{"__type":"TooManyRequestsException"}', { status: fail });
-      const op = await this.findCallback(id);
+      let op = await this.findCallback(id);
+      // The runner lists an operation a moment after it's saved. On AWS a callback that a run
+      // has the ID of is there.
+      for (let i = 0; !op && !this.closed.has(id) && i < 10; i++) {
+        await settle(20);
+        op = await this.findCallback(id);
+        if (op && process.env.DEBUG_HARNESS) console.error(`LATE callback, found after ${(i + 1) * 20} ms`);
+      }
       if (!op) return new Response('{"__type":"CallbackTimeoutException"}', { status: 400 });
       this.succeeded.push({ id, body });
       // Like the API, don't wait for the run. The local runner's call waits for the
@@ -258,7 +265,7 @@ export class Cluster {
       for (let a = 1; a <= 3; a++)
         for (let l = 0; l <= 2; l++) for (let n = 0; n < 8; n++) names.push(`queued:${a}.${l}.${n}`);
       for (const name of names) {
-        for (let i = 0; i < 4; i++) {
+        for (let i = 0; i < 60; i++) {
           try {
             const op = run.runner.getOperationByNameAndIndex(name, i);
             const details = op.getCallbackDetails();
@@ -266,7 +273,7 @@ export class Cluster {
               this.closed.add(id);
               return op;
             }
-          } catch (e) { if (process.env.DEBUG_HARNESS) console.log("findCallback", name, i, String(e).slice(0, 120)); }
+          } catch (e) {  }
         }
       }
     }

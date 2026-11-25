@@ -127,7 +127,10 @@ export interface SignalWait {
 }
 
 /** A step's result, or the error it failed with. */
-export type Memo = { v: unknown } | { e: { name: string; message: string } };
+export type Memo = ({ v: unknown } | { e: { name: string; message: string } }) & {
+  /** Its place in the order the function had them. */
+  o?: number;
+};
 
 export interface Store {
   /**

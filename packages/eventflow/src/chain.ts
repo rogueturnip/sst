@@ -1,19 +1,18 @@
 import { AsyncLocalStorage } from "async_hooks";
+import type { Grace } from "./invocation.js";
 
 // Which step call led to which, in a function. A branch of one, as in
 // `Promise.all([a(), b()])`, is an async function, and it keeps its async context: a step
 // that's called puts its own there, and the next one called after it, in that branch, finds
-// it. So a call's place in the chains is the same each time the function is replayed,
-// whatever finishes first.
-//
-// A step ID that's used more than once is numbered in the order it's used. That's the same
-// each time only where one use led to the other: in a loop, or a list that's started at once.
-// In two branches that run at once it's whichever comes first, so then it's refused.
+// it. One that isn't found may have led to it still, as from a function that's called and
+// awaited: it only ever says yes.
 
 interface Link {
   owner: object;
   parent?: Link;
   depth: number;
+  /** What the function has left of the time after it. */
+  grace?: Grace;
 }
 
 const links = new AsyncLocalStorage<Link>();
@@ -32,6 +31,12 @@ export function led(to: Link, from: Link) {
   let l: Link | undefined = to;
   while (l && l.depth > from.depth) l = l.parent;
   return l === from;
+}
+
+/** The last step call before here. */
+export function lastLink(owner: object): Link | undefined {
+  const current = links.getStore();
+  return current?.owner === owner ? current : undefined;
 }
 
 /** Run a function's attempt, with chains of its own. */

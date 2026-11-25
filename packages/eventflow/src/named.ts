@@ -1,5 +1,6 @@
 import type * as durable from "@aws/durable-execution-sdk-js";
 import { createHash } from "crypto";
+import { isMarker } from "./order.js";
 
 // Operations by name, not by the order they're called in.
 //
@@ -29,7 +30,7 @@ export interface Replay {
 /** What a run had done, as an invocation of it begins. */
 export function replayOf(ctx: durable.DurableContext): Replay {
   const ops = Object.values(((ctx as any)._executionContext?._stepData ?? {}) as Record<string, any>);
-  const ahead = new Set<string>(ops.filter((o) => o?.Id && !o.ParentId && o.Type !== "EXECUTION").map((o) => o.Id));
+  const ahead = new Set<string>(ops.filter((o) => o?.Id && !o.ParentId && o.Type !== "EXECUTION" && !isMarker(o.Name)).map((o) => o.Id));
   return { on: ahead.size > 0, ahead };
 }
 
@@ -37,6 +38,8 @@ export interface NamedContext {
   readonly raw: durable.DurableContext;
   /** Whether an operation is done, and its result saved. */
   saved(name: string): boolean;
+  /** Whether an operation was begun already. */
+  known(name: string): boolean;
   readonly lambdaContext: durable.DurableContext["lambdaContext"];
   step<T>(name: string, fn: durable.StepFunc<T>, config?: durable.StepConfig<T>): durable.DurablePromise<T>;
   wait(name: string, duration: durable.Duration): durable.DurablePromise<void>;
@@ -91,6 +94,7 @@ export function named(ctx: durable.DurableContext, replay: Replay): NamedContext
   const context: NamedContext = {
     raw: ctx,
     saved: (name) => c._executionContext.getStepData(idOf(name))?.Status === "SUCCEEDED",
+    known: (name) => c._executionContext.getStepData(idOf(name)) !== undefined,
     lambdaContext: ctx.lambdaContext,
     step: (name, fn, config) => at(name, () => ctx.step(name, fn, config)),
     wait: (name, duration) => at(name, () => ctx.wait(name, duration)),

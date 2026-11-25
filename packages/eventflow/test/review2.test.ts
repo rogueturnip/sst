@@ -29,20 +29,21 @@ const one = async (options: any, handler: any, client: any = {}) => {
 };
 
 describe("a step ID in two branches", () => {
-  it("is refused, not guessed", async () => {
+  it("is each one's, whichever is faster", async () => {
     for (const speeds of [[150, 5], [5, 150]]) {
       const calls: string[] = [];
       const c = await one({ retries: 2 }, async ({ step }: any) => {
         const branch = async (who: string, ms: number) => {
           await step.run(`check-${who}`, () => settle(ms));
-          return step.run("charge", () => (calls.push(who), `charged ${who}`));
+          const charged = await step.run("charge", () => (calls.push(who), `charged ${who}`));
+          await step.sleep(`pause-${who}`, "1s");
+          return charged;
         };
         return Promise.all([branch("alice", speeds[0]), branch("bob", speeds[1])]);
       });
       const r = await st(c.runOf("f"));
-      expect(r.s).toBe(ExecutionStatus.FAILED);
-      expect(r.e.errorMessage).toContain("two branches");
-      expect(calls.length).toBeLessThanOrEqual(1);
+      expect(r.v).toEqual(["charged alice", "charged bob"]);
+      expect(calls.sort()).toEqual(["alice", "bob"]);
     }
   }, 30_000);
 

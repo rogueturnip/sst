@@ -41,6 +41,7 @@
     "prepack": "npm run build",
     "typecheck": "tsc --noEmit",
     "test": "./scripts/test.sh",
+    "test:node": "npm run build && node test/node/order.mjs",
     "test:table": "./scripts/test-table.sh"
   },
   "peerDependencies": {

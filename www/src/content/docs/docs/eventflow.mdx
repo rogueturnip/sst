@@ -219,7 +219,13 @@ A step is **at least once**. If the worker crashes after the step's code ran, bu
 
 ### IDs
 
-A step is found by its ID, as with Inngest, so branches that run at once can finish in any order. Used more than once, as in a loop, an ID gets the suffixes `:1`, `:2`, … in the order it's used. Give the steps of branches that run at once IDs of their own, like `` `charge-${order.id}` ``. One ID in two branches throws, where Inngest numbers them by which comes first: that can change when the run goes on later, and then one branch would get the other's result, and its idempotency key. A loop, a list of steps started together, and a race that's run again are fine. A run stays on the version it started on: see [deploying](#deploying).
+A step is found by its ID, as with Inngest, so branches that run at once can finish in any order. Used more than once, as in a loop, an ID gets the suffixes `:1`, `:2`, … in the order it's used.
+
+A function is given its steps' results one at a time, and the order is saved with them. A replay gives them in the same order, so what depends on which step finished first is decided once: a `Promise.race` of a payment and a sleep, results handled as they come, a limiter, or two branches that use one ID. A failed function's next attempt has the same order too.
+
+What isn't in a step has no order. Where branches that run at once do other work, like a `fetch` outside of a step, and then use one ID, which is which depends on that work, and can be another on a replay. The run fails when it's seen, which is when the first is still running, and otherwise one branch can get the other's result. Do the work in a step, or give the steps IDs of their own, like `` `charge-${order.id}` ``. When a replay doesn't call the step that's next in the order, as its code was removed, the results after it wait 5 seconds for it. Then the function goes on without it, with a warning in the logs.
+
+A run stays on the version it started on: see [deploying](#deploying).
 
 ### Sleep
 
@@ -228,7 +234,7 @@ await step.sleep("wait-a-day", "1d");
 await step.sleepUntil("wait-for-launch", "2027-01-01T09:00:00Z");
 ```
 
-A duration is a number of milliseconds or a string like `"30s"`, `"5m"`, `"2h"`, `"1d"` or `"1w"`. It's rounded up to whole seconds. A sleeping run costs nothing, and can sleep until its [execution timeout](/docs/component/aws/eventflow#timeout).
+A sleep takes two of a run's durable operations: one to sleep, and one that saves when it ended, in the order of the function's steps. A duration is a number of milliseconds or a string like `"30s"`, `"5m"`, `"2h"`, `"1d"` or `"1w"`. It's rounded up to whole seconds. A sleeping run costs nothing, and can sleep until its [execution timeout](/docs/component/aws/eventflow#timeout).
 
 ### Parallel steps
 
@@ -774,9 +780,9 @@ The table and the functions are billed by use. These are estimates from AWS's pr
 | SQS | send, receive and delete, in batches of 10 | $0.0000005 |
 | DynamoDB | event ID write, waits read | $0.0000008 |
 | Router | a tenth of an invocation, 512 MB | $0.0000003 |
-| Durable operations | start, 2 steps, sleep: 4 × $8 per million | $0.000032 |
+| Durable operations | start, 2 steps, 2 for the sleep: 5 × $8 per million | $0.00004 |
 | Worker | 2 invocations, 1 GB, about 100 ms each | $0.0000037 |
-| **Total** | | **about $0.00004** |
+| **Total** | | **about $0.000045** |
 
 What flow control and waits add:
 

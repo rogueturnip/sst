@@ -13,6 +13,7 @@ import { callRunId, hash, key, runId as makeRunId } from "./ids.js";
 import { Hooks } from "./middleware.js";
 import { publish, type TopicRef } from "./realtime.js";
 import { named, replayLogger, replayOf, type Replay } from "./named.js";
+import { Failed, Order, ORDER, placesOf } from "./order.js";
 import { keyed, sign, verify } from "./sign.js";
 import type { LeaseWaiter, Limit, Memo } from "./store.js";
 import { sendSystemEvents, wantedSystemEvents } from "./system.js";
@@ -255,8 +256,18 @@ interface RunState {
   inv: Invocation;
   /** The step names that are taken. */
   used: Set<string>;
-  /** The last call of each step ID that's used, for which led to which. */
-  calls: Map<string, Link>;
+  /** The order in which the function is given its steps' results. */
+  order: Order;
+  /** The last call of each step ID that's used, and whether the function has its result. */
+  calls: Map<string, Call>;
+  /** The step that was called last, as it's called. */
+  calling?: Call;
+  /** The function is used as it can't be: it fails, whatever it does about that. */
+  refuse: (error: UsageError) => void;
+  /** How the function ended is decided: none of its steps start their code any more. */
+  ended: { now: boolean };
+  /** Its steps of which the code runs now. */
+  running: Set<Promise<unknown>>;
   /** A step's place, where it's been claimed already. */
   claimed?: Claim;
   /** The sessions its events share, for what it sends. */
@@ -277,6 +288,12 @@ interface Deferred {
   fn: string;
   data: unknown;
   sessions?: Record<string, string>;
+}
+
+interface Call {
+  link: Link;
+  name: string;
+  given: boolean;
 }
 
 interface Claim {
@@ -305,16 +322,26 @@ function claim(state: RunState, input: StepInput): Claim {
   if (state.claimed) return state.claimed;
   const first = state.counts.size === 0;
   const id = stepId(input);
+  const { order } = state;
   const at = link(state);
+  // Of which result it came, so the invocation needn't wait for more of that.
+  state.inv.came(order.fresh ? order.grace : at.parent?.grace);
   const before = state.calls.get(id);
-  // Which of two branches uses an ID first is whichever is faster, and on a replay may be
-  // the other: then one would get the other's result, and its idempotency key.
-  if (before && !led(at, before))
-    throw new UsageError(
-      `The step ID "${id}" is used in two branches that run at once, so which is which can't be told when the run goes on later. Give each an ID of its own, like \`${id}-\${item.id}\`.`,
+  // The results come in the same order each time, and so does what comes of them at once. Not
+  // what comes of other work in the function, between its steps: which of two branches uses an
+  // ID first is whichever's work is faster, and on a replay may be the other's. Then one would
+  // get the other's result, and its idempotency key.
+  if (before && !before.given && !order.fresh && !led(at, before.link)) {
+    const error = new UsageError(
+      `The step ID "${id}" is used in two branches that run at once, after work that isn't in a step, so which is which can't be told when the run goes on later. Do that work in a step, or give each an ID of its own, like \`${id}-\${item.id}\`.`,
     );
-  state.calls.set(id, at);
-  return { id: occurrence(state, id), first };
+    state.refuse(error);
+    throw error;
+  }
+  const call = { link: at, name: occurrence(state, id), given: false };
+  state.calls.set(id, call);
+  state.calling = call;
+  return { id: call.name, first };
 }
 
 /** The sessions that all of a run's events are in. */
@@ -464,11 +491,12 @@ function makeStep(state: RunState) {
   // `place.joined` is when the step first joined the line, so asking again, or after
   // a lease was lost, keeps its place. It comes from a step's result, so a replay has
   // the same.
-  const takeLeases = async (child: durable.DurableContext, leaseId: string, tag: string, place: { joined?: number }): Promise<string[] | undefined> => {
+  const takeLeases = async (child: durable.DurableContext, leaseId: string, tag: string, place: { joined?: number }, again: boolean): Promise<string[] | undefined> => {
     for (let round = 0; ; round++) {
       const t = `${tag}.${round}`;
       const got = await child.step(`lease:${t}`, async (c) => {
-        const first = round === 0 && c.attempt === 1;
+        // It may have asked before it was saved, where the worker stopped.
+        const first = round === 0 && c.attempt === 1 && !again;
         const result = await engine.store.acquire(limits, leaseId, tenant, leaseMs(), first).catch((error) => {
           log("warn", "Failed to ask for a lease. Joining the line.", { run: state.runId, error: errorInfo(error).message });
           return "full" as const;
@@ -535,7 +563,30 @@ function makeStep(state: RunState) {
     if (inv.over) return never();
     await state.start();
     if (inv.over) return never();
-    return stepKeys.run({ key: keyFor(id), attempt: attempt - 1 }, async () => fn());
+    // It was waiting, for its next try or its lease, as the function failed. What's done about
+    // that, like a refund, may have been done.
+    if (state.ended.now) throw new NonRetriableError("The function ended before this step ran.");
+    const work = stepKeys.run({ key: keyFor(id), attempt: attempt - 1 }, async () => fn());
+    const over = () => void state.running.delete(work);
+    state.running.add(work);
+    work.then(over, over);
+    return work;
+  };
+
+  const delayOf = (id: string, attempt: number) => (error: unknown) =>
+    retryDelay(error, attempt, def.retries, `${state.runId}\n${id}\n${attempt}`);
+  // A step's last error is saved with its place in the order, as a result is.
+  const failing = async <T>(id: string, delay: (error: unknown) => number | undefined, fn: () => Promise<T>): Promise<T> => {
+    try {
+      return await fn();
+    } catch (error) {
+      if (isDurableInternal(error) || delay(error) !== undefined) throw error;
+      throw state.order.failed(id, error);
+    }
+  };
+  const retrying = (id: string) => (error: unknown, attempt: number) => {
+    const delay = error instanceof Failed ? undefined : delayOf(id, attempt)(error);
+    return delay === undefined ? { shouldRetry: false } : { shouldRetry: true, delay: toDurableSeconds(delay) };
   };
 
   const run = <T>(idInput: StepInput, fn: (...args: any[]) => T | Promise<T>, ...args: any[]): Promise<T> => {
@@ -553,20 +604,19 @@ function makeStep(state: RunState) {
     if (!limits.length) {
       if (once)
         return eager(
-          ctx.step(id, async (c) => jsonify(await inStep(id, c.attempt, () => fn(...args))), {
+          ctx.step(id, (c) => failing(id, () => undefined, async () => jsonify(await inStep(id, c.attempt, () => fn(...args)))), {
             semantics: durable.StepSemantics.AtMostOncePerRetry,
             retryStrategy: () => ({ shouldRetry: false }),
             subType: ONCE,
+            serdes: state.order.serdes(id),
           }),
         ).catch((error) => {
           throw isInterruption(error) ? new StepFailedError(id, interrupted(id)) : error;
         }) as Promise<T>;
       return eager(
-        ctx.step(id, async (c) => jsonify(await inStep(id, c.attempt, () => fn(...args))), {
-          retryStrategy: (error, attempt) => {
-            const delay = retryDelay(error, attempt, def.retries, `${state.runId}\n${id}\n${attempt}`);
-            return delay === undefined ? { shouldRetry: false } : { shouldRetry: true, delay: toDurableSeconds(delay) };
-          },
+        ctx.step(id, (c) => failing(id, delayOf(id, c.attempt), async () => jsonify(await inStep(id, c.attempt, () => fn(...args)))), {
+          retryStrategy: retrying(id),
+          serdes: state.order.serdes(id),
         }),
       ) as Promise<T>;
     }
@@ -574,6 +624,7 @@ function makeStep(state: RunState) {
     // With a concurrency limit, each attempt takes its leases first, and gives them
     // back when it ends. A step that waits for a lease, or for its next attempt, holds
     // none, as with Inngest.
+    const again = ctx.known(id);
     return eager(
       ctx.runInChildContext(
         id,
@@ -585,7 +636,7 @@ function makeStep(state: RunState) {
               // The lease's ID comes from the run, the step and the attempt, so a lease
               // step that's retried asks for the same lease.
               const leaseId = `${hash(`${state.runId}\n${state.namespace}\n${state.attempt}\n${id}`, 12)}.${attempt}.${lost}`;
-              const placed = await takeLeases(child, leaseId, `${attempt}.${lost}`, place);
+              const placed = await takeLeases(child, leaseId, `${attempt}.${lost}`, place, again);
               const outcome = await child.step(
                 attempt === 1 && lost === 0 ? "run" : `run:${attempt}.${lost}`,
                 async () => {
@@ -640,7 +691,7 @@ function makeStep(state: RunState) {
             }
           }
         },
-        { subType: "EventFlowStep" },
+        { subType: "EventFlowStep", serdes: state.order.serdes(id), summaryGenerator: state.order.summary(id) },
       ),
     ).then((outcome) => {
       // An error thrown in a child context comes out as a ChildContextError, so the
@@ -735,7 +786,7 @@ function makeStep(state: RunState) {
             throw error;
           }
         },
-        { subType: "EventFlowWait" },
+        { subType: "EventFlowWait", serdes: state.order.serdes(id), summaryGenerator: state.order.summary(id) },
       ),
     ).then((e: any) => {
       // Only its event answers it.
@@ -790,7 +841,7 @@ function makeStep(state: RunState) {
           await child.step("stop-listening", async () => engine.store.signalFree(item, callbackId));
           return { value };
         },
-        { subType: "EventFlowSignal" },
+        { subType: "EventFlowSignal", serdes: state.order.serdes(id), summaryGenerator: state.order.summary(id) },
       ),
     ).then((outcome: any) => {
       if (outcome.conflict) throw new SignalConflictError(options.signal);
@@ -901,7 +952,7 @@ function makeStep(state: RunState) {
             throw error;
           }
         },
-        { subType: "EventFlowInvoke" },
+        { subType: "EventFlowInvoke", serdes: state.order.serdes(id), summaryGenerator: state.order.summary(id) },
       ),
     ).then((outcome: InvokeOutcome) => {
       if (!outcome.ok) throw new InvokeFailedError(outcome.error.message, target);
@@ -935,20 +986,15 @@ function makeStep(state: RunState) {
       eager(
         ctx.step(
           id,
-          async (c) => {
+          (c) => failing(id, delayOf(id, c.attempt), async () => {
             if (!state.hooks.any) return send(list);
             const info = state.hooks.info(id, undefined, "sendEvent", undefined, false);
             return handledWith(state, info, c.attempt, async () => {
               const { events } = await state.hooks.transform("transformSendEvent", { events: list.map((e) => ({ ...e })) });
               return state.hooks.wrap("wrapSendEvent", { events }, () => send(events));
             }) as Promise<{ ids: string[] }>;
-          },
-          {
-            retryStrategy: (error, attempt) => {
-              const delay = retryDelay(error, attempt, def.retries, `${state.runId}\n${id}\n${attempt}`);
-              return delay === undefined ? { shouldRetry: false } : { shouldRetry: true, delay: toDurableSeconds(delay) };
-            },
-          },
+          }),
+          { retryStrategy: retrying(id), serdes: state.order.serdes(id) },
         ),
       ),
     );
@@ -983,7 +1029,7 @@ function makeStep(state: RunState) {
           const told = await engine.callback(callbackId, { signal: options.signal, data: options.data ?? null });
           await engine.store.signalFree(item, callbackId);
           return { runId: told || wait?.callbackId !== callbackId ? runId : undefined };
-        }),
+        }, { serdes: state.order.serdes(id) }),
       ),
     ).then((r: any) => ({ runId: r?.runId ?? undefined }));
   };
@@ -1061,7 +1107,6 @@ function withMiddleware(state: RunState): Record<string, any> {
       const handler = takesInput
         ? (...a: any[]) => handledWith(state, given, (stepKeys.getStore()?.attempt ?? 0) + 1, () => fn(...a))
         : undefined;
-      state.inv.given();
       return hooks.wrap("wrapStep", { ctx: state.args, stepInfo: given }, () =>
         takesInput ? call(options, handler, ...args) : call(options, ...args),
       );
@@ -1125,17 +1170,14 @@ function told(state: RunState, tools: Record<string, any>): Record<string, any> 
     const called = (...args: any[]) => {
       // A step in a step isn't one: it would be found in no history.
       if (stepKeys.getStore()) throw new UsageError("A step can't be called in another step. Call it in the function.");
-      state.inv.came();
+      state.calling = undefined;
       const answer = fn(...args);
-      return typeof answer?.then !== "function"
-        ? answer
-        : answer.then(
-            (v: any) => (state.inv.given(), v),
-            (e: any) => {
-              state.inv.given();
-              throw e;
-            },
-          );
+      const call = state.calling as Call | undefined;
+      if (!call || typeof answer?.then !== "function") return answer;
+      return state.order.give(call.name, answer, (grace) => {
+        call.given = true;
+        call.link.grace = grace;
+      });
     };
     return Object.assign(called, { config: fn.config ? () => called : undefined });
   };
@@ -1390,37 +1432,64 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
       for (const [id, blob] of Object.entries(payload.memoBlobs ?? {})) memo[id] = new BlobMemo(blob);
       return memo;
     };
-    const newState = (more: Partial<RunState>): RunState => ({
-      ctx,
-      engine,
-      def,
-      registry,
-      runId,
-      event,
-      memo: given(),
-      // The root is signed with the payload. A payload from before roots is its own.
-      root: payload.root ?? payload.runId,
-      namespace: "",
-      counts: new Map(),
-      at: payload.at,
-      attempt: 0,
-      done: Object.create(null),
-      busy: new Set(),
-      invokes: new Set(),
-      fence: { down: false },
-      replay,
-      inv,
-      used: new Set(),
-      calls: new Map(),
-      sessions: shared,
-      defers,
-      deferCounts: new Map(),
-      deferUsed: new Set(),
-      start,
-      hooks,
-      settled: async () => {},
-      ...more,
-    });
+    const places = placesOf(ctx);
+    // A retry's steps come in the order they had in the run it retries, up to the first that
+    // it runs again. What comes after that may be another.
+    const givenOrder = (memo: Record<string, unknown>) => {
+      const strict = (payload.memoOrder ?? []).filter((id) => Object.prototype.hasOwnProperty.call(memo, id));
+      return { order: [...new Set([...strict, ...Object.keys(memo)])], strict: strict.length };
+    };
+    // Its steps' results, with their places.
+    const placed = (state: RunState): Record<string, Memo> =>
+      Object.assign(
+        Object.create(null),
+        Object.fromEntries(Object.entries(state.done).map(([id, m]) => [id, { ...m, o: state.order.seqOf(id) }])),
+      );
+    const newState = (more: Partial<RunState> & { scope: string; earlier?: string[]; strict?: number }): RunState => {
+      const { scope, earlier = [], strict = 0, ...rest } = more;
+      const state: RunState = {
+        ctx,
+        engine,
+        def,
+        registry,
+        runId,
+        event,
+        memo: given(),
+        // The root is signed with the payload. A payload from before roots is its own.
+        root: payload.root ?? payload.runId,
+        namespace: "",
+        counts: new Map(),
+        at: payload.at,
+        attempt: 0,
+        done: Object.create(null),
+        busy: new Set(),
+        invokes: new Set(),
+        fence: { down: false },
+        replay,
+        inv,
+        used: new Set(),
+        calls: new Map(),
+        sessions: shared,
+        defers,
+        deferCounts: new Map(),
+        deferUsed: new Set(),
+        start,
+        hooks,
+        settled: async () => {},
+        ended: { now: false },
+        running: new Set(),
+        refuse: () => {},
+        order: undefined as any,
+        ...rest,
+      };
+      state.order = new Order(inv, scope, places.get(scope), earlier, strict, (name, place) =>
+        named(state.ctx, replay).step(name, async () => {
+          const [s, id, seq] = place();
+          return { [ORDER]: [s, id, seq] };
+        }, LEASING),
+      );
+      return state;
+    };
 
     const makeArgs = (forState: RunState, extra: Record<string, unknown> = {}) => {
       const args: Record<string, unknown> = {
@@ -1542,10 +1611,17 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
       }
 
       // An attempt of the function. It's in a virtual context, which costs no operation.
-      const attempt = async (n: number, memo: Record<string, unknown>) => {
+      const attempt = async (n: number, memo: Record<string, unknown>, earlier: string[], strict: number) => {
         // What an attempt that failed deferred, the next does again, if it comes to it.
         defers.clear();
-        const state = newState({ memo, attempt: n });
+        const state = newState({ memo, attempt: n, scope: `${n}`, earlier, strict });
+        const refused = new Promise<never>((_, reject) => {
+          state.refuse = (error) => {
+            state.fence.down = true;
+            reject(error);
+          };
+        });
+        refused.catch(() => {});
         state.settled = () => (settled ??= hooks.tell("onMemoizationEnd", { ctx: state.args }));
         let outcome: Outcome | undefined;
         await root.runInChildContext(
@@ -1560,7 +1636,9 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
                 args = (await hooks.transform("transformFunctionInput", { ctx: args, steps: {} })).ctx;
                 state.args = args;
               }
-              const value = await hooks.wrap("wrapFunctionHandler", { ctx: args }, async () => unlinked(() => entry.handler(args)));
+              const value = await hooks.wrap("wrapFunctionHandler", { ctx: args }, async () => Promise.race([unlinked(() => state.order.begin(async () => entry.handler(args))), refused]));
+              // Also where the function did something about it.
+              if (state.fence.down) await refused;
               if (hooks.any) await state.settled();
               outcome = { ok: true, value: jsonify(value) };
             } catch (error) {
@@ -1572,6 +1650,7 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
         );
         // It has ended, however it did: its branches that go on start nothing more.
         state.fence.down = true;
+        state.order.close();
         return { state, outcome: outcome! };
       };
 
@@ -1580,14 +1659,18 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
       const failures =
         def.retries > 0 ? await read(inv, ctx.lambdaContext, "how the run's attempts failed", () => engine.store.failures(payload.runId), false) : [];
       const memo = given();
+      let { order: earlier, strict } = givenOrder(memo);
       for (let n = 0; ; n++) {
         let failure = failures.find((f) => f.attempt === n);
         let state: RunState | undefined;
         let error: unknown;
         if (failure) error = Object.assign(new Error(failure.error.message), { name: failure.error.name });
         else {
-          const tried = await attempt(n, { ...memo });
-          if (tried.outcome.ok) return tried.outcome;
+          const tried = await attempt(n, { ...memo }, earlier, strict);
+          if (tried.outcome.ok) {
+            tried.state.ended.now = true;
+            return tried.outcome;
+          }
           ({ state } = tried);
           error = tried.outcome.error;
         }
@@ -1598,17 +1681,26 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
             error instanceof InvokeFailedError ||
             (error !== null && typeof error === "object" && fromStep.has(error)));
         let delayMs = failure ? failure.delayMs : final ? undefined : retryDelay(error, n + 1, def.retries, `${runId}\n${n}`);
+        let waited = false;
         if (!failure && delayMs !== undefined && !(await quiet(state!))) {
+          waited = true;
           log("warn", "A step of the function didn't end after the function failed, so it isn't tried again.", { run: runId });
           delayMs = undefined;
         }
         const last = delayMs === undefined;
+        // Nothing of the function starts any more, and what runs ends, before what's done about
+        // its failure.
+        if (last && state) {
+          state.ended.now = true;
+          if (state.running.size && !waited)
+            await inv.hold(() => Promise.race([Promise.allSettled([...state!.running]), new Promise((r) => setTimeout(r, 60_000).unref?.())]));
+        }
         if (hooks.has("onRunError"))
           await root.step(`sst:onRunError:${n}`, async () => hooks.tell("onRunError", { ctx: state?.args, error, isFinalAttempt: last }));
         if (delayMs === undefined) return { ok: false, error };
         if (!failure) {
           log("warn", "The function failed outside a step. It's tried again.", { run: runId, attempt: n + 1, error: errorInfo(error).message });
-          failure = { attempt: n, error: errorInfo(error), delayMs, memo: { ...state!.done } };
+          failure = { attempt: n, error: errorInfo(error), delayMs, memo: placed(state!) };
           const kept = failure;
           await read(inv, ctx.lambdaContext, "how the run's attempt failed", () => engine.store.putFailure(payload.runId, kept, ttlMs + 86_400_000), false);
         }
@@ -1616,6 +1708,11 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
         // What every attempt's steps returned, not just the last's: one that failed early
         // didn't come to all of them.
         for (const [id, m] of Object.entries(failure.memo)) memo[id] = "v" in m ? m.v : new FailedMemo(m.e);
+        // In the order it had them, and then those it was never given.
+        const had = Object.entries(failure.memo).sort(([, a], [, b]) => (a.o ?? Infinity) - (b.o ?? Infinity));
+        earlier = [...new Set([...earlier.slice(0, strict), ...had.filter(([, m]) => m.o !== undefined).map(([id]) => id)])];
+        strict = earlier.length;
+        earlier = [...new Set([...earlier, ...Object.keys(memo)])];
       }
     };
 
@@ -1693,7 +1790,7 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
       try {
         await root.runInChildContext("onFailure", async (child) => {
           const ts = await child.step("sst:failed-at", async () => Date.now());
-          const state = newState({ ctx: child, memo: Object.create(null), namespace: "onFailure", start: async () => {} });
+          const state = newState({ ctx: child, memo: Object.create(null), namespace: "onFailure", scope: "onFailure", start: async () => {} });
           const args = makeArgs(state, {
             error,
             event: {
@@ -1704,7 +1801,21 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
             },
           });
           state.args = args;
-          await unlinked(() => def.onFailure!(args));
+          const refused = new Promise<never>((_, reject) => {
+            state.refuse = (error) => {
+              state.fence.down = true;
+              reject(error);
+            };
+          });
+          refused.catch(() => {});
+          try {
+            await Promise.race([unlinked(() => state.order.begin(async () => def.onFailure!(args))), refused]);
+            if (state.fence.down) await refused;
+          } finally {
+            state.fence.down = true;
+            state.ended.now = true;
+            state.order.close();
+          }
         });
       } catch (failure) {
         if (isDurableInternal(failure)) throw failure;
