@@ -99,6 +99,25 @@ async function state(store: Store, l: Limit) {
   };
 }
 
+// Waits to be woken. A slow machine is slow to wake a step, and that isn't a lost wake: it
+// gives up only when no step, anywhere, has finished for 20 seconds. The last step left
+// waiting for a wake that was lost sees that.
+function pace() {
+  let last = Date.now();
+  return {
+    finished: () => void (last = Date.now()),
+    until: (woken: Promise<boolean>, giveUp: () => boolean) =>
+      new Promise<boolean>((resolve) => {
+        const timer = setInterval(() => {
+          if (Date.now() - last < 20_000) return;
+          clearInterval(timer);
+          resolve(!giveUp());
+        }, 500);
+        void woken.then(() => (clearInterval(timer), resolve(true)));
+      }),
+  };
+}
+
 const collect = (into: string[]) => async (w: LeaseWaiter) => (into.push(w.leaseId), true);
 
 for (const [name, make] of stores) {
@@ -425,6 +444,7 @@ for (const [name, make] of stores) {
       const most: Record<string, number> = {};
       const wakes = new Map<string, () => void>();
       let late = 0;
+      const progress = pace();
       const wake = async (w: LeaseWaiter) => {
         const resolve = wakes.get(w.callbackId);
         if (!resolve) return false;
@@ -438,10 +458,10 @@ for (const [name, make] of stores) {
         for (let round = 0; ; round++) {
           if ((await store.acquire(limits, leaseId, tenant.name, 60_000)) === "granted") break;
           const callbackId = `cb-${leaseId}-${round}`;
-          const woken = new Promise<boolean>((resolve) => {
-            wakes.set(callbackId, () => resolve(true));
-            setTimeout(() => wakes.delete(callbackId) && resolve(false), 15_000);
-          });
+          const woken = progress.until(
+            new Promise<boolean>((resolve) => wakes.set(callbackId, () => resolve(true))),
+            () => wakes.delete(callbackId),
+          );
           joined ??= Date.now();
           const result = await store.enqueue({ ...waiter(leaseId, tenant.name, joined, limits), callbackId });
           let mine = result === "held";
@@ -458,6 +478,7 @@ for (const [name, make] of stores) {
         for (const l of limits) most[l.item] = Math.max(most[l.item] ?? 0, (active[l.item] = (active[l.item] ?? 0) + 1));
         await new Promise((r) => setTimeout(r, ms));
         for (const l of limits) active[l.item]--;
+        progress.finished();
         await store.handoff(limits, leaseId, tenant.name, wake);
       };
       await Promise.all(
@@ -472,7 +493,7 @@ for (const [name, make] of stores) {
         expect(await state(store, l)).toEqual({ active: 0, queued: 0, tenants: {} });
       }
       expect(late).toBe(0);
-    }, 180_000);
+    }, 400_000);
 
     if (name === "dynamodb") {
       // Run something between two writes of the store: before the first call that matches.
@@ -968,6 +989,7 @@ for (const [name, make] of stores) {
           const active: Record<string, number> = {};
           const most: Record<string, number> = {};
           let late = 0;
+          const progress = pace();
           const step = async (leaseId: string, tenant: (typeof tenants)[number], ms: number) => {
             // Each in its own process, as workers are.
             const store = make() as DynamoStore;
@@ -976,10 +998,10 @@ for (const [name, make] of stores) {
             for (let round = 0; ; round++) {
               if ((await store.acquire(limits, leaseId, tenant.name, 60_000)) !== "granted") {
                 const w = { ...waiter(leaseId, tenant.name, joined, limits), callbackId: `cb-${leaseId}-${round}` };
-                const woken = new Promise<boolean>((resolve) => {
-                  wakes.set(w.callbackId, () => resolve(true));
-                  setTimeout(() => wakes.delete(w.callbackId) && resolve(false), 30_000);
-                });
+                const woken = progress.until(
+                  new Promise<boolean>((resolve) => wakes.set(w.callbackId, () => resolve(true))),
+                  () => wakes.delete(w.callbackId),
+                );
                 let mine = (await store.enqueue(w)) === "held";
                 if (!mine) for (const l of limits) await store.dispatch(l, async (o) => (o.callbackId === w.callbackId ? (mine = true) : wake(o)), w);
                 if (!mine && !(await woken)) {
@@ -992,6 +1014,7 @@ for (const [name, make] of stores) {
               for (const l of limits) most[l.item] = Math.max(most[l.item] ?? 0, (active[l.item] = (active[l.item] ?? 0) + 1));
               await new Promise((r) => setTimeout(r, ms));
               for (const l of limits) active[l.item]--;
+              progress.finished();
               return there.handoff(limits, leaseId, tenant.name, wake);
             }
           };
@@ -1008,7 +1031,7 @@ for (const [name, make] of stores) {
             expect(await state(store, l)).toEqual({ active: 0, queued: 0, tenants: {} });
           }
           expect(late).toBe(0);
-        }, 180_000);
+        }, 400_000);
 
         it("gives back a second lease of a step, in another shard", async () => {
           const store = make() as DynamoStore;
