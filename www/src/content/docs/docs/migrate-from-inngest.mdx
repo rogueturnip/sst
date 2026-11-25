@@ -163,7 +163,7 @@ The [AWS EventFlow tenants example](/docs/examples/#aws-eventflow-tenants) has a
 |---|---|---|
 | `sleep`, `sleepUntil` | Up to a year, or the plan's run length | Up to the run's `timeout.execution`, 366 days at most |
 | `waitForEvent` returns | The event, or `null` on timeout | The same |
-| Correlation | `match`, or a CEL `if` | `match`, or an `if` with paths, literals, comparisons and `&&` |
+| Correlation | `match`, or a CEL `if` | `match`, or an `if`. [What it can have](/docs/eventflow#expressions) |
 | Events sent before the wait | Not matched | Not matched |
 | An event as the wait registers | — | Matched. [How](/docs/eventflow#waiting-for-events) |
 | Tenants | — | Only events of the run's tenant match |
@@ -189,7 +189,9 @@ The [AWS EventFlow tenants example](/docs/examples/#aws-eventflow-tenants) has a
 | `burst` | Runs in a burst | The same, 1 by default |
 | `rateLimit` | Run starts, skipped | The same |
 | `idempotency` | One run per key, 24 hours | The same |
-| `debounce`, `batchEvents`, `priority`, `singleton` | Yes | Throw. Not supported yet |
+| `debounce`, `batchEvents`, `singleton` | Yes | The same, and each tenant's are its own |
+| `priority` | Order of queued runs | Order of the steps that wait for a concurrency limit. A throttle starts runs in the order they came |
+| `timeouts` | Cancel the run | The same |
 
 ### Run recovery
 
