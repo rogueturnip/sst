@@ -98,7 +98,8 @@ export function named(ctx: durable.DurableContext, replay: Replay): NamedContext
     saved: (name) => c._executionContext.getStepData(idOf(name))?.Status === "SUCCEEDED",
     kind: (name) => {
       const op = c._executionContext.getStepData(idOf(name)) as any;
-      return op && (op.Type === "CONTEXT" ? op.SubType : op.Type);
+      // EventFlow's own subtypes, or the operation's type.
+      return op && (/^EventFlow/.test(op.SubType ?? "") ? op.SubType : op.Type);
     },
     known: (name) => c._executionContext.getStepData(idOf(name)) !== undefined,
     lambdaContext: ctx.lambdaContext,

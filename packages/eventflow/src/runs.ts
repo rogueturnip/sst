@@ -330,7 +330,6 @@ export async function rerun(
   if (memo && memoBlobs) for (const id of Object.keys(found_!.memo)) delete memoBlobs[id];
   const reused = [...Object.keys(memo ?? {}), ...Object.keys(memoBlobs ?? {})];
   const memoOrder = found_?.order;
-  const memoRest = found_?.rest;
   if (memo && Buffer.byteLength(JSON.stringify(memo)) > MAX_MEMO_BYTES)
     throw new Error(`The saved results of "${runId}" are over ${MAX_MEMO_BYTES} bytes. Replay it instead, to run every step again.`);
 
@@ -363,7 +362,7 @@ export async function rerun(
     const taken = await takeLock(engine, lockRuns, payload.lock, id, "skip");
     if (!taken) throw new Error(`Another run has the singleton of "${runId}". Rerun it once that one has ended.`);
   }
-  await engine.startRun({ ...rest, runId: id, root: payload.root ?? runId, replayOf: runId, memo, memoBlobs, memoOrder, memoRest, at: Date.now() });
+  await engine.startRun({ ...rest, runId: id, root: payload.root ?? runId, replayOf: runId, memo, memoBlobs, memoOrder, at: Date.now() });
   return { id, replayOf: runId, reused };
 }
 
@@ -427,7 +426,7 @@ function isWhole(text: string | undefined) {
  * The results of a run's top-level steps that succeeded, by step ID, from its
  * history. A retry passes them to its run, so those steps aren't run again.
  */
-export function memoFrom(events: any[], earlier: Pick<RunPayload, "memo" | "memoBlobs" | "memoOrder" | "memoRest"> = {}): { memo: Record<string, unknown>; blobs: Record<string, string>; order: string[]; rest: string[] } {
+export function memoFrom(events: any[], earlier: Pick<RunPayload, "memo" | "memoBlobs" | "memoOrder"> = {}): { memo: Record<string, unknown>; blobs: Record<string, string>; order: string[] } {
   const memo: Record<string, unknown> = Object.create(null);
   const blobs: Record<string, string> = Object.create(null);
   const saved: Place[] = [];
@@ -485,7 +484,12 @@ export function memoFrom(events: any[], earlier: Pick<RunPayload, "memo" | "memo
   const ids = places.map(([id]) => id);
   const first = ids.findIndex((id) => !kept(id));
   const order = first < 0 ? ids : ids.slice(0, first);
-  return { memo, blobs, order, rest: [...new Set([...ids.slice(order.length).filter(kept), ...(earlier.memoRest ?? []).filter((id) => !ids.includes(id))])] };
+  // After it the function may take another path, and a result found by its ID could be
+  // another call's: those steps run again.
+  const keep = new Set(order);
+  for (const id of Object.keys(memo)) if (!keep.has(id)) delete memo[id];
+  for (const id of Object.keys(blobs)) if (!keep.has(id)) delete blobs[id];
+  return { memo, blobs, order };
 }
 
 // The child contexts EventFlow makes, by their subtype.
@@ -494,6 +498,8 @@ const SUBTYPES: Record<string, StepRecord["type"]> = {
   EventFlowWait: "waitForEvent",
   EventFlowInvoke: "invoke",
   EventFlowSignal: "waitForSignal",
+  EventFlowSend: "step",
+  EventFlowSignalSend: "step",
 };
 
 const TYPES: Record<string, StepRecord["type"]> = {

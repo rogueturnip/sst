@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { ExecutionStatus, LocalDurableTestRunner } from "@aws/durable-execution-sdk-js-testing";
-import { Cluster, finishRuns, waitFor } from "./harness.ts";
+import { Cluster, finishRuns, waitFor, placed } from "./harness.ts";
 import { ONCE } from "../src/worker.ts";
 import { memoFrom, toSteps } from "../src/runs.ts";
 
@@ -98,7 +98,7 @@ describe("the admin API", () => {
 
   it("lists the latest runs, when there are more than a page", async () => {
     const cluster = new Cluster(() => []);
-    for (let i = 0; i < 1500; i++) cluster.history.set(`pay-${i}`, { status: "FAILED", payload: {}, events: [], startedAt: i + 1 });
+    for (let i = 0; i < 1500; i++) cluster.history.set(`pay-${i}`, { status: "FAILED", payload: {}, events: placed([]), startedAt: i + 1 });
     const runs = await cluster.flow.runs.list({ limit: 3 });
     expect(runs.map((r) => r.id)).toEqual(["pay-1499", "pay-1498", "pay-1497"]);
   });
@@ -150,13 +150,13 @@ describe("retry", () => {
       { EventType: "StepFailed", Id: "6", Name: "ship", StepFailedDetails: { Error: { Payload: { ErrorMessage: "down" } } } },
       { EventType: "StepSucceeded", Id: "7", Name: "sst:cancelOn", StepSucceededDetails: { Result: { Payload: "[]" } } },
     ];
-    expect(memoFrom(events).memo).toEqual({
+    expect(memoFrom(placed(events)).memo).toEqual({
       load: { rows: 3 },
       pause: true,
       charge: "ch_1",
       approval: { id: "e2", name: "approved" },
     });
-    const steps = toSteps(events);
+    const steps = toSteps(placed(events));
     expect(steps.find((s) => s.id === "ship")).toEqual(expect.objectContaining({ status: "failed", error: { name: undefined, message: "down" } }));
   });
 
@@ -208,7 +208,7 @@ describe("rerunning a run", () => {
 
   it("starts one run for two retries of the same run, unless asked again", async () => {
     const cluster = flow();
-    cluster.history.set("pay-01", { status: "FAILED", payload, events: [] });
+    cluster.history.set("pay-01", { status: "FAILED", payload, events: placed([]) });
     const first = await cluster.flow.runs.retry("pay-01");
     const second = await cluster.flow.runs.retry("pay-01");
     expect(second.id).toBe(first.id);
@@ -226,7 +226,7 @@ describe("rerunning a run", () => {
       status: "TIMED_OUT",
       payload,
       error: { ErrorType: "Timeout", ErrorMessage: "The run timed out" },
-      events: [step("StepStarted", "1", "wire", ONCE)],
+      events: placed([step("StepStarted", "1", "wire", ONCE)]),
     });
     await expect(cluster.flow.runs.retry("pay-01")).rejects.toThrow('"wire"');
     expect((await cluster.flow.runs.retry("pay-01", { force: true })).id).toBeDefined();
@@ -237,7 +237,7 @@ describe("rerunning a run", () => {
     cluster.history.set("pay-01", {
       status: "FAILED",
       payload,
-      events: [step("StepStarted", "1", "wire", ONCE), step("StepSucceeded", "1", "wire", ONCE)],
+      events: placed([step("StepStarted", "1", "wire", ONCE), step("StepSucceeded", "1", "wire", ONCE)]),
     });
     expect((await cluster.flow.runs.retry("pay-01")).id).toBeDefined();
     await expect(cluster.flow.runs.replay("pay-01")).rejects.toThrow("would run again");
@@ -250,7 +250,7 @@ describe("a retry that didn't start", () => {
     cluster.history.set("pay-01", {
       status: "FAILED",
       payload: { "sst:eventflow": 1, fn: "pay", runId: "pay-01", root: "pay-01", event: { id: "e", name: "x", data: {}, ts: 0 } },
-      events: [],
+      events: placed([]),
     });
     let fail = true;
     cluster.failStart = () => fail;

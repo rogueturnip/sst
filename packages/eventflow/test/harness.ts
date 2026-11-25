@@ -358,3 +358,25 @@ export async function finishRuns() {
   ]);
   state.all = [];
 }
+
+/** A history written by hand, with the places of its results, as the worker saves them. */
+export function placed(events: any[]): any[] {
+  let seq = 0;
+  const out: any[] = [];
+  const wrap = (text: string | undefined, name: string) =>
+    JSON.stringify({ "sst:order": ["", name, ++seq, 0, 0], v: text === undefined || text === "" ? undefined : JSON.parse(text) });
+  for (const e of events) {
+    const top = !e.ParentId && e.Name && !String(e.Name).startsWith("sst:");
+    if (top && (e.EventType === "StepSucceeded" || e.EventType === "ContextSucceeded")) {
+      const key = e.EventType === "StepSucceeded" ? "StepSucceededDetails" : "ContextSucceededDetails";
+      const d = e[key] ?? {};
+      out.push({ ...e, [key]: { ...d, Result: { ...d.Result, Payload: d.Result?.Truncated ? d.Result.Payload : wrap(d.Result?.Payload, e.Name) } } });
+    } else if (top && e.EventType === "StepFailed") {
+      const d = e.StepFailedDetails ?? {};
+      out.push({ ...e, StepFailedDetails: { ...d, Error: { ...d.Error, Payload: { ...d.Error?.Payload, ErrorData: wrap(undefined, e.Name) } } } });
+    } else out.push(e);
+    if (top && e.EventType === "WaitSucceeded")
+      out.push({ EventType: "StepSucceeded", Id: `${e.Id}-m`, Name: `sst:order::0:${e.Name}`, StepSucceededDetails: { Result: { Payload: JSON.stringify({ "sst:order": ["", e.Name, ++seq, 0, 1] }) } } });
+  }
+  return out;
+}

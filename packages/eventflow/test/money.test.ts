@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { ExecutionStatus, LocalDurableTestRunner } from "@aws/durable-execution-sdk-js-testing";
-import { Cluster, finishRuns, waitFor } from "./harness.ts";
+import { Cluster, finishRuns, waitFor, placed } from "./harness.ts";
 import { idempotencyKey, ONCE } from "../src/worker.ts";
 import { onceSteps } from "../src/runs.ts";
 
@@ -252,20 +252,20 @@ describe("rerunning a run with an atMostOnce step", () => {
     cluster.history.set("order-1", {
       status: "FAILED",
       payload: payload("order", "order-1"),
-      events: [
+      events: placed([
         { EventType: "ContextStarted", Id: "1", Name: "pay", SubType: "EventFlowInvoke" },
         { EventType: "StepStarted", Id: "2", ParentId: "1", Name: "start" },
         { EventType: "StepSucceeded", Id: "2", ParentId: "1", Name: "start", StepSucceededDetails: ok({ runId: "wire-1" }) },
         { EventType: "ContextSucceeded", Id: "1", Name: "pay", SubType: "EventFlowInvoke", ContextSucceededDetails: ok({ ok: false, error: { name: "StepError", message: "bank timed out" } }) },
-      ],
+      ]),
     });
     cluster.history.set("wire-1", {
       status: "FAILED",
       payload: { ...payload("wire", "wire-1"), parent: "cb" },
-      events: [
+      events: placed([
         { EventType: "StepStarted", Id: "1", Name: "send-wire", SubType: ONCE },
         { EventType: "StepFailed", Id: "1", Name: "send-wire", SubType: ONCE },
-      ],
+      ]),
     });
     await expect(cluster.flow.runs.retry("order-1")).rejects.toThrow('"pay → send-wire"');
     expect((await cluster.flow.runs.retry("order-1", { force: true })).id).toBeDefined();
@@ -276,20 +276,20 @@ describe("rerunning a run with an atMostOnce step", () => {
     cluster.history.set("order-2", {
       status: "FAILED",
       payload: payload("order", "order-2"),
-      events: [
+      events: placed([
         { EventType: "ContextStarted", Id: "1", Name: "pay", SubType: "EventFlowInvoke" },
         { EventType: "StepSucceeded", Id: "2", ParentId: "1", Name: "start", StepSucceededDetails: ok({ runId: "wire-2" }) },
         { EventType: "ContextSucceeded", Id: "1", Name: "pay", SubType: "EventFlowInvoke", ContextSucceededDetails: ok({ ok: true, result: "sent" }) },
         { EventType: "StepFailed", Id: "3", Name: "ship" },
-      ],
+      ]),
     });
     cluster.history.set("wire-2", {
       status: "SUCCEEDED",
       payload: { ...payload("wire", "wire-2"), parent: "cb" },
-      events: [
+      events: placed([
         { EventType: "StepStarted", Id: "1", Name: "send-wire", SubType: ONCE },
         { EventType: "StepSucceeded", Id: "1", Name: "send-wire", SubType: ONCE, StepSucceededDetails: ok(1) },
-      ],
+      ]),
     });
     expect((await cluster.flow.runs.retry("order-2")).reused).toContain("pay");
     // A replay starts the invoked run again, so it's refused.
@@ -301,12 +301,12 @@ describe("rerunning a run with an atMostOnce step", () => {
     cluster.history.set("order-3", {
       status: "FAILED",
       payload: payload("order", "order-3"),
-      events: [
+      events: placed([
         { EventType: "StepFailed", Id: "1", Name: "ship" },
         { EventType: "ContextStarted", Id: "2", Name: "onFailure" },
         { EventType: "StepStarted", Id: "3", ParentId: "2", Name: "refund", SubType: ONCE },
         { EventType: "StepSucceeded", Id: "3", ParentId: "2", Name: "refund", SubType: ONCE, StepSucceededDetails: ok(null) },
-      ],
+      ]),
     });
     await expect(cluster.flow.runs.retry("order-3")).rejects.toThrow('"refund"');
   });
@@ -316,12 +316,12 @@ describe("rerunning a run with an atMostOnce step", () => {
     cluster.history.set("order-4", {
       status: "FAILED",
       payload: payload("order", "order-4"),
-      events: [
+      events: placed([
         { EventType: "ContextStarted", Id: "1", Name: "transfer", SubType: "EventFlowStep" },
         { EventType: "StepStarted", Id: "2", ParentId: "1", Name: "run", SubType: ONCE },
         { EventType: "StepSucceeded", Id: "2", ParentId: "1", Name: "run", SubType: ONCE, StepSucceededDetails: ok({ ok: false, error: { name: "Error", message: "bank timeout" } }) },
         { EventType: "ContextSucceeded", Id: "1", Name: "transfer", SubType: "EventFlowStep", ContextSucceededDetails: ok({ ok: false, error: { name: "Error", message: "bank timeout" } }) },
-      ],
+      ]),
     });
     await expect(cluster.flow.runs.retry("order-4")).rejects.toThrow('"run"');
   });
@@ -331,13 +331,13 @@ describe("rerunning a run with an atMostOnce step", () => {
     cluster.history.set("order-5", {
       status: "FAILED",
       payload: payload("order", "order-5"),
-      events: [
+      events: placed([
         { EventType: "ContextStarted", Id: "1", Name: "transfer", SubType: "EventFlowStep" },
         { EventType: "StepStarted", Id: "2", ParentId: "1", Name: "run", SubType: ONCE },
         { EventType: "StepSucceeded", Id: "2", ParentId: "1", Name: "run", SubType: ONCE, StepSucceededDetails: ok({ ok: true, value: 1 }) },
         { EventType: "ContextSucceeded", Id: "1", Name: "transfer", SubType: "EventFlowStep", ContextSucceededDetails: ok({ ok: true, value: 1 }) },
         { EventType: "StepFailed", Id: "3", Name: "email" },
-      ],
+      ]),
     });
     expect((await cluster.flow.runs.retry("order-5")).reused).toEqual(["transfer"]);
   });

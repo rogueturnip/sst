@@ -256,8 +256,10 @@ interface RunState {
   used: Set<string>;
   /** The order in which the function is given its steps' results. */
   order: Order;
-  /** The IDs of which a use has a result from before, that's found by its ID alone. */
-  loose: Set<string>;
+  /** How many times each step ID is used. */
+  uses: Map<string, number>;
+  /** How many times each event, invoke and defer of an ID, with the same content, is sent. */
+  sent: Map<string, number>;
   /** The last call of each step ID that's used, and whether the function has its result. */
   calls: Map<string, Call>;
   /** The step that was called last, as it's called. */
@@ -356,19 +358,16 @@ function claim(state: RunState, input: StepInput): Claim {
     throw error;
   }
   const call = { link: at, name: occurrence(state, id), given: false };
-  // A result from before, of a path that's another now, is a step's by its ID. Where an ID is
-  // used more than once, it can't be told of which use it is.
-  const { places } = state.shared;
-  const loose = (name: string) => places.lost(name) || (Object.prototype.hasOwnProperty.call(state.memo, name) && places.at(name)?.attempt !== -1);
-  const twice = `${id}:1`;
-  if (call.name === id ? loose(id) && (places.lost(twice) || Object.prototype.hasOwnProperty.call(state.memo, twice)) : loose(call.name) || state.loose.has(id)) {
+  // A step that an earlier attempt ended, on a path that the function didn't take again: its
+  // result would be found by its ID, and could be another call's.
+  if (state.shared.places.lost(call.name)) {
     const error = new UsageError(
-      `The step ID "${id}" is used more than once, and the function came here another way than before, so which result is whose can't be told. Replay the run, and give each use an ID of its own, like \`${id}-\${item.id}\`.`,
+      `The step "${call.name}" ended in an earlier attempt, which took another path, so whose result it is can't be told. Fix what made the path change, and replay the run. Keep the IDs of the steps that ran: their idempotency keys come from them.`,
     );
     state.refuse(error);
     throw error;
   }
-  if (loose(call.name)) state.loose.add(id);
+  state.uses.set(id, (state.uses.get(id) ?? 0) + 1);
   state.calls.set(id, call);
   state.calling = call;
   return { id: call.name, base: id, first };
@@ -464,6 +463,7 @@ function makeStep(state: RunState) {
       throw error;
     }
     if (before) return before.promise;
+    state.shared.places.callers.set(id, state.attempt);
     const promise = begin();
     promise.catch(() => {});
     ops.set(id, { kind, promise });
@@ -471,6 +471,15 @@ function makeStep(state: RunState) {
   };
 
   const stepOp = <T>(id: string, kind: string, begin: () => Promise<T>) => record(op(id, kind, begin));
+
+  // What a run sends, by what it is, and how many like it the step's ID sent before.
+  const contentId = (base: string, what: unknown) => {
+    const content = hash(JSON.stringify(what) ?? "null", 26);
+    const k = `${base}\n${content}`;
+    const n = state.sent.get(k) ?? 0;
+    state.sent.set(k, n + 1);
+    return hash(JSON.stringify([state.root, state.namespace, base, content, n]), 26);
+  };
 
   const leaseMs = () => Math.max(30_000, (ctx.lambdaContext?.getRemainingTimeInMillis?.() ?? 900_000) + 10_000);
   // A wake that throws may not have reached the step: the store keeps it in line.
@@ -578,6 +587,15 @@ function makeStep(state: RunState) {
 
   // The key of a step's side effect, for idempotencyKey() called in the step.
   const keyFor = (id: string) => idempotencyKey(state.root, state.namespace, id);
+  // What a step does, once it's begun: nothing once the function's end is decided.
+  const acting = <T>(fn: () => Promise<T>): Promise<T> => {
+    if (state.shared.ended) return Promise.reject(new NonRetriableError("The function ended before this step ran."));
+    const work = fn();
+    const over = () => void state.shared.running.delete(work);
+    state.shared.running.add(work);
+    work.then(over, over);
+    return work;
+  };
   const inStep = async <T>(id: string, attempt: number, fn: () => T | Promise<T>): Promise<T> => {
     // The invocation has ended, and goes on in a Lambda that's been thawed: the next one runs it.
     if (inv.over) return never();
@@ -586,14 +604,14 @@ function makeStep(state: RunState) {
     // It was waiting, for its next try or its lease, as the function failed. What's done about
     // that, like a refund, may have been done.
     if (state.shared.ended) throw new NonRetriableError("The function ended before this step ran.");
-    const { base, counts } = state.shared.code.get(id) ?? { base: id, counts: state.counts };
+    const { base, counts } = state.shared.code.get(id) ?? { base: id, counts: state.uses };
     const keyOf = (of: string | number | undefined) => {
       if (of !== undefined) return idempotencyKey(state.root, state.namespace, base, String(of));
       // Which use of an ID is whose can be another in a replay, where a step before it fails, or
       // a list has changed. Then one would be paid for with another's key.
       if ((counts.get(base) ?? 0) > 1)
         throw new NonRetriableError(
-          `The step ID "${base}" is used more than once, so its idempotency key can be another use's in a replay. Give each an ID of its own, like \`${base}-\${order.id}\`, or say what it's of: idempotencyKey(order.id).`,
+          `The step ID "${base}" is used more than once, so its idempotency key can be another use's in a replay. Say what it's of: idempotencyKey(order.id).`,
         );
       return keyFor(id);
     };
@@ -625,8 +643,8 @@ function makeStep(state: RunState) {
     const { id, base } = claim(state, idInput);
     const saved = earlier(id);
     if (saved) return saved as Promise<T>;
-    state.shared.code.set(id, { fn, args, base, counts: state.counts });
-    return stepOp(id, limits.length ? "EventFlowStep" : "STEP", () => runStep<T>(id, idInput));
+    state.shared.code.set(id, { fn, args, base, counts: state.uses });
+    return stepOp(id, limits.length ? "EventFlowStep" : atMostOnce(idInput) ? ONCE : "STEP", () => runStep<T>(id, idInput));
   };
 
   const runStep = <T>(id: string, idInput: StepInput): Promise<T> => {
@@ -892,7 +910,7 @@ function makeStep(state: RunState) {
     },
   ) => {
     if (state.fence.down) return never();
-    const { id, first } = claim(state, idInput);
+    const { id, base, first } = claim(state, idInput);
     const saved = earlier(id);
     if (saved) return saved;
     begin(first);
@@ -916,6 +934,9 @@ function makeStep(state: RunState) {
     const timeout = bounded(timeoutMs ?? Math.min(maxWaitMs, DEFAULT_INVOKE_TIMEOUT_MS), `timeout of step "${id}"`);
 
     const identity = `invoke\n${state.runId}\n${state.namespace}\n${id}`;
+    // The child's root, which its idempotency keys come from, is the same for every retry and
+    // replay of the parent that invokes it with the same data.
+    const childRoot = contentId(base, [target, options.data ?? null]);
     try {
       checkEvent({ name: "inngest/function.invoked", ...(sessions ? { sessions } : {}) }, "event", true);
     } catch (error) {
@@ -928,11 +949,11 @@ function makeStep(state: RunState) {
           const [result, callbackId] = await child.createCallback<InvokeOutcome>("result", { timeout, serdes: json as any });
           // The invoked run goes through the router, like any other, so its flow
           // control applies. The message is signed, so only a run can send one.
-          await child.step("start", async () => {
+          await child.step("start", () => acting(async () => {
             // The child run is new for each run that invokes it, as a retry of the
             // parent needs its own. Its root, which its idempotency keys come from,
             // is the same for every retry and replay of the parent.
-            const root = hash(JSON.stringify([state.root, state.namespace, id]), 26);
+            const root = childRoot;
             const event: WireEvent = {
               id: hash(identity),
               name: "inngest/function.invoked",
@@ -962,7 +983,7 @@ function makeStep(state: RunState) {
             ]);
             // In the history, so a rerun of this run can find the child, and check it.
             return { runId: childRunId };
-          });
+          }));
           // The run whose answer this is: no one else's is taken.
           const by =
             app === undefined ? makeRunId(target, identity) : callRunId(target, { id: hash(identity), tenant: state.event.tenant }, callbackId);
@@ -992,11 +1013,15 @@ function makeStep(state: RunState) {
 
   const sendEvent = (idInput: string | { id: string }, payload: SendPayload | SendPayload[]) => {
     if (state.fence.down) return never();
-    const { id, first } = claim(state, idInput);
+    const { id, base, first } = claim(state, idInput);
     const saved = earlier(id);
     if (saved) return saved as Promise<{ ids: string[] }>;
     begin(first);
     const list = Array.isArray(payload) ? payload : [payload];
+    // An event's ID comes from the run's root, the step's ID and what's sent, so a retried step,
+    // and a retry or replay of the run, send the same events, and the router skips the ones it has
+    // seen. Not from which use of the ID it is: that can be another in a replay.
+    const sentIds = list.map((p) => contentId(base, [p?.name, p?.data ?? null]));
     const send = async (events: any[]) => {
       // IDs come from the run's root and the step, so a retried step, and a retry
       // or replay of the run, send the same events, and the router skips the ones
@@ -1004,7 +1029,7 @@ function makeStep(state: RunState) {
       const wire = events.map((p, i) =>
         toWireEvent({
           ...p,
-          id: p.id ?? hash(JSON.stringify([state.root, state.namespace, id, i]), 26),
+          id: p.id ?? sentIds[i],
           tenant: p.tenant ?? state.event.tenant,
         }, undefined, engine.propagateSessions ? state.sessions : undefined),
       );
@@ -1013,19 +1038,19 @@ function makeStep(state: RunState) {
     };
     return stepOp(
       id,
-      "STEP",
+      "EventFlowSend",
       () => eager(
         ctx.step(
           id,
-          (c) => failing(id, delayOf(id, c.attempt), async () => {
+          (c) => failing(id, delayOf(id, c.attempt), () => acting(async () => {
             if (!state.hooks.any) return send(list);
             const info = state.hooks.info(id, undefined, "sendEvent", undefined, false);
             return handledWith(state, info, c.attempt, async () => {
               const { events } = await state.hooks.transform("transformSendEvent", { events: list.map((e) => ({ ...e })) });
               return state.hooks.wrap("wrapSendEvent", { events }, () => send(events));
             }) as Promise<{ ids: string[] }>;
-          }),
-          { retryStrategy: retrying(id), serdes: state.shared.places.serdes(id) },
+          })),
+          { retryStrategy: retrying(id), serdes: state.shared.places.serdes(id), subType: "EventFlowSend" },
         ),
       ),
     );
@@ -1044,9 +1069,9 @@ function makeStep(state: RunState) {
     }
     return stepOp(
       id,
-      "STEP",
+      "EventFlowSignalSend",
       () => eager(
-        ctx.step(id, async () => {
+        ctx.step(id, () => acting(async () => {
           const item = signalKey(state.event.tenant, options.signal);
           const wait = await engine.store.signalRead(item);
           // The wait it found first, so a try that comes after the run waits again doesn't
@@ -1061,7 +1086,7 @@ function makeStep(state: RunState) {
           const told = await engine.callback(callbackId, { signal: options.signal, data: options.data ?? null });
           await engine.store.signalFree(item, callbackId);
           return { runId: told || wait?.callbackId !== callbackId ? runId : undefined };
-        }, { serdes: state.shared.places.serdes(id) }),
+        }), { serdes: state.shared.places.serdes(id), subType: "EventFlowSignalSend" }),
       ),
     ).then((r: any) => ({ runId: r?.runId ?? undefined }));
   };
@@ -1457,10 +1482,15 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
     const given = () => {
       const memo: Record<string, unknown> = Object.assign(Object.create(null), payload.memo ?? {});
       for (const [id, blob] of Object.entries(payload.memoBlobs ?? {})) memo[id] = new BlobMemo(blob);
+      // Only those it had in order: a result after them could be another call's.
+      if (payload.memoOrder) {
+        const ordered = new Set(payload.memoOrder);
+        for (const id of Object.keys(memo)) if (!ordered.has(id)) delete memo[id];
+      }
       return memo;
     };
     const placesIn = placesOf(ctx);
-    const sharedOf = (scope: string, earlier?: string[], rest?: string[]): Shared => ({ places: placesIn(scope, earlier, rest), ops: new Map(), code: new Map(), ended: false, running: new Set() });
+    const sharedOf = (scope: string, earlier?: string[]): Shared => ({ places: placesIn(scope, earlier), ops: new Map(), code: new Map(), ended: false, running: new Set() });
     const newState = (more: Partial<RunState> & { shared: Shared }): RunState => {
       const state: RunState = {
         ctx,
@@ -1481,7 +1511,8 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
         inv,
         used: new Set(),
         calls: new Map(),
-        loose: new Set(),
+        uses: new Map(),
+        sent: new Map(),
         sessions: shared,
         defers,
         deferCounts: new Map(),
@@ -1558,10 +1589,13 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
           throw new UsageError((error as Error).message);
         }
         if (forState.fence.down) return { abort: () => {} };
-        const name = occurrence({ counts: forState.deferCounts, used: forState.deferUsed } as any, stepId(id));
+        const data = jsonify(checked ? checked.value : (input.data ?? {}));
+        // By what it is, so another path in a replay doesn't start one in another's place.
+        const what = hash(JSON.stringify([target, data ?? null]), 26);
+        const name = occurrence({ counts: forState.deferCounts, used: forState.deferUsed } as any, `${stepId(id)}#${what}`);
         defers.set(`${forState.namespace}\n${name}`, {
           fn: target,
-          data: jsonify(checked ? checked.value : (input.data ?? {})),
+          data,
           sessions,
         });
         return { abort: () => void defers.delete(`${forState.namespace}\n${name}`) };
@@ -1633,7 +1667,7 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
 
       return attempts(root, {
         namespace: "",
-        shared: sharedOf("", payload.memoOrder?.filter((id) => id in (payload.memo ?? {}) || id in (payload.memoBlobs ?? {})), payload.memoRest),
+        shared: sharedOf("", payload.memoOrder?.filter((id) => id in (payload.memo ?? {}) || id in (payload.memoBlobs ?? {}))),
         run: async (state, child) => {
           // What an attempt that failed deferred, the next does again, if it comes to it.
           defers.clear();
@@ -1748,14 +1782,14 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
             delayMs = undefined;
           }
         }
-        await options.failed?.(n, error, delayMs === undefined, state);
-        if (delayMs === undefined) return { ok: false, error };
-        if (!failure) {
+        if (!failure && delayMs !== undefined) {
           const info = errorInfo(error);
           log("warn", "The function failed outside a step. It's tried again.", { run: runId, attempt: n + 1, error: info.message });
           const kept = { error: { name: info.name.slice(0, 256), message: info.message.slice(0, 8192) }, delayMs };
           await at.step(FAILED, async () => kept, LEASING);
         }
+        await options.failed?.(n, error, delayMs === undefined, state);
+        if (delayMs === undefined) return { ok: false, error };
         await at.wait(`sst:retry:${n + 1}`, toDurableSeconds(delayMs));
       }
     };

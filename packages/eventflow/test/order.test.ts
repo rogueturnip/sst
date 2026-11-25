@@ -371,16 +371,23 @@ describe("a function that's tried again after it was paused", () => {
 });
 
 describe("a run that's retried", () => {
-  it("gives no result to another branch", async () => {
-    const charged: string[] = [];
+  it("gives no result to another branch, and charges each once", async () => {
+    const charged = new Map<string, string>();
     let tries = 0;
     const c = new Cluster((flow) => [
       flow.createFunction({ id: "f", triggers: { event: "go" }, retries: 0 }, async ({ step }: any) => {
         const first = tries++ === 0;
+        (globalThis as any).currentKey = (who: string) => currentStep()!.keyFor(who);
         const speeds: any = { carol: 5, bob: 60, alice: 150 };
         const branch = async (who: string) => {
           await step.run(`check-${who}`, async () => { await settle(speeds[who]); if (first && who === "carol") throw new Error("check failed"); });
-          return step.run("charge", () => { if (first && who === "alice") throw new Error("charge failed"); charged.push(who); return who; });
+          return step.run("charge", () => {
+            if (first && who === "alice") throw new Error("charge failed");
+            // A provider that charges once for each key.
+            const key = (globalThis as any).currentKey(who);
+            if (!charged.has(key)) charged.set(key, who);
+            return who;
+          });
         };
         const all = await Promise.allSettled(["alice", "bob", "carol"].map(branch));
         if (all.some((r) => r.status === "rejected")) throw new NonRetriableError("not all");
@@ -394,9 +401,8 @@ describe("a run that's retried", () => {
     c.history.set(run.runId, { status: "FAILED", payload: run.payload, events: (await run.result).getHistoryEvents() });
     const again = await c.flow.runs.retry(run.runId);
     const r = await st(c.run(again.id));
-    expect(charged).toEqual(["bob"]);
-    expect(r.s).toBe(ExecutionStatus.FAILED);
-    expect(r.e.errorMessage).toContain("which result is whose can't be told");
+    expect(r.v).toEqual(["alice", "bob", "carol"]);
+    expect([...charged.values()].sort()).toEqual(["alice", "bob", "carol"]);
   }, 30_000);
 
   it("has the same order for a result that's read from the table", async () => {
@@ -430,6 +436,71 @@ describe("a run that's retried", () => {
   }, 30_000);
 });
 
+describe("what a step sends", () => {
+  it("has IDs by what it is, so a replay with another list sends each once", async () => {
+    let list = ["A", "B"];
+    const c = new Cluster((flow) => [
+      flow.createFunction({ id: "f", triggers: { event: "go" }, retries: 0 }, async ({ step }: any) => {
+        const orders = await step.run("list", () => list);
+        for (const o of orders) await step.sendEvent("charge-order", { name: "order/charge", data: { o } });
+      }),
+    ]);
+    await c.flow.send({ name: "go" });
+    await c.drain();
+    const run = c.runOf("f");
+    await st(run);
+    const ids = () => c.queue.filter((m) => JSON.parse(m.body).kind === "event").flatMap((m) => [JSON.parse(m.body)].map((b) => [b.event?.id ?? b.id, b.event?.data?.o]));
+    const first = new Map(ids().map(([id, o]) => [o, id]));
+    c.history.set(run.runId, { status: "FAILED", payload: run.payload, events: (await run.result).getHistoryEvents() });
+    list = ["C", "A", "B"];
+    const again = await c.flow.runs.replay(run.runId);
+    await st(c.run(again.id));
+    const all = ids();
+    expect(all.filter(([, o]) => o === "A").every(([id]) => id === first.get("A"))).toBe(true);
+    expect(all.filter(([, o]) => o === "B").every(([id]) => id === first.get("B"))).toBe(true);
+    expect(new Set(all.map(([id]) => id)).size).toBe(3);
+  }, 30_000);
+
+  it("isn't sent once the run has failed", async () => {
+    const log: string[] = [];
+    let tries = 0;
+    const t0 = Date.now();
+    const c = new Cluster((flow) => [
+      flow.createFunction(
+        { id: "f", triggers: { event: "go" }, retries: 3, onFailure: async ({ step }: any) => { await step.run("refund", async () => { log.push("refund"); await settle(4000); }); } },
+        async ({ step }: any) => {
+          await Promise.all([
+            step.sendEvent("ship", { name: "order/ship" }),
+            step.run("check", async () => { await settle(100); throw new NonRetriableError("fraud"); }),
+          ]);
+        },
+      ),
+    ]);
+    const real = c.fetch.bind(c);
+    c.fetch = async (service: string, path: string, init: RequestInit) => {
+      if (service === "sqs" && String(init.body).includes("order/ship") && Date.now() - t0 < 600) return (tries++, new Response("{}", { status: 500 }));
+      return real(service, path, init);
+    };
+    await c.flow.send({ name: "go" });
+    await c.drain();
+    expect((await st(c.runOf("f"))).s).toBe(ExecutionStatus.FAILED);
+    expect(log).toEqual(["refund"]);
+    expect(tries).toBeGreaterThan(0);
+    expect(c.queue.some((m) => m.body.includes("order/ship"))).toBe(false);
+  }, 30_000);
+});
+
+it("an explicit ID that looks like a second use has a key of its own", async () => {
+  const keys: string[] = [];
+  const c = await one({}, async ({ step, idempotencyKey }: any) => {
+    for (const o of ["a", "b"]) await step.run("charge", () => keys.push(idempotencyKey(o)));
+    await step.run("charge:1", () => keys.push(idempotencyKey()));
+    return "ok";
+  });
+  expect((await st(c.runOf("f"))).v).toBe("ok");
+  expect(new Set(keys).size).toBe(3);
+}, 20_000);
+
 it("code that runs as the function ends isn't cut off", async () => {
   const log: string[] = [];
   const c = await one({}, async ({ step }: any) => {
@@ -454,7 +525,8 @@ describe("what's saved", () => {
     const events = (await c.runOf("f").result).getHistoryEvents();
     const { memo, order } = memoFrom(events);
     expect(order).toEqual(["2", "0", "1-slow"]);
-    expect(memo).toMatchObject({ "2": "2", "0": "0", "1-slow": "1-slow", after: "after", z: true });
+    // What came after the step that failed runs again.
+    expect(memo).toEqual({ "2": "2", "0": "0", "1-slow": "1-slow" });
     expect(toSteps(events).some((s) => s.id.includes("sst:order"))).toBe(false);
     expect(toSteps(events).find((s) => s.id === "3-fails")).toMatchObject({ status: "failed", error: { message: "no" } });
   }, 20_000);

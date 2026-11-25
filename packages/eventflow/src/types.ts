@@ -93,8 +93,7 @@ export interface RunPayload {
   memoBlobs?: Record<string, string>;
   /** The order the function had them in, up to the first step that's run again. */
   memoOrder?: string[];
-  /** The order of those after it. */
-  memoRest?: string[];
+
   /** When its event came: the steps of runs that came first go first. */
   at?: number;
   /** For a run with a batch, which one. `event` is its first. */
