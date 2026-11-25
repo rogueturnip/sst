@@ -206,6 +206,11 @@ export class Cluster {
     throw new Error(`Unexpected AWS call ${service} ${target ?? ""} ${path}`);
   }
 
+  /** Calls to AWS go to this one from here. */
+  static use(cluster: Cluster) {
+    state.cluster = cluster;
+  }
+
   private arns = new Map<string, string>();
   private idOf(arn: string) {
     return this.arns.get(arn) ?? arn.replace(/^arn\//, "");

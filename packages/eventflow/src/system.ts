@@ -42,7 +42,8 @@ export async function sendSystemEvents(registry: Map<string, Registered>, engine
     const full = {
       function_id: ended.fn,
       run_id: ended.runId,
-      event: ended.event,
+      // A large one is named, not carried.
+      event: ended.event.blob ? { id: ended.event.id, name: ended.event.name, ts: ended.event.ts } : ended.event,
       ...(ended.events && ended.events.length > 1 ? { events: ended.events.map((e) => ({ id: e.id, name: e.name, ts: e.ts })) } : {}),
       ...(ended.error ? { error: ended.error } : {}),
       ...(ended.result !== undefined && !large ? { result: ended.result } : {}),

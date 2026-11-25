@@ -65,8 +65,6 @@ export function registerMiddleware(classes: MiddlewareClass[], client: unknown, 
     for (const hook of UNSUPPORTED)
       if (typeof c.prototype?.[hook] === "function")
         throw new TypeError(`The middleware "${c.name}" has ${hook}(), which EventFlow doesn't have: there's no request.`);
-    if (typeof (c as any).functions === "function")
-      throw new TypeError(`The middleware "${c.name}" has functions(), which EventFlow doesn't have. Pass them to serve().`);
     (c as any).onRegister?.({ client, fn });
   }
 }

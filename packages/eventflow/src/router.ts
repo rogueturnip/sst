@@ -2,7 +2,8 @@ import { createHash } from "crypto";
 import type { SQSBatchItemFailure, SQSBatchResponse, SQSEvent, SQSRecord } from "aws-lambda";
 import { cronMatches, localMinute } from "./cron.js";
 import { matchesTrigger, type Definition } from "./definition.js";
-import { checkEvent, checkSignal, DEDUP_MS, MESSAGE_TTL_MS, type Engine } from "./engine.js";
+import { fat, slim } from "./blobs.js";
+import { checkEvent, checkSignal, cleanEvent, DEDUP_MS, MESSAGE_TTL_MS, type Engine } from "./engine.js";
 import { evaluate, getPath } from "./expression.js";
 import { hash, key, runId as makeRunId, ulid } from "./ids.js";
 import { findRun, runStatus } from "./runs.js";
@@ -82,15 +83,20 @@ function parse(record: SQSRecord): Message {
     if ((message.tenant ?? undefined) !== (group ?? undefined)) throw new Rejected("The signal's tenant isn't its message group.");
     return { kind: "signal", signal: message.signal, data: message.data, tenant: message.tenant, id: String(message.id ?? "") };
   }
-  if (message.kind === "event") {
+  if (message.kind === "event" || message.kind === "call") {
     try {
-      checkEvent(message.event ?? {}, "event");
+      checkEvent(message.event ?? {}, "event", message.kind === "call");
     } catch (error) {
       throw new Rejected((error as Error).message);
     }
     if (typeof message.event.id !== "string") throw new Rejected("The event has no ID.");
     if ((message.event.tenant ?? undefined) !== (group ?? undefined)) throw new Rejected("The event's tenant isn't its message group.");
-    return { kind: "event", event: message.event };
+    // Only what's a sender's to set.
+    const event = cleanEvent(message.event);
+    if (message.kind === "event") return { kind: "event", event };
+    if (typeof message.fn !== "string" || typeof message.parent !== "string" || !message.parent || message.parent.length > 4096)
+      throw new Rejected("The call has no function, or no callback.");
+    return { kind: "call", fn: message.fn, event, parent: message.parent };
   }
   throw new Rejected(`Unknown message kind "${String(message.kind).slice(0, 20)}".`);
 }
@@ -100,6 +106,18 @@ async function routeRecord(record: SQSRecord, registry: Map<string, Registered>,
   // When it was sent: the same each time it's delivered.
   const receivedAt = Number(record.attributes.SentTimestamp) || Date.now();
   if (message.kind === "timer") return routeTimer(message, registry, engine);
+  if (message.kind === "call") {
+    const entry = registry.get(message.fn);
+    // The same answer whether it's there or not: it isn't the caller's to find out.
+    if (!entry?.def.external)
+      return notifyParent(engine, message.parent, { name: "InvokeError", message: `The function "${message.fn.slice(0, 128)}" doesn't take calls from other EventFlows.` });
+    return startRun(entry.def, { ...message.event, name: "inngest/function.invoked" }, engine, registry, {
+      parent: message.parent,
+      identity: `call\n${JSON.stringify([message.event.tenant ?? null, message.event.id, message.parent])}`,
+      received: receivedAt,
+      external: true,
+    });
+  }
   if (message.kind === "signal") return void (await deliverSignal(engine, message.tenant, message.signal, message.data, receivedAt));
   if (message.kind === "start" || message.kind === "invoke") {
     // A signed message is good for longer than the dead-letter queue keeps it, so
@@ -118,7 +136,7 @@ async function routeRecord(record: SQSRecord, registry: Map<string, Registered>,
         await notifyParent(engine, message.parent, { name: "InvokeError", message: `The function "${message.fn}" isn't served.` });
       return;
     }
-    return startRun(entry.def, message.event, engine, registry, {
+    return startRun(entry.def, await fat(engine, message.event), engine, registry, {
       parent: message.parent,
       runId: message.runId,
       root: message.root,
@@ -126,6 +144,7 @@ async function routeRecord(record: SQSRecord, registry: Map<string, Registered>,
       held: message.kind === "start",
       fired: message.kind === "start" ? message.fired : undefined,
       batch: message.kind === "start" ? message.batch : undefined,
+      external: message.kind === "start" ? message.external : undefined,
     });
   }
 
@@ -133,7 +152,7 @@ async function routeRecord(record: SQSRecord, registry: Map<string, Registered>,
     if (message.exp < Date.now() || !(SYSTEM_EVENTS as readonly string[]).includes(message.event.name))
       return warn("Dropped a message that expired", { kind: message.kind });
   }
-  const event = message.event;
+  const event = await fat(engine, message.event);
 
   // An event ID is used once per tenant in 24 hours. The same message delivered
   // again, or a message whose routing didn't finish, is routed again, since starting
@@ -168,7 +187,8 @@ async function notifyParent(engine: Engine, parent: string, error: { name: strin
 async function resolveWaits(event: WireEvent, receivedAt: number, engine: Engine, registry: Map<string, Registered>) {
   const fields = await engine.store.waitFields(event.name, event.tenant);
   if (!fields.length) return;
-  await engine.store.putRecent(recentKey(event.name, event.tenant), event, receivedAt, RECENT_MS);
+  const kept = await slim(engine, event);
+  await engine.store.putRecent(recentKey(event.name, event.tenant), kept, receivedAt, RECENT_MS);
   const now = Date.now();
   for (const field of fields) {
     const raw = field === "*" ? undefined : getPath(event, field.split("."));
@@ -187,7 +207,7 @@ async function resolveWaits(event: WireEvent, receivedAt: number, engine: Engine
             const arn = w.callbackId.slice(STOP.length);
             if (await stop(engine, registry, { arn, runId: w.runId, parent: w.parent, message: `The run was cancelled by "${event.name}".` }))
               log("Cancelled a run", { run: w.runId, event: event.id });
-          } else if (await engine.callback(w.callbackId, event)) {
+          } else if (await engine.callback(w.callbackId, kept)) {
             log("Resolved a wait for an event", { run: w.runId, event: event.id });
           }
           await engine.store.deleteWaiter(k, w).catch(() => {});
@@ -256,7 +276,7 @@ async function addToBatch(def: Definition, event: WireEvent, receivedAt: number,
   const tenant = event.tenant ?? null;
   const item = key("B", def.id, tenant, batch.key?.({ event }) ?? null);
   const order = `${String(receivedAt).padStart(15, "0")}#${hash(event.id, 16)}`;
-  await engine.store.batchAdd(item, key("BE", item, event.id), order, event, receivedAt, batchTtl(engine));
+  await engine.store.batchAdd(item, key("BE", item, event.id), order, await slim(engine, event), receivedAt, batchTtl(engine));
   // Each event has a timer of its own, so however this stops, the batch is closed in time.
   await engine.sendTimer({ type: "batch", fn: def.id, item, tenant: event.tenant }, receivedAt + batch.timeoutMs);
   await closeBatches(def, item, engine, registry);
@@ -283,7 +303,7 @@ async function closeBatches(def: Definition, item: string, engine: Engine, regis
     // here. Starting it twice is safe: its run has one name.
     const [first] = await engine.store.batchEvents(closed.refs.slice(0, 1));
     if (first)
-      await startRun(def, first, engine, registry, {
+      await startRun(def, await fat(engine, first), engine, registry, {
         identity: `batch\n${item}\n${closed.n}`,
         batch: { item, n: closed.n },
         fired: true,
@@ -305,9 +325,10 @@ async function debounce(def: Definition, event: WireEvent, receivedAt: number, e
   // doesn't hold its place against the ones sent after it.
   const order = `${at(Math.min(event.ts, receivedAt))}#${at(receivedAt)}#${event.id}`;
   const ttl = Math.max(periodMs, timeoutMs ?? 0) + MESSAGE_TTL_MS;
+  const kept = await slim(engine, event);
   for (let attempt = 0; attempt < 5; attempt++) {
     const now = Date.now();
-    const merged = await engine.store.debounceMerge(item, event, order, `${at(receivedAt)}#${event.id}`, now, ttl);
+    const merged = await engine.store.debounceMerge(item, kept, order, `${at(receivedAt)}#${event.id}`, now, ttl);
     if (merged === "closing") {
       // The window's run is being started, or a router stopped before it was. Start it, and
       // this event opens the next window.
@@ -325,7 +346,7 @@ async function debounce(def: Definition, event: WireEvent, receivedAt: number, e
 async function fireDebounce(def: Definition, item: string, engine: Engine, registry: Map<string, Registered>) {
   const window = await engine.store.debounceRead(item);
   if (!window?.closing) return;
-  await startRun(def, window.event, engine, registry, { fired: true, received: window.last });
+  await startRun(def, await fat(engine, window.event), engine, registry, { fired: true, received: window.last });
   await engine.store.debounceDone(item, window.order);
 }
 
@@ -377,6 +398,8 @@ interface StartOptions {
   /** It's a debounce's or a batch's run: the event has been through what comes before. */
   fired?: boolean;
   batch?: { item: string; n: number };
+  /** Another EventFlow invoked it. */
+  external?: boolean;
   /** It was held, and has come back: its timers were sent. */
   held?: boolean;
   /** Not before this, as for a cron's jitter. */
@@ -436,7 +459,7 @@ export async function startRun(
         message: sign({
           kind: "start" as const,
           fn: def.id,
-          event,
+          event: await slim(engine, event),
           at: admission.at,
           // The run keeps its ID and root when it comes back, so it's the same run.
           runId: id,
@@ -446,6 +469,7 @@ export async function startRun(
           ...(opts.fired ? { fired: true } : {}),
           ...(opts.batch ? { batch: opts.batch } : {}),
           ...(opts.parent ? { parent: opts.parent } : {}),
+          ...(opts.external ? { external: true } : {}),
         }),
         group: event.tenant ?? `t-${hash(def.id, 10)}`,
         delaySeconds: Math.min(900, Math.ceil((admission.at - Date.now()) / 1000)),
@@ -464,11 +488,12 @@ export async function startRun(
     fn: def.id,
     runId: id,
     root: opts.root ?? deriveRoot(id),
-    event,
+    event: await slim(engine, event),
     at: opts.received,
     ...(opts.batch ? { batch: opts.batch } : {}),
     ...(lockItem ? { lock: lockItem } : {}),
     ...(opts.parent ? { parent: opts.parent } : {}),
+    ...(opts.external ? { external: true } : {}),
   };
   const started = await engine.startRun(payload);
   if (lockItem && started?.arn) await engine.store.lockStarted(lockItem, id, started.arn);
@@ -510,7 +535,7 @@ async function admit(
     }
   }
   // A run that's invoked, or a cron's, has nothing to wait for: what invoked it waits.
-  if (def.debounce && !opts.fired && !opts.parent && !opts.identity) return { decision: "debounce" };
+  if (def.debounce && !opts.fired && !opts.parent && !opts.identity && !opts.runId) return { decision: "debounce" };
   const claimed = def.idempotency?.(scope);
   const idempotency = claimed === undefined ? undefined : key("I", def.id, tenant, claimed);
   if (idempotency && !(await engine.store.claim(idempotency, id, DEDUP_MS))) return { decision: "skip", reason: "idempotency" };

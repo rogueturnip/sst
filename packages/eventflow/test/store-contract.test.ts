@@ -210,6 +210,16 @@ for (const [name, make] of stores) {
       expect(await store.lockRead(item)).toBeUndefined();
     });
 
+    it("keeps a blob whole, however large, and says when there's none", async () => {
+      const store = make();
+      const key = `X#contract-${run}-${n++}`;
+      const body = JSON.stringify({ t: `x${"é".repeat(150_000)}${"😀".repeat(200_000)}` });
+      await store.putBlob(key, body, 86_400_000);
+      await store.putBlob(key, body, 86_400_000);
+      expect((await store.getBlob(key)) === body).toBe(true);
+      expect(await store.getBlob(`${key}-none`)).toBeUndefined();
+    });
+
     it("keeps the first failure of an attempt, whole, however large", async () => {
       const store = make();
       const r = `run-${run}-${n++}`;

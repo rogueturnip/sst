@@ -57,6 +57,11 @@ export interface FunctionOptions {
    * a concurrency limit, or hasn't finished within `finish` of starting.
    */
   timeouts?: { start?: DurationInput; finish?: DurationInput };
+  /**
+   * Let other EventFlows invoke the function, by its ID. Anyone who may send events to this
+   * EventFlow can, so it takes its input as an event's.
+   */
+  external?: boolean;
   /** What wraps the function and its steps. See the guide. */
   middleware?: MiddlewareClass[];
   onFailure?: (...args: any[]) => unknown;
@@ -128,6 +133,9 @@ export interface Definition {
   priority?: Expression;
   timeouts?: { startMs?: number; finishMs?: number };
   middleware: MiddlewareClass[];
+  external: boolean;
+  /** Made by `createDefer()`. */
+  deferred?: boolean;
 }
 
 type Key = (scope: Record<string, unknown>) => string | undefined;
@@ -152,6 +160,7 @@ const KNOWN = new Set([
   "priority",
   "timeouts",
   "middleware",
+  "external",
   "checkpointing",
   "optimizeParallelism",
 ]);
@@ -249,6 +258,7 @@ export function define(options: FunctionOptions): Definition {
       finishMs: options.timeouts.finish === undefined ? undefined : within(options.timeouts.finish, "finish timeout", 1000, 366 * 86_400_000),
     },
     middleware: options.middleware ?? [],
+    external: options.external === true,
     cancelOn: normalizeCancelOn(options.cancelOn, where),
   };
 }

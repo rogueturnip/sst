@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { regex } from "../src/regex.ts";
 import { bind, compileKey, evaluate, evaluateValue, parseExpression } from "../src/expression.ts";
 
 const event = {
@@ -58,7 +59,7 @@ describe("expressions", () => {
 
   it("refuses what it doesn't know, when it's parsed", () => {
     for (const bad of [
-      "event.data.id.matches('a+')", "process.exit()", "event.data.id = 1", "event.data.", "&& a", "a &&", "a ? b", "[1, 2", "(a",
+      "event.data.id.matches(event.data.id)", "event.data.id.matches('(')", "event.data.id.matches('(a)\\\\1')", "event.data.id.matches('(?=a)')", "process.exit()", "event.data.id = 1", "event.data.", "&& a", "a &&", "a ? b", "[1, 2", "(a",
       "a b", "foo(1)", "event.data.x.constructor()", "has(1)", "event.data.items.map(event, 1)", "a..b", "'open", "a ; b", "${a}", "a => b", "in", "x.size(1)",
     ])
       expect(() => parseExpression(bad, "test")).toThrow(TypeError);
@@ -123,5 +124,30 @@ describe("expressions", () => {
     expect(key("event.data.amount")).toBe("120");
     expect(key("event.data.tags")).toBe('["a","b"]');
     for (const none of ["event.data.missing", "event.data.empty", "event.data.nothing", 'event.data.missing + "x"']) expect(key(none)).toBeUndefined();
+  });
+});
+
+describe("matches()", () => {
+  it("agrees with JavaScript's on patterns both have", () => {
+    const patterns = ["abc", "^abc$", "a.c", "[a-c]+", "[^a-c]", "\\d{2,3}", "^\\w+@\\w+\\.com$", "(foo|bar)baz", "a(b|c)*d", "x?y+z*", "^$", "\\bcat\\b", "[\\w.-]+", "a{0,2}b", "(?:ab)+$", "(a|ab)(c|bcd)", "\\s", "[]a]", "é+", "😀", "^[A-Z]{3}-\\d+$", "a|", "(a*)(b+)?$", "[\\d-]+x", "\\.", "a+?b"];
+    const texts = ["", "abc", "xabcx", "aXc", "cat", "concat", "the cat.", "foobaz", "barbaz", "ad", "abcbd", "y", "xyyz", "12", "1234", "ada@example.com", "ab", "abab", "abcd", "b", "]", "éé", "x😀", "ABC-12", "a b", "1-2x", ".", "aab", "\n"];
+    for (const p of patterns)
+      for (const t of texts) {
+        const [js, mine] = [new RegExp(p === "[]a]" ? "[\\]a]" : p, "u".replace("u", /[\]a]|\[\\d-/.test(p) ? "" : "u")).test(t), regex(p).test(t)];
+        expect([p, t, mine]).toEqual([p, t, js]);
+      }
+  });
+
+  it("takes time in proportion to the text, whatever the pattern", () => {
+    const started = Date.now();
+    for (const p of ["(a+)+$", "(a|a)*$", "(a|aa)+$", "([a-z]+)*\\d", "(.*a){12}"]) regex(p).test("a".repeat(20_000) + "!");
+    expect(Date.now() - started).toBeLessThan(3000);
+    const event = { event: { data: { t: "a".repeat(300_000) + "!" } } };
+    expect(() => is('event.data.t.matches("(a+)+(a+)+(a+)+b{1,100}$")', event)).toThrow("too much work");
+  });
+
+  it("is an expression's", () => {
+    expect(is('event.data.email.lowerAscii().matches("^[a-z]+@example[.]com$")')).toBe(true);
+    expect(() => value("event.data.amount.matches('1')")).toThrow();
   });
 });

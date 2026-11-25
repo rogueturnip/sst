@@ -224,6 +224,21 @@ describe("EventFlow", () => {
     expect(invokesRouter("OpenWorkerHandlerRole", "Open")).toBe(true);
   });
 
+  it("answers the runs of the EventFlows it names, and no others", async () => {
+    const { EventFlow } = await import("../../src/components/aws/eventflow");
+    new EventFlow("Billing", { handler: "src/flow.handler", invokedBy: ["Shop"] });
+    new EventFlow("Shop", { handler: "src/flow.handler" });
+    await settle();
+    const shop = find("aws:lambda/function:Function", "ShopWorkerHandlerFunction").inputs.name;
+    for (const role of ["BillingWorkerHandlerRole", "BillingRouterRole"]) {
+      const policy = JSON.stringify(registered.filter((r) => r.type === "aws:iam/role:Role" && r.name === role).pop()?.inputs);
+      expect(policy).toContain(`function:${shop}:*`);
+      expect(policy).not.toMatch(/lambda:StopDurableExecution[^}]*function:app-test-Shop/);
+    }
+    const own = JSON.stringify(registered.filter((r) => r.type === "aws:iam/role:Role" && r.name === "ShopWorkerHandlerRole").pop()?.inputs);
+    expect(own).not.toContain("BillingWorker");
+  });
+
   it("refuses a role, and a maxConcurrency AWS won't take", async () => {
     const { EventFlow } = await import("../../src/components/aws/eventflow");
     expect(() => new EventFlow("Roled", { handler: "src/flow.handler", role: "arn:aws:iam::1:role/x" } as any)).toThrow("role");

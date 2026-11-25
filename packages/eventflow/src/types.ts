@@ -16,6 +16,12 @@ export interface WireEvent {
    * sender asserts: the engine keeps tenants apart, but can't check who they are.
    */
   tenant?: string;
+  /** The sessions it's in, by name, as Inngest's. */
+  sessions?: Record<string, string>;
+  /** For a deferred function's event, the run that deferred it. */
+  from?: { fn: string; runId: string };
+  /** Its data, when that's large, is in the table. */
+  blob?: { key: string; bytes: number };
 }
 
 /** A queue message. */
@@ -24,6 +30,9 @@ export type Message =
   | { kind: "event"; event: WireEvent }
   // From a sender: data for the run that waits for a signal. `id` is the message's own.
   | { kind: "signal"; signal: string; data: unknown; tenant?: string; id: string }
+  // From another EventFlow: run a function that takes calls from others, and answer its
+  // callback. Like an event, anyone who may send can send one.
+  | { kind: "call"; fn: string; event: WireEvent; parent: string }
   // From the router or the worker, about a run that ended. Signed, and good until `exp`.
   | { kind: "system"; event: WireEvent; exp: number; sig: string }
   // From the router: a run that's held, by a throttle or a cron's jitter, to start at `at`.
@@ -39,6 +48,7 @@ export type Message =
       received?: number;
       fired?: boolean;
       batch?: { item: string; n: number };
+      external?: boolean;
       exp: number;
       sig: string;
     }
@@ -81,6 +91,8 @@ export interface RunPayload {
   at?: number;
   /** For a run with a batch, which one. `event` is its first. */
   batch?: { item: string; n: number };
+  /** Another EventFlow invoked it. */
+  external?: boolean;
   /** For a singleton's run, the singleton it has. */
   lock?: string;
   sig?: string;

@@ -335,7 +335,7 @@ export class MemoryStore implements Store {
       at = Number(order.split("#")[0]) || at;
     } else this.batchItems.set(ref, { event, order });
     const b = this.batch(item);
-    b.pending = [...b.pending.filter((p) => p.order !== order), { order, at, bytes: JSON.stringify(event).length, ref }].sort((x, y) => (x.order < y.order ? -1 : 1));
+    b.pending = [...b.pending.filter((p) => p.order !== order), { order, at, bytes: JSON.stringify(event).length + (event.blob?.bytes ?? 0), ref }].sort((x, y) => (x.order < y.order ? -1 : 1));
     return true;
   }
   async batchPending(item: string, max: number) {
@@ -392,6 +392,14 @@ export class MemoryStore implements Store {
   }
   async lockFree(item: string, run: string) {
     if (this.locks.get(item)?.run === run) this.locks.delete(item);
+  }
+
+  blobs = new Map<string, string>();
+  async putBlob(key: string, body: string) {
+    this.blobs.set(key, body);
+  }
+  async getBlob(key: string) {
+    return this.blobs.get(key);
   }
 
   failed = new Map<string, Failure[]>();

@@ -1,4 +1,5 @@
 import { awsFetch } from "./client.js";
+import { fat } from "./blobs.js";
 import type { Engine } from "./engine.js";
 import { replayId } from "./ids.js";
 import type { RunPayload, WireEvent } from "./types.js";
@@ -190,7 +191,7 @@ export async function getRun(engine: Engine, runId: string): Promise<Run | undef
   return {
     ...found,
     function: payload?.fn ?? "",
-    event: payload?.event as WireEvent,
+    event: (payload?.event && (await fat(engine, payload.event).catch(() => payload.event))) as WireEvent,
     replayOf: payload?.replayOf,
     reused: payload?.memo ? Object.keys(payload.memo) : undefined,
     version: info.Version,

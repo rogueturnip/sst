@@ -1,15 +1,17 @@
 import * as durable from "@aws/durable-execution-sdk-js";
 import { AsyncLocalStorage } from "async_hooks";
 import { createHash } from "crypto";
+import { fat, fatValue, slim, slimValue } from "./blobs.js";
 import { priorityMs, type Definition } from "./definition.js";
 import { parseDuration, toDurableSeconds, type DurationInput } from "./duration.js";
-import { checkSignal, MESSAGE_TTL_MS, toWireEvent, type Engine, type SendPayload } from "./engine.js";
+import { checkSignal, mergeSessions, MESSAGE_TTL_MS, toWireEvent, type Engine, type SendPayload } from "./engine.js";
 import { InvokeFailedError, NonRetriableError, RetryAfterError, SignalConflictError, StepFailedError } from "./errors.js";
 import { bind, conjuncts, evaluate, getPath, parseExpression, paths, type Expression } from "./expression.js";
 import { hash, key, runId as makeRunId } from "./ids.js";
 import { Hooks } from "./middleware.js";
+import { publish, type TopicRef } from "./realtime.js";
 import { named, replayLogger, type Replay } from "./named.js";
-import { sign, verify } from "./sign.js";
+import { keyed, sign, verify } from "./sign.js";
 import type { LeaseWaiter, Limit, Memo } from "./store.js";
 import { sendSystemEvents, wantedSystemEvents } from "./system.js";
 import { infer, saveResponse, toResponse, type AiModel, type SavedResponse } from "./tools.js";
@@ -25,7 +27,8 @@ export interface Registered {
 
 /** A function's return, as the run that invoked it gets it. */
 export type InvokeOutcome =
-  | { ok: true; result: unknown }
+  /** A large result is in the table, or for another EventFlow, isn't returned. */
+  | { ok: true; result?: unknown; blob?: string }
   | { ok: false; error: { name: string; message: string } };
 
 export { NonRetriableError, RetryAfterError, StepFailedError, InvokeFailedError, SignalConflictError } from "./errors.js";
@@ -220,12 +223,24 @@ interface RunState {
   used: Set<string>;
   /** A step's place, where it's been claimed already. */
   claimed?: Claim;
+  /** The sessions its events share, for what it sends. */
+  sessions?: Record<string, string>;
+  /** What it defers, by name. */
+  defers: Map<string, Deferred>;
+  deferCounts: Map<string, number>;
+  deferUsed: Set<string>;
   /** Note that the run started, before its first step runs. */
   start: () => Promise<void>;
   hooks: Hooks;
   /** The context a hook gets. */
   args?: Record<string, unknown>;
   settled: () => Promise<void>;
+}
+
+interface Deferred {
+  fn: string;
+  data: unknown;
+  sessions?: Record<string, string>;
 }
 
 interface Claim {
@@ -254,6 +269,13 @@ function claim(state: RunState, input: StepInput): Claim {
   if (state.claimed) return state.claimed;
   const first = state.counts.size === 0;
   return { id: occurrence(state, stepId(input)), first };
+}
+
+/** The sessions that all of a run's events are in. */
+function sessionsOf(events: WireEvent[]): Record<string, string> | undefined {
+  const [first, ...rest] = events;
+  const shared = Object.entries(first?.sessions ?? {}).filter(([k, v]) => rest.every((e) => e.sessions?.[k] === v));
+  return shared.length ? Object.fromEntries(shared) : undefined;
 }
 
 const never = () => new Promise<never>(() => {});
@@ -630,7 +652,7 @@ function makeStep(state: RunState) {
         },
         { subType: "EventFlowWait" },
       ),
-    ) as Promise<WireEvent | null>);
+    ).then((e: any) => (e?.blob ? read("the event's data", () => fat(engine, e)) : e)) as Promise<WireEvent | null>);
   };
 
   const waitForSignal = (
@@ -642,7 +664,11 @@ function makeStep(state: RunState) {
     const saved = earlier(id);
     if (saved) return saved;
     begin(first);
-    checkSignal(options);
+    try {
+      checkSignal(options);
+    } catch (error) {
+      throw new UsageError((error as Error).message);
+    }
     if (options.onConflict !== undefined && options.onConflict !== "fail" && options.onConflict !== "replace")
       throw new UsageError(`The step "${id}" has onConflict "${options.onConflict}". Use "fail" or "replace".`);
     const timeoutMs =
@@ -685,7 +711,12 @@ function makeStep(state: RunState) {
 
   const invoke = (
     idInput: string | { id: string },
-    options: { function: string | { id: string } | { opts?: { id?: string; functionId?: string; appId?: string } }; data?: unknown; timeout?: DurationInput | Date },
+    options: {
+      function: string | { id: string } | { opts?: { id?: string; functionId?: string; appId?: string } };
+      data?: unknown;
+      meta?: SendPayload["meta"];
+      timeout?: DurationInput | Date;
+    },
   ) => {
     if (state.fence.down) return never();
     const { id, first } = claim(state, idInput);
@@ -695,9 +726,11 @@ function makeStep(state: RunState) {
     const fn = options.function as any;
     const target = typeof fn === "string" ? fn.replace(new RegExp(`^${escape(engine.appId)}-`), (prefix) => (state.registry.has(fn) ? prefix : "")) : (fn?.id ?? fn?.opts?.id ?? fn?.opts?.functionId);
     if (!target) throw new UsageError(`The step "${id}" has no function to invoke.`);
-    if (fn?.opts?.appId !== undefined && fn.opts.appId !== engine.appId)
-      throw new UsageError(`The step "${id}" invokes a function of the app "${fn.opts.appId}". An EventFlow invokes its own functions: send an event to another, and wait for its answer.`);
-    if (!state.registry.has(target))
+    const sessions = mergeSessions(engine.propagateSessions ? state.sessions : undefined, options.meta);
+    const app = fn?.opts?.appId !== undefined && fn.opts.appId !== engine.appId ? String(fn.opts.appId) : undefined;
+    if (app !== undefined && !engine.apps[app])
+      throw new UsageError(`The step "${id}" invokes a function of the app "${app}". Give it to the client, as "apps: { ${JSON.stringify(app)}: Resource.… }", and link it.`);
+    if (app === undefined && !state.registry.has(target))
       throw new UsageError(`The step "${id}" invokes "${target}", which isn't served by this EventFlow.`);
     const timeoutMs =
       options.timeout === undefined
@@ -728,14 +761,19 @@ function makeStep(state: RunState) {
               data: options.data ?? {},
               ts: Date.now(),
               ...(state.event.tenant ? { tenant: state.event.tenant } : {}),
+              ...(sessions ? { sessions } : {}),
             };
+            if (app !== undefined) {
+              await engine.sendMessages([{ message: { kind: "call", fn: target, event, parent: callbackId }, group: event.tenant }], engine.apps[app].queueUrl);
+              return {};
+            }
             const childRunId = makeRunId(target, identity);
             await engine.sendMessages([
               {
                 message: sign({
                   kind: "invoke" as const,
                   fn: target,
-                  event,
+                  event: await slim(engine, event),
                   parent: callbackId,
                   runId: childRunId,
                   root,
@@ -762,7 +800,7 @@ function makeStep(state: RunState) {
       ),
     ).then((outcome: InvokeOutcome) => {
       if (!outcome.ok) throw new InvokeFailedError(outcome.error.message, target);
-      return outcome.result;
+      return outcome.blob ? read("the result", () => fatValue(engine, { blob: outcome.blob })) : outcome.result;
     }));
   };
 
@@ -782,7 +820,7 @@ function makeStep(state: RunState) {
           ...p,
           id: p.id ?? hash(JSON.stringify([state.root, state.namespace, id, i]), 26),
           tenant: p.tenant ?? state.event.tenant,
-        }),
+        }, undefined, engine.propagateSessions ? state.sessions : undefined),
       );
       await engine.sendEvents(wire);
       return { ids: wire.map((e) => e.id) };
@@ -817,7 +855,11 @@ function makeStep(state: RunState) {
     const saved = earlier(id);
     if (saved) return saved as Promise<{ runId: string | undefined }>;
     begin(first);
-    checkSignal(options);
+    try {
+      checkSignal(options);
+    } catch (error) {
+      throw new UsageError((error as Error).message);
+    }
     return record(
       id,
       eager(
@@ -863,8 +905,14 @@ function makeStep(state: RunState) {
     },
   };
 
-  const tools: Record<string, any> = { run, sleep, sleepUntil, waitForEvent, waitForSignal, invoke, sendEvent, sendSignal, fetch: stepFetch, ai };
-  Object.defineProperty(tools, "realtime", { get: unsupported("step.realtime") });
+  const realtime = {
+    publish: (idInput: StepInput, ref: TopicRef, data: unknown) =>
+      run(idInput, () => {
+        if (!engine.realtime) throw new UsageError("step.realtime.publish() needs a Realtime component: link one to the EventFlow.");
+        return publish(engine.realtime.resource, engine.realtime.prefix, ref, data, { runId: state.runId, fnId: def.id }, engine.aws);
+      }),
+  };
+  const tools: Record<string, any> = { run, sleep, sleepUntil, waitForEvent, waitForSignal, invoke, sendEvent, sendSignal, fetch: stepFetch, ai, realtime };
   return tools;
 }
 
@@ -932,8 +980,8 @@ function withMiddleware(state: RunState): Record<string, any> {
   };
   const tools: Record<string, any> = { ...plain };
   for (const name of ["run", "sleep", "sleepUntil", "waitForEvent", "waitForSignal", "invoke", "sendEvent", "sendSignal"]) tools[name] = tool(name, name);
-  tools.ai = { infer: tool("ai.infer", "ai.infer"), wrap: tool("ai.wrap", "ai.wrap") };
-  Object.defineProperty(tools, "realtime", { get: unsupported("step.realtime") });
+  tools.ai = { infer: tool("ai.infer", "ai.infer"), wrap: tool("ai.wrap", "ai.wrap"), get models() { return unsupported("step.ai.models")(); } };
+  tools.realtime = { publish: tool("realtime.publish", "realtime.publish") };
   return tools;
 }
 
@@ -1065,10 +1113,11 @@ async function listen(
   await engine.store.putWaiter(k, waiter);
   const registered = { key: k, createdAt, callbackId: input.callbackId };
   const recent = await engine.store.recent(recentKey(input.name, input.tenant), createdAt);
-  for (const { event } of recent) {
+  for (const { event: kept } of recent) {
+    const event = await fat(engine, kept);
     if (!eventMatches(event, input.field, input.value, waiter.condition)) continue;
     await engine.store.deleteWaiter(k, waiter).catch(() => {});
-    return { event, registered };
+    return { event: kept, registered };
   }
   return { event: null, registered };
 }
@@ -1130,17 +1179,18 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
     const finish = async (outcome: InvokeOutcome) => {
       if (!payload.parent) return;
       await ctx.step("sst:return", async () => {
-        const bytes = Buffer.byteLength(JSON.stringify(outcome));
-        const answer: InvokeOutcome =
-          bytes > MAX_ANSWER_BYTES
-            ? {
-                ok: false,
-                error: {
-                  name: "InvokeError",
-                  message: `The run succeeded, and its result is ${bytes} bytes, more than the ${MAX_ANSWER_BYTES} an invoke returns. Store it in a bucket, and return its key.`,
-                },
-              }
-            : outcome;
+        let answer = outcome;
+        if (outcome.ok) {
+          // A large result is kept for the run that invoked it. One of another EventFlow has
+          // no way to read it.
+          const kept = await slimValue(engine, `result\n${payload.runId}`, outcome.result);
+          if (!("blob" in kept)) answer = outcome;
+          else if (payload.external)
+            answer = Buffer.byteLength(JSON.stringify(outcome)) > MAX_ANSWER_BYTES
+              ? { ok: false, error: { name: "InvokeError", message: "The run succeeded, and its result is more than an invoke of another EventFlow returns. Store it in a bucket, and return its key." } }
+              : outcome;
+          else answer = { ok: true, blob: kept.blob };
+        }
         await engine.callback(payload.parent!, answer);
       }, ENDING);
     };
@@ -1170,6 +1220,7 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
 
     // It has the run's event alone, until the batch is read.
     let events = [payload.event];
+    let event = payload.event;
     let hooks = new Hooks([], options.client, {});
     let settled: Promise<void> | undefined;
     const tellRun = async (name: string, fn: () => Promise<void>) => {
@@ -1179,13 +1230,16 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
     // Whether this invocation goes on from what's saved. The SDK's own logger can't tell, in a
     // virtual context.
     const replay: Replay = { on: Object.keys((ctx as any)._executionContext?._stepData ?? {}).length > 1 };
+    // What its functions deferred. Each time the function is replayed it defers the same.
+    const defers = new Map<string, Deferred>();
+    let shared = sessionsOf(events);
     const newState = (more: Partial<RunState>): RunState => ({
       ctx,
       engine,
       def,
       registry,
       runId,
-      event: payload.event,
+      event,
       memo: Object.assign(Object.create(null), payload.memo ?? {}),
       // The root is signed with the payload. A payload from before roots is its own.
       root: payload.root ?? payload.runId,
@@ -1198,6 +1252,10 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
       fence: { down: false },
       replay,
       used: new Set(),
+      sessions: shared,
+      defers,
+      deferCounts: new Map(),
+      deferUsed: new Set(),
       start,
       hooks,
       settled: async () => {},
@@ -1231,18 +1289,26 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
         if (!current) throw new TypeError("Call idempotencyKey() inside step.run: it's the key of that step.");
         return current.key;
       };
-      // What EventFlow can't give throws when it's read, instead of being undefined.
-      const missing: Record<string, string> = {
-        defer: "EventFlow doesn't support `defer`.",
-        sessions: "EventFlow doesn't support `sessions`.",
-      };
-      for (const [name, message] of Object.entries(missing))
-        Object.defineProperty(args, name, {
-          enumerable: false,
-          get() {
-            throw new UsageError(message);
-          },
+      if (forState.sessions) args.sessions = forState.sessions;
+      if (def.deferred) args.parents = events.map((e) => ({ fnSlug: e.from?.fn ?? "", runId: e.from?.runId ?? "" }));
+      // Start a deferred function once this run has ended.
+      args.defer = (id: string, input: { function: any; data?: unknown; meta?: SendPayload["meta"] }) => {
+        const target = input?.function?.id ?? input?.function?.opts?.id;
+        if (!target || !registry.get(target)?.def.deferred)
+          throw new UsageError(`defer("${id}") needs a function made by createDefer(), and served by this EventFlow.`);
+        const schema = (input.function as any).schema?.["~standard"];
+        const checked = schema?.validate(input.data);
+        if (checked && typeof checked.then === "function") throw new UsageError(`defer("${id}") needs a schema that checks at once.`);
+        if (checked?.issues) throw new UsageError(`The data of defer("${id}") doesn't match its schema: ${checked.issues.map((i: any) => i.message).join("; ")}`);
+        if (forState.fence.down) return { abort: () => {} };
+        const name = occurrence({ counts: forState.deferCounts, used: forState.deferUsed } as any, stepId(id));
+        defers.set(`${forState.namespace}\n${name}`, {
+          fn: target,
+          data: jsonify(checked ? checked.value : (input.data ?? {})),
+          sessions: mergeSessions(engine.propagateSessions ? forState.sessions : undefined, input.meta),
         });
+        return { abort: () => void defers.delete(`${forState.namespace}\n${name}`) };
+      };
       return args;
     };
 
@@ -1265,6 +1331,9 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
         events = await read("the run's batch", async () => engine.store.batchEvents(await engine.store.batchRead(batch.item, batch.n)));
         if (!events.length) throw new NonRetriableError("The run's batch is gone.");
       }
+      if (events.some((e) => e.blob)) events = await read("the run's event", () => Promise.all(events.map((e) => fat(engine, e))));
+      event = events[0];
+      shared = sessionsOf(events);
       hooks = new Hooks([...(options.middleware ?? []), ...def.middleware], options.client, { id: def.id, name: def.name, opts: { id: def.id } });
 
       // Listen for the events that cancel the run, before it does anything else.
@@ -1273,7 +1342,7 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
           const keys: typeof cancelKeys = [];
           let found = false;
           for (const c of def.cancelOn) {
-            const { field, value, condition } = matcher("cancelOn", payload.event, c);
+            const { field, value, condition } = matcher("cancelOn", event, c);
             const expiresAt = Date.now() + (c.timeoutMs ?? ttlMs);
             const heard = await listen(engine, {
               name: c.name,
@@ -1300,6 +1369,8 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
       // An attempt of the function. It's in a virtual context, which costs no operation, so
       // an attempt that failed keeps its place in the history when it isn't run again.
       const attempt = async (n: number, memo: Record<string, unknown>) => {
+        // What an attempt that failed deferred, the next does again, if it comes to it.
+        defers.clear();
         const state = newState({ memo, attempt: n });
         state.settled = () => (settled ??= hooks.tell("onMemoizationEnd", { ctx: state.args }));
         let outcome: Outcome | undefined;
@@ -1395,7 +1466,7 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
             event: {
               id: hash(`failed\n${runId}`),
               name: "inngest/function.failed",
-              data: { event: payload.event, error: errorInfo(error), function_id: def.id, run_id: runId },
+              data: { event, error: errorInfo(error), function_id: def.id, run_id: runId },
               ts,
             },
           });
@@ -1426,6 +1497,39 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
       await ending("stop listening", () =>
         tellRun("sst:cancelOn:end", async () => {
           await Promise.all(cancelKeys.map((k) => engine.store.deleteWaiter(k.key, k)));
+        }),
+      );
+    // Start what it deferred, unless it was cancelled.
+    if (defers.size && !isCancelled)
+      await ending("start what it deferred", () =>
+        tellRun("sst:defer", async () => {
+          const messages = await Promise.all(
+            [...defers].map(async ([name, d]) => {
+              const id = keyed(JSON.stringify(["defer", payload.runId, name]));
+              const childId = makeRunId(d.fn, `defer\n${payload.runId}\n${name}`);
+              return {
+                message: sign({
+                  kind: "start" as const,
+                  fn: d.fn,
+                  event: await slim(engine, {
+                    id,
+                    name: "inngest/deferred.schedule",
+                    data: d.data,
+                    ts: Date.now(),
+                    from: { fn: def.id, runId: payload.runId },
+                    ...(payload.event.tenant ? { tenant: payload.event.tenant } : {}),
+                    ...(d.sessions ? { sessions: d.sessions } : {}),
+                  }),
+                  at: Date.now(),
+                  runId: childId,
+                  root: hash(JSON.stringify([payload.root ?? payload.runId, "defer", name]), 26),
+                  exp: Date.now() + MESSAGE_TTL_MS,
+                }),
+                group: payload.event.tenant,
+              };
+            }),
+          );
+          await engine.sendMessages(messages);
         }),
       );
     // Give back the singleton, and send the events about the run.

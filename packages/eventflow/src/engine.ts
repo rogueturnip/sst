@@ -5,6 +5,7 @@ import { sqs } from "./aws.js";
 import { hash, ulid } from "./ids.js";
 import { sign } from "./sign.js";
 import { DynamoStore, type Store } from "./store.js";
+import type { RealtimeResource } from "./realtime.js";
 import {
   ADMIN_MARKER,
   CONTRACT,
@@ -16,8 +17,10 @@ import {
   type WireEvent,
 } from "./types.js";
 
-/** The largest event, in bytes of JSON, that `send()` accepts. It leaves room for the message around it in SQS's 256 KB. */
-export const MAX_EVENT_BYTES = 255 * 1024;
+/** The largest message SQS takes, and the largest batch: 1 MiB. */
+const MAX_BATCH_BYTES = 1_048_576;
+/** The largest event, in bytes of JSON, that `send()` accepts. It leaves room for the message around it. */
+export const MAX_EVENT_BYTES = 1_000_000;
 /**
  * How long a signed message in the queue is good for: longer than the dead-letter
  * queue keeps it, so one moved back after a fix still runs.
@@ -65,14 +68,21 @@ export class Engine {
     return { name, qualifier };
   }
 
-  async sendMessages(messages: { message: Message; group?: string; delaySeconds?: number }[]) {
+  /** The other EventFlows it calls functions of, by app ID. */
+  apps: Record<string, EngineResource> = {};
+  /** Where it publishes realtime messages, and under what. */
+  realtime?: { resource: RealtimeResource; prefix: string };
+  /** Runs give their sessions to the events they send. */
+  propagateSessions = true;
+
+  async sendMessages(messages: { message: Message; group?: string; delaySeconds?: number }[], queueUrl = this.resource.queueUrl) {
     // SendMessageBatch takes 10 messages and 256 KB.
     const batches: (typeof messages)[] = [];
     let batch: typeof messages = [];
     let bytes = 0;
     for (const m of messages) {
       const size = Buffer.byteLength(JSON.stringify(m.message));
-      if (batch.length === 10 || (batch.length && bytes + size > 255 * 1024)) {
+      if (batch.length === 10 || (batch.length && bytes + size > MAX_BATCH_BYTES - 1024)) {
         batches.push(batch);
         batch = [];
         bytes = 0;
@@ -86,7 +96,7 @@ export class Engine {
       const result = await sqs<{ Failed?: { Id: string; Code: string; Message?: string }[] }>(
         "SendMessageBatch",
         {
-          QueueUrl: this.resource.queueUrl,
+          QueueUrl: queueUrl,
           Entries: entries.map((e, i) => ({
             Id: String(i),
             MessageBody: JSON.stringify(e.message),
@@ -242,6 +252,11 @@ export interface SendPayload {
    */
   tenant?: string;
   v?: string;
+  /**
+   * The sessions the event is in, by name, to group its runs. The events a run sends are in
+   * the run's sessions too; `null` takes one, or all of them, away.
+   */
+  meta?: { sessions?: Record<string, string | number | null> | null };
 }
 
 // SQS's MessageGroupId: letters, digits and punctuation.
@@ -251,14 +266,14 @@ const ID = /^[\x21-\x7e]{1,128}$/;
 const CONTROL = /[\u0000-\u001f\u007f]/;
 
 /** Check an event, as `send()` does and as the router does for every message. */
-export function checkEvent(input: Partial<WireEvent> & Record<string, unknown>, label = "event") {
+export function checkEvent(input: Partial<WireEvent> & Record<string, unknown>, label = "event", own = false) {
   if (!input || typeof input !== "object") throw new TypeError(`The ${label} isn't an object.`);
   const name = input.name;
   if (typeof name !== "string" || !name) throw new TypeError(`An ${label} needs a name.`);
   if (name.length > 256 || CONTROL.test(name))
     throw new TypeError(`The ${label} name "${name.slice(0, 40)}" must be 1 to 256 characters, with no control characters.`);
   // So a sender can't make up what happened to a run.
-  if (name.startsWith("inngest/")) throw new TypeError(`The ${label} name "${name.slice(0, 60)}" is kept for EventFlow's own, as "inngest/" is.`);
+  if (name.startsWith("inngest/") && !own) throw new TypeError(`The ${label} name "${name.slice(0, 60)}" is kept for EventFlow's own, as "inngest/" is.`);
   if (input.tenant !== undefined && (typeof input.tenant !== "string" || !TENANT.test(input.tenant)))
     throw new TypeError(
       `The tenant of ${label} "${name}" must be 1 to 128 letters, digits and punctuation, as SQS allows in a MessageGroupId.`,
@@ -267,6 +282,11 @@ export function checkEvent(input: Partial<WireEvent> & Record<string, unknown>, 
     throw new TypeError(`The id of ${label} "${name}" must be 1 to 128 printable characters, with no spaces.`);
   if (input.ts !== undefined && (typeof input.ts !== "number" || !Number.isFinite(input.ts)))
     throw new TypeError(`The ts of ${label} "${name}" must be a number of milliseconds.`);
+  if (input.sessions !== undefined) {
+    const entries = input.sessions && typeof input.sessions === "object" && !Array.isArray(input.sessions) ? Object.entries(input.sessions) : undefined;
+    if (!entries || entries.length > 20 || entries.some(([k, v]) => !k || k.length > 128 || typeof v !== "string" || v.length > 256))
+      throw new TypeError(`The sessions of ${label} "${name}" must be at most 20, with names to 128 characters and IDs to 256.`);
+  }
   if ("user" in input)
     throw new TypeError(
       `The ${label} "${name}" has a "user" field. Inngest v4 removed it, and EventFlow doesn't support it. Put it in "data".`,
@@ -281,8 +301,34 @@ export function checkSignal(input: { signal?: unknown; tenant?: unknown }) {
     throw new TypeError("The tenant of a signal must be 1 to 128 letters, digits and punctuation, as SQS allows in a MessageGroupId.");
 }
 
-export function toWireEvent(input: SendPayload, now = Date.now()): WireEvent {
-  checkEvent(input as any);
+/** The sessions of an event that's sent: those of the run that sends it, and its own. */
+export function mergeSessions(from: Record<string, string> | undefined, meta: SendPayload["meta"]): Record<string, string> | undefined {
+  const own = meta?.sessions;
+  if (own === null) return undefined;
+  const merged: Record<string, string> = { ...from };
+  for (const [k, v] of Object.entries(own ?? {})) {
+    if (v === null) delete merged[k];
+    else merged[k] = String(v);
+  }
+  return Object.keys(merged).length ? merged : undefined;
+}
+
+/** What a sender gives of an event, and nothing else: what's EventFlow's own isn't theirs to set. */
+export function cleanEvent(event: WireEvent): WireEvent {
+  return {
+    id: event.id,
+    name: event.name,
+    data: event.data,
+    ts: typeof event.ts === "number" ? event.ts : Date.now(),
+    ...(typeof event.v === "string" ? { v: event.v } : {}),
+    ...(event.tenant ? { tenant: event.tenant } : {}),
+    ...(event.sessions ? { sessions: event.sessions } : {}),
+  };
+}
+
+export function toWireEvent(input: SendPayload, now = Date.now(), from?: Record<string, string>): WireEvent {
+  const sessions = mergeSessions(from, input.meta);
+  checkEvent({ ...(input as any), ...(sessions ? { sessions } : {}) });
   const event: WireEvent = {
     id: input.id ?? ulid(now),
     name: input.name,
@@ -290,6 +336,7 @@ export function toWireEvent(input: SendPayload, now = Date.now()): WireEvent {
     ts: input.ts ?? now,
     ...(input.v ? { v: input.v } : {}),
     ...(input.tenant ? { tenant: input.tenant } : {}),
+    ...(sessions ? { sessions } : {}),
   };
   const bytes = Buffer.byteLength(JSON.stringify(event));
   if (bytes > MAX_EVENT_BYTES)

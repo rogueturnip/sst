@@ -10,9 +10,11 @@
 //                                                 lowerAscii, upperAscii, trim, split, join
 //   event.data.items.exists(i, i.price > 100)     exists, all, exists_one, filter, map
 //
-// Anything else throws a TypeError when it's parsed, instead of being read some other
-// way. `matches()` isn't here: JavaScript's regular expressions can take forever on some
-// text, and the text is the sender's.
+//   event.data.sku.matches("^[A-Z]{3}-\\d+$")     a pattern, in time that's bounded
+//
+// Anything else throws a TypeError when it's parsed, instead of being read some other way.
+
+import { regex } from "./regex.js";
 
 export type Node =
   | { kind: "path"; path: string[] }
@@ -39,8 +41,8 @@ const TOKEN =
 
 const MAX_LENGTH = 8 * 1024;
 const MAX_DEPTH = 64;
-/** The most elements a macro, or a size, works on: an event can be large. */
-const MAX_WORK = 100_000;
+/** The most elements, or characters, an expression works on: an event can be large. */
+const MAX_WORK = 400_000;
 
 const PRECEDENCE: Record<string, number> = {
   "||": 1,
@@ -62,6 +64,7 @@ const PRECEDENCE: Record<string, number> = {
 const FUNCTIONS: Record<string, number> = { has: 1, size: 1, string: 1, int: 1, double: 1, bool: 1 };
 const METHODS: Record<string, number> = {
   contains: 1,
+  matches: 1,
   startsWith: 1,
   endsWith: 1,
   size: 0,
@@ -184,6 +187,11 @@ export function parseExpression(source: string, label: string): Expression {
           if (!Object.hasOwn(METHODS, name.text)) fail(`.${name.text}(`);
           const list = args();
           if (list.length !== METHODS[name.text]) fail(`.${name.text}(`);
+          // A pattern is the function's, and not an event's, so it's checked now.
+          if (name.text === "matches") {
+            if (list[0].kind !== "literal" || typeof list[0].value !== "string") fail(".matches(");
+            else regex(list[0].value);
+          }
           node = { kind: "call", name: `.${name.text}`, args: [node, ...list] };
         } else if (node.kind === "path") node = { kind: "path", path: [...node.path, name.text] };
         else node = { kind: "get", of: node, key: { kind: "literal", value: name.text } };
@@ -335,7 +343,10 @@ function binaryValue(node: Extract<Node, { kind: "binary" }>, scope: Record<stri
       if (right && typeof right === "object") return typeof left === "string" && Object.prototype.hasOwnProperty.call(right, left);
       throw new EvaluationError('"in" needs a list or an object.');
     case "+":
-      if (typeof left === "string" && typeof right === "string") return left + right;
+      if (typeof left === "string" && typeof right === "string") {
+        spend(budget, (left.length + right.length) >> 4);
+        return left + right;
+      }
       if (Array.isArray(left) && Array.isArray(right)) {
         spend(budget, left.length + right.length);
         return [...left, ...right];
@@ -398,7 +409,10 @@ function call(node: Extract<Node, { kind: "call" }>, scope: Record<string, unkno
       if (a === false || a === "false") return false;
       throw new EvaluationError("bool() needs a boolean.");
     case ".contains":
+      spend(budget, text(a).length >> 4);
       return text(a).includes(text(b));
+    case ".matches":
+      return regex(text(b)).test(text(a), (n) => spend(budget, n));
     case ".startsWith":
       return text(a).startsWith(text(b));
     case ".endsWith":

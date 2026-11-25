@@ -185,10 +185,10 @@ Keys, `if`s and `priority` are [CEL](https://cel.dev) expressions, as with Innge
 | Values | Paths like `event.data.items[0].sku` and `event.data["odd-key"]`, strings, numbers, `true`, `false`, `null`, lists |
 | Operators | `==` `!=` `<` `<=` `>` `>=` `&&` `||` `!` `+` `-` `*` `/` `%` `in` `? :` |
 | Functions | `has()` `size()` `string()` `int()` `double()` `bool()` |
-| Of strings | `contains()` `startsWith()` `endsWith()` `lowerAscii()` `upperAscii()` `trim()` `split()` `size()` |
+| Of strings | `contains()` `matches()` `startsWith()` `endsWith()` `lowerAscii()` `upperAscii()` `trim()` `split()` `size()` |
 | Of lists | `exists()` `all()` `exists_one()` `filter()` `map()` `join()` `size()` |
 
-Anything else throws when the function is created. `matches()` isn't there: JavaScript's regular expressions can take forever on text that a sender chooses. Order only compares numbers with numbers, and strings with strings, so a string can't pass `event.data.amount > 100`. A key can also be a function: `key: (event) => event.data.customerId`.
+Anything else throws when the function is created. `matches()` takes a pattern as RE2 does, in time that's in proportion to the text, and without backreferences or lookaround: JavaScript's can take forever on text that a sender chooses. Order only compares numbers with numbers, and strings with strings, so a string can't pass `event.data.amount > 100`. A key can also be a function: `key: (event) => event.data.customerId`.
 
 ---
 
@@ -218,7 +218,7 @@ A step is **at least once**. If the worker crashes after the step's code ran, bu
 
 ### IDs
 
-A step's ID is its name in the run's history. Used more than once, as in a loop, it gets the suffixes `:1`, `:2`, …, as with Inngest. Changing a step's ID, or the order of steps, breaks runs that are in flight on the old code only if they're replayed on the new code: see [deploying](#deploying).
+A step is found by its ID, as with Inngest, so branches that run at once can finish in any order. Used more than once, as in a loop, an ID gets the suffixes `:1`, `:2`, … in the order it's used. Give the steps of branches that run at once IDs of their own, like `` `charge-${order.id}` ``: one ID in two branches gets its suffixes by which comes first. A run stays on the version it started on: see [deploying](#deploying).
 
 ### Sleep
 
@@ -259,6 +259,47 @@ const summary = await step.ai.wrap("summarize", generateText, { model, prompt })
 ```
 
 `step.fetch` is `fetch` as a step: the request runs in your worker, and its response, up to 700 KB, is saved. It's tried again when the request fails, not for an error status. `step.ai.infer` takes a model adapter, like those of [`@inngest/ai`](https://www.npmjs.com/package/@inngest/ai). It's tried again for a rate limit, when the provider says, or a server error. Unlike Inngest's, both wait in your Lambda, so they're billed while they do.
+
+### Realtime
+
+```ts
+import { channel } from "@sst-community/eventflow";
+
+const order = channel({ name: (id: string) => `order:${id}`, topics: { status: { schema: z.object({ state: z.string() }) } } });
+
+await step.realtime.publish("tell", order(id).status, { state: "paid" });
+```
+
+Messages to browsers, through SST's [`Realtime`](/docs/component/aws/realtime) component, linked to the EventFlow. `step.realtime.publish()` publishes once; `flow.realtime.publish()` now. Browsers subscribe with MQTT, to `flow.realtime.topic(order(id).status)`, which the component's authorizer has to allow. Inngest's subscription tokens and `useRealtime` aren't here. A message is at most 120 KB.
+
+### Defer
+
+```ts
+const audit = createDefer(flow, { id: "audit" }, async ({ event, parents, step }) => { /* ... */ });
+
+const deferred = defer("audit", { function: audit, data: { what: "paid" } });
+```
+
+A deferred function starts once the run that deferred it has ended, whether it succeeded or failed, and not if it was cancelled. `deferred.abort()` takes it back. Pass it to `serve()` with the others.
+
+### Sessions
+
+`send({ ..., meta: { sessions: { chat: chatId } } })` puts an event in sessions. A run's `sessions` are those that all of its events are in. The events it sends, and the functions it invokes, are in them too, unless the client has `sessionPropagation: false`; `null` takes one away.
+
+### Another EventFlow's functions
+
+```ts title="src/shop.ts"
+new EventFlow({ id: "shop", resource: Resource.Shop, apps: { billing: Resource.Billing } });
+
+await step.invoke("charge", { function: referenceFunction({ appId: "billing", functionId: "charge" }), data });
+```
+
+```ts title="sst.config.ts"
+const billing = new sst.aws.EventFlow("Billing", { handler: "src/billing.handler", invokedBy: ["Shop"] });
+const shop = new sst.aws.EventFlow("Shop", { handler: "src/shop.handler", link: [billing] });
+```
+
+The function it invokes has `external: true`. Anyone who may send events to its EventFlow can invoke it, so it takes its input as it takes an event's. Its result is at most 250 KB.
 
 ---
 
@@ -492,7 +533,7 @@ class Tracing extends Middleware.BaseMiddleware {
 export const flow = new EventFlow({ id: "my-app", middleware: [Tracing] });
 ```
 
-On the EventFlow, or on a function. It has the hooks of Inngest's: `transformFunctionInput`, `transformStepInput`, `transformSendEvent`, `wrapFunctionHandler`, `wrapStep`, `wrapStepHandler`, `wrapSendEvent`, `onRunStart`, `onRunComplete`, `onRunError`, `onStepStart`, `onStepComplete`, `onStepError` and `onMemoizationEnd`. `wrapRequest` throws, since there's no request, and `stepInfo.memoized` is `undefined` before a step runs. `wrapFunctionHandler` and `wrapStep` run each time the function replays. The run hooks are a step each, so they run once, and one more operation.
+On the EventFlow, or on a function. It has the hooks of Inngest's: `transformFunctionInput`, `transformStepInput`, `transformSendEvent`, `wrapFunctionHandler`, `wrapStep`, `wrapStepHandler`, `wrapSendEvent`, `onRunStart`, `onRunComplete`, `onRunError`, `onStepStart`, `onStepComplete`, `onStepError` and `onMemoizationEnd`. A middleware's static `functions()` are served too. `wrapRequest` throws, since there's no request, and `stepInfo.memoized` is `undefined` before a step runs. `wrapFunctionHandler` and `wrapStep` run each time the function replays. The run hooks are a step each, so they run once, and one more operation.
 
 ## Events about runs
 
@@ -697,7 +738,7 @@ The worker is a published version. A run keeps the version it started on, throug
 
 | | Limit |
 |---|---|
-| Event size | 256 KB |
+| Event size | 1 MB |
 | Events per `send()` | No limit; sent 10 per request |
 | Event ID memory | 24 hours |
 | Run length | `timeout.execution`, up to 366 days; 14 days by default |
@@ -808,10 +849,10 @@ To reproduce it, deploy the tenants example and follow its steps.
 
 These throw, when the function is created or they're used:
 
-- `step.realtime`, `ctx.defer` and `ctx.sessions`
-- `matches()` in an expression
-- `step.invoke()` of a function of another EventFlow
-- middleware's `wrapRequest` and `functions`
-- the client's `fetch`, `schemas`, `internalLogger`, `endpointAdapter`, `sessionPropagation` and `aiMetadata`
+- Realtime's subscription tokens and `useRealtime`: browsers subscribe with MQTT
+- `step.ai.models`: import the adapters from `@inngest/ai`
+- backreferences and lookaround in `matches()`
+- middleware's `wrapRequest`, and changing a step's ID in `transformStepInput`
+- the client's `schemas`, which Inngest v4 hasn't either, and `endpointAdapter`
 
 The [migration guide](/docs/migrate-from-inngest#compatibility) has what to use instead.

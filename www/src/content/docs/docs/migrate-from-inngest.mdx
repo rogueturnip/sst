@@ -230,21 +230,23 @@ Every option of `createFunction()` in v4.27.0, and the step tools.
 | `cancelOn` | Supported: `event`, `match`, `if`, `timeout` | |
 | `timeouts` | Supported | |
 | `singleton` | Supported, per key and tenant | |
-| `middleware` | Supported, without `wrapRequest` and `functions` | |
+| `middleware` | Supported, without `wrapRequest` | |
 | `step.run`, `sleep`, `sleepUntil`, `waitForEvent`, `invoke`, `sendEvent` | Supported | |
 | `group.parallel` | Runs the function | `Promise.all` of steps |
 | `step.fetch`, `step.ai.infer`, `step.ai.wrap` | Supported. They wait in your Lambda | Model adapters from `@inngest/ai` |
 | `step.waitForSignal`, `step.sendSignal` | Supported, per tenant | |
-| `step.realtime` | Throws | A `step.run` that publishes to [`Realtime`](/docs/component/aws/realtime) |
-| `step.invoke` by function ID, `referenceFunction()` | Supported, in the same app | An event to another app, and a wait |
+| `step.realtime.publish`, `channel()` | Supported, through [`Realtime`](/docs/component/aws/realtime) | Subscribe with MQTT, instead of `useRealtime` |
+| `step.invoke` by function ID, `referenceFunction()` | Supported, and for another EventFlow with `external: true` | |
 | `ctx.attempt` | Supported. Read it as `ctx.attempt`, in the step | |
 | an error outside a step | Retries the function | |
 | `inngest/function.finished`, `.failed`, `.cancelled` | Supported, as triggers | `systemEvents` to wait for them |
-| `ctx.defer`, `ctx.sessions` | Throw when read | |
+| `ctx.defer`, `createDefer()`, `ctx.sessions` | Supported | |
 | `ctx.maxAttempts` | Supported | |
 | `Inngest({ eventKey, signingKey, signingKeyFallback, isDev, env, appVersion, baseUrl, checkpointing, optimizeParallelism })` | Accepted, no effect | |
 | `Inngest({ middleware, logger })` | Supported | |
-| `Inngest({ schemas, fetch, endpointAdapter, sessionPropagation, aiMetadata })` | Throws | `eventType()` for schemas |
+| `Inngest({ sessionPropagation })` | Supported | |
+| `Inngest({ fetch, internalLogger, aiMetadata })` | Accepted, no effect | |
+| `Inngest({ schemas, endpointAdapter })` | Throws | `eventType()` for schemas |
 
 ---
 

@@ -26,6 +26,7 @@ import type { WireEvent } from "./types.js";
 //   S#…    a singleton: the run that has it
 //   F#…    how a run's attempts failed, and what its steps had returned
 //   G#…    a run that waits for a signal
+//   X#…    the data of a large event, or a large result, in parts
 //   M#…    whether a run with a start timeout started, or was cancelled first
 
 export interface Limit {
@@ -234,6 +235,9 @@ export interface Store {
   /** The runs it was taken from are stopped. */
   lockSettled(item: string, run: string): Promise<void>;
   lockFree(item: string, run: string): Promise<void>;
+  /** Keeps a text of any length. */
+  putBlob(key: string, body: string, ttlMs: number): Promise<void>;
+  getBlob(key: string): Promise<string | undefined>;
   /** Keeps how a function's attempt failed. The first one kept for an attempt stays. */
   putFailure(run: string, failure: Failure, ttlMs: number): Promise<void>;
   failures(run: string): Promise<Failure[]>;
@@ -1624,7 +1628,7 @@ export class DynamoStore implements Store {
       }
     }
     await this.db("PutItem", {
-      Item: { pk: S(item), sk: S(`q#${order}`), ref: S(ref), at: N(at), bytes: N(Buffer.byteLength(body)), expires },
+      Item: { pk: S(item), sk: S(`q#${order}`), ref: S(ref), at: N(at), bytes: N(Buffer.byteLength(body) + (event.blob?.bytes ?? 0)), expires },
     });
     return true;
   }
@@ -1817,6 +1821,28 @@ export class DynamoStore implements Store {
     });
   }
 
+  // A blob is named by what's in it, so its parts are the same each time it's written. The
+  // item that says how many there are goes last.
+  async putBlob(key: string, body: string, ttlMs: number) {
+    const expires = { N: seconds(Date.now() + ttlMs) };
+    const parts = split(body);
+    for (let i = 0; i < parts.length; i += 8)
+      await Promise.all(
+        parts.slice(i, i + 8).map((part, j) => this.db("PutItem", { Item: { pk: S(key), sk: S(`p#${pad(i + j)}`), part: S(part), expires } })),
+      );
+    await this.db("PutItem", { Item: { pk: S(key), sk: S("-"), count: N(parts.length), expires } });
+  }
+
+  async getBlob(key: string) {
+    const { Item } = await this.db("GetItem", { Key: { pk: S(key), sk: S("-") }, ConsistentRead: true });
+    if (!Item) return undefined;
+    const parts = await Promise.all(
+      Array.from({ length: Number(Item.count.N) }, (_, i) => this.db("GetItem", { Key: { pk: S(key), sk: S(`p#${pad(i)}`) }, ConsistentRead: true })),
+    );
+    if (parts.some((p) => !p.Item)) return undefined;
+    return parts.map((p) => String(p.Item.part.S)).join("");
+  }
+
   // A failure's steps can be more than an item holds: they're in parts, and the failure
   // itself goes last, so one that's there has all of them.
   async putFailure(run: string, given: Failure, ttlMs: number) {
@@ -1824,14 +1850,7 @@ export class DynamoStore implements Store {
     const pk = S(keyOf("F", run));
     const expires = { N: seconds(Date.now() + ttlMs) };
     const body = JSON.stringify(failure.memo);
-    const parts: string[] = [];
-    for (let i = 0; i < body.length; ) {
-      let end = Math.min(body.length, i + 100_000);
-      // Not between the two halves of a character, which would each be lost.
-      if (end < body.length && /[\uD800-\uDBFF]/.test(body[end - 1])) end--;
-      parts.push(body.slice(i, end));
-      i = end;
-    }
+    const parts = split(body);
     const attempt = pad(failure.attempt);
     const id = randomInt(2 ** 48 - 1).toString(36);
     await Promise.all(
@@ -2078,6 +2097,19 @@ function linesOf(limit: Limit) {
 function lineOf(limit: Limit, leaseId: string) {
   const n = linesOf(limit);
   return n === 1 ? 0 : createHash("sha256").update(leaseId).digest().readUInt32BE(0) % n;
+}
+
+/** A text in parts that each fit an item. */
+function split(body: string) {
+  const parts: string[] = [];
+  for (let i = 0; i < body.length; ) {
+    let end = Math.min(body.length, i + 100_000);
+    // Not between the two halves of a character, which would each be lost.
+    if (end < body.length && /[\uD800-\uDBFF]/.test(body[end - 1])) end--;
+    parts.push(body.slice(i, end));
+    i = end;
+  }
+  return parts;
 }
 
 function shuffle<T>(list: T[]) {

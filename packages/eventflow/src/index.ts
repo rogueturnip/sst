@@ -11,6 +11,8 @@ import { routeBatch, tick } from "./router.js";
 import type { ListInput, Run, RunSummary } from "./runs.js";
 import type { Store } from "./store.js";
 import { ADMIN_MARKER, TICK_MARKER, type EngineResource, type WireEvent } from "./types.js";
+import { Resource } from "sst/resource";
+import { mqttTopic, publish, type RealtimeResource, type TopicRef } from "./realtime.js";
 import { BaseMiddleware, Hooks, registerMiddleware } from "./middleware.js";
 import type { AiModel } from "./tools.js";
 import type { MiddlewareClass } from "./definition.js";
@@ -19,6 +21,8 @@ import { createWorker, type Registered } from "./worker.js";
 
 export { NonRetriableError, RetryAfterError, InvokeFailedError, SignalConflictError, StepFailedError } from "./errors.js";
 export type { StepInfo } from "./middleware.js";
+export { channel } from "./realtime.js";
+export type { TopicRef } from "./realtime.js";
 export { SendError } from "./engine.js";
 export type { Run, RunSummary, RunStatus, StepRecord, ListInput } from "./runs.js";
 export type { DeadLetter, FunctionInfo, LimitInfo, Overview, QueueInfo, WaitInfo } from "./admin.js";
@@ -95,11 +99,7 @@ export class EventFlow {
     // throw. The ones about Inngest's cloud are accepted, and do nothing.
     const unsupported: Record<string, string> = {
       schemas: "EventFlow follows Inngest v4, which replaced `schemas` with `eventType()`. Declare each event with `eventType()`.",
-      internalLogger: "EventFlow doesn't take a logger.",
-      fetch: "EventFlow doesn't take a fetch. It calls AWS with your function's IAM role.",
       endpointAdapter: "EventFlow doesn't take an endpoint adapter. Use serve() as its handler.",
-      sessionPropagation: "EventFlow doesn't support sessions.",
-      aiMetadata: "EventFlow doesn't keep AI metadata.",
     };
     for (const key of Object.keys(options))
       if (unsupported[key] && (options as any)[key] !== undefined) throw new TypeError(unsupported[key]);
@@ -110,6 +110,39 @@ export class EventFlow {
     this.runs = new Runs(() => this.getEngine());
     this.admin = new Admin(() => this.getEngine());
   }
+
+  private realtimeTarget() {
+    const given = this.options.realtime;
+    let resource = given && "endpoint" in given ? given : given?.resource;
+    try {
+      resource ??= Object.values(Resource as Record<string, any>).find((r) => r?.type === "sst.aws.Realtime");
+    } catch {}
+    if (!resource) return undefined;
+    let app = "";
+    try {
+      const { name, stage } = (Resource as any).App;
+      app = `${name}/${stage}/`;
+    } catch {}
+    return { resource, prefix: (given && "prefix" in given ? given.prefix : undefined) ?? `${app}${this.id}` };
+  }
+
+  /**
+   * Publish messages to browsers, through SST's `Realtime` component, linked to the function.
+   */
+  public readonly realtime = {
+    /** Publish a message now. In a run, use `step.realtime.publish()`, which does once. */
+    publish: async <TData>(ref: TopicRef<TData>, data: TData): Promise<void> => {
+      const target = this.realtimeTarget();
+      if (!target) throw new Error("realtime.publish() needs a Realtime component linked to this function.");
+      await publish(target.resource, target.prefix, ref, data, {}, this.options.aws);
+    },
+    /** The MQTT topic of a channel's topic, to subscribe to it, and to allow it in the authorizer. */
+    topic: (ref: { channel: string; topic: string }): string => {
+      const target = this.realtimeTarget();
+      if (!target) throw new Error("realtime.topic() needs a Realtime component linked to this function.");
+      return mqttTopic(target.prefix, ref);
+    },
+  };
 
   /** @internal */
   public workerOptions(): { client: unknown; middleware?: MiddlewareClass[]; logger?: Logger } {
@@ -126,6 +159,9 @@ export class EventFlow {
       });
       this.engine.appId = this.id;
       this.engine.systemEvents = this.options.systemEvents === true;
+      this.engine.propagateSessions = this.options.sessionPropagation !== false;
+      this.engine.apps = this.options.apps ?? {};
+      this.engine.realtime = this.realtimeTarget();
     }
     return this.engine;
   }
@@ -277,10 +313,65 @@ export interface EventFlowOptions {
   appVersion?: string;
   /** Accepted for Inngest compatibility. It has no effect: there's no Inngest server. */
   baseUrl?: string;
+  /**
+   * The other EventFlows whose functions this one invokes, by app ID. Link each, so its
+   * events can be sent to, and name this one in its `invokedBy`.
+   *
+   * @example
+   * ```ts
+   * new EventFlow({ id: "shop", apps: { billing: Resource.Billing } });
+   *
+   * await step.invoke("charge", { function: referenceFunction({ appId: "billing", functionId: "charge" }), data });
+   * ```
+   */
+  apps?: Record<string, EngineResource>;
+  /** The `Realtime` component to publish to, where more than one is linked, or another prefix for its topics. */
+  realtime?: RealtimeResource | { resource?: RealtimeResource; prefix?: string };
+  /**
+   * Give a run's sessions to the events it sends, and the functions it invokes.
+   *
+   * @default `true`
+   */
+  sessionPropagation?: boolean;
+  /** Accepted for Inngest compatibility. It has no effect: there's no Inngest API to call. */
+  fetch?: unknown;
+  /** Accepted for Inngest compatibility. It has no effect: EventFlow logs to CloudWatch. */
+  internalLogger?: unknown;
+  /** Accepted for Inngest compatibility. It has no effect. */
+  aiMetadata?: unknown;
   /** Accepted for Inngest compatibility. Steps are always checkpointed. */
   checkpointing?: unknown;
   /** Accepted for Inngest compatibility. It has no effect. */
   optimizeParallelism?: boolean;
+}
+
+/**
+ * Create a deferred function: one that `defer()` starts once the run that called it has
+ * ended, as Inngest's `createDefer()`. Pass it to `serve()`.
+ *
+ * @example
+ * ```ts
+ * const audit = createDefer(flow, { id: "audit" }, async ({ event, parents, step }) => {
+ *   await step.run("save", () => save(parents[0].runId, event.data));
+ * });
+ *
+ * flow.createFunction({ id: "pay", triggers: { event: "pay" } }, async ({ defer, step }) => {
+ *   defer("audit", { function: audit, data: { what: "pay" } });
+ * });
+ * ```
+ */
+export function createDefer<TData = any, TOutput = unknown>(
+  client: EventFlow,
+  options: Omit<CreateFunctionOptions<undefined>, "triggers" | "onFailure" | "batchEvents"> & { schema?: StandardSchemaV1<any, TData> },
+  handler: (ctx: Context<FlowEvent<"inngest/deferred.schedule", TData>> & { parents: { fnSlug: string; runId: string }[] }) => TOutput | Promise<TOutput>,
+): EventFlowFunction<TOutput> {
+  const { schema, ...rest } = options;
+  for (const key of ["triggers", "onFailure", "batchEvents"])
+    if ((rest as any)[key] !== undefined) throw new TypeError(`createDefer() doesn't take "${key}".`);
+  const fn = client.createFunction(rest as any, handler as any) as any;
+  fn[registration].def.deferred = true;
+  if (schema) fn.schema = schema;
+  return fn;
 }
 
 const registration = Symbol.for("sst.eventflow.function");
@@ -311,7 +402,8 @@ export function serve(input: { client: EventFlow; functions: EventFlowFunction<a
   if (!(input?.client instanceof EventFlow))
     throw new TypeError("serve() needs `client`, the EventFlow the functions were created with.");
   const registry = new Map<string, Registered>();
-  for (const fn of input.functions ?? []) {
+  const added = (input.client.workerOptions().middleware ?? []).flatMap((m: any) => (typeof m.functions === "function" ? m.functions({ client: input.client }) : []));
+  for (const fn of [...(input.functions ?? []), ...added]) {
     const entry = (fn as any)?.[registration] as Registered | undefined;
     if (!entry) throw new TypeError("serve() got a function that wasn't made with createFunction().");
     if (registry.has(entry.def.id))
@@ -647,6 +739,8 @@ export interface FlowEvent<TName extends string = string, TData = any> {
   /** When it was sent, in ms since the epoch. */
   ts: number;
   v?: string;
+  /** The sessions it's in. */
+  sessions?: Record<string, string>;
   /** The tenant it was sent with. */
   tenant?: string;
 }
@@ -704,6 +798,13 @@ export interface Context<TEvent = FlowEvent> {
   idempotencyKey: () => string;
   /** A logger that doesn't repeat itself when the function replays. */
   logger: Logger;
+  /** The sessions that all of the run's events are in. */
+  sessions?: Record<string, string>;
+  /** Start a deferred function once this run has ended, unless it's cancelled, or `abort()` is called. */
+  defer: (
+    id: string,
+    options: { function: EventFlowFunction<any>; data?: unknown; meta?: SendPayload["meta"] },
+  ) => { abort: () => void };
 }
 
 /**
@@ -758,7 +859,7 @@ export interface Step {
   /** Run another function of this EventFlow, and wait for what it returns. */
   invoke: <TOutput>(
     id: StepId,
-    options: { function: EventFlowFunction<TOutput> | FunctionReference<TOutput> | string; data?: unknown; timeout?: DurationInput | Date },
+    options: { function: EventFlowFunction<TOutput> | FunctionReference<TOutput> | string; data?: unknown; meta?: SendPayload["meta"]; timeout?: DurationInput | Date },
   ) => Promise<TOutput>;
   /** Send events from a run. A retried step sends the same event IDs, so they aren't sent twice. */
   sendEvent: (id: StepId, payload: SendPayload | SendPayload[]) => Promise<{ ids: string[] }>;
@@ -779,6 +880,11 @@ export interface Step {
    * A response with an error status is a response. At most 700 KB.
    */
   fetch: typeof globalThis.fetch;
+  /** Messages to browsers, through SST's `Realtime` component. */
+  realtime: {
+    /** Publish a message, as a step: once. */
+    publish: <TData>(id: StepId, topic: TopicRef<TData>, data: TData) => Promise<TData>;
+  };
   /** AI calls as steps. */
   ai: {
     /** Call a model, with an adapter like `openai()` of `@inngest/ai`. A rate limit is tried again when the provider says. */

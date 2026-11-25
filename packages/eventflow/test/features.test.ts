@@ -534,7 +534,7 @@ describe("retries of the function", () => {
       },
       async ({ step }: any) => step.run("s", () => Promise.reject(new Error("step"))),
       async ({ step }: any) => step.sleepUntil("s", "not a date"),
-      async ({ step }: any) => step.realtime.publish(),
+      async ({ step }: any) => step.waitForSignal("s", { signal: "", timeout: "1h" }),
     ]) {
       let calls = 0;
       const cluster = new Cluster((flow) => [flow.createFunction({ id: "f", triggers: { event: "go" }, retries: 1 }, async (ctx: any) => (calls++, body(ctx)))]);

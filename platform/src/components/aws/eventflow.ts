@@ -132,6 +132,23 @@ export interface EventFlowArgs
    */
   functionAdmin?: Input<boolean>;
   /**
+   * The names of the other EventFlows in this app that invoke functions of this one, so it
+   * can answer them. Those functions have `external: true`, and the others link this one.
+   *
+   * @example
+   * ```ts title="sst.config.ts"
+   * const billing = new sst.aws.EventFlow("Billing", {
+   *   handler: "src/billing.handler",
+   *   invokedBy: ["Shop"],
+   * });
+   * const shop = new sst.aws.EventFlow("Shop", {
+   *   handler: "src/shop.handler",
+   *   link: [billing],
+   * });
+   * ```
+   */
+  invokedBy?: string[];
+  /**
    * [Transform](/docs/components#transform) how this component creates its underlying
    * resources.
    */
@@ -332,6 +349,7 @@ export class EventFlow extends Component {
       retries,
       schedule,
       functionAdmin,
+      invokedBy,
       transform: transforms,
       ...workflowArgs
     } = args;
@@ -339,9 +357,9 @@ export class EventFlow extends Component {
     // The names are known before the functions are created, so their permissions can
     // name each other. They're stable from one deploy to the next: the app, stage and
     // name, with a hash of them, so two that shorten the same way don't collide.
-    const stableName = (suffix: string) => {
-      const hash = hashStringToPrettyString(`${$app.name}/${$app.stage}/${name}/${suffix}`, 8);
-      return `${prefixName(64 - 9, `${name}${suffix}`)}-${hash}`;
+    const stableName = (suffix: string, of = name) => {
+      const hash = hashStringToPrettyString(`${$app.name}/${$app.stage}/${of}/${suffix}`, 8);
+      return `${prefixName(64 - 9, `${of}${suffix}`)}-${hash}`;
     };
     const workerName = output(stableName("Worker"));
     const routerName = output(stableName("Router"));
@@ -426,6 +444,17 @@ export class EventFlow extends Component {
         ],
         resources: [interpolate`${workerArn}:*`],
       }),
+      // To answer the other EventFlows' runs.
+      ...(invokedBy?.length
+        ? [
+            permission({
+              actions: ["lambda:SendDurableExecutionCallbackSuccess"],
+              resources: invokedBy.map(
+                (other) => interpolate`arn:${partition}:lambda:${region}:${account}:function:${stableName("Worker", other)}:*`,
+              ),
+            }),
+          ]
+        : []),
     ];
 
     const runTimeout = output(args.timeout).apply((t) => toSeconds(t?.execution ?? "14 days"));
