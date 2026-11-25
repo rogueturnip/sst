@@ -1,5 +1,5 @@
 import { createHmac, timingSafeEqual } from "crypto";
-import type { AwsOptions } from "../client.js";
+import type { AwsOptions } from "./client.js";
 import { ssm } from "./aws.js";
 
 // The router and the worker sign what they start, with a key only they have. The

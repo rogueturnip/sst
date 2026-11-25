@@ -155,6 +155,7 @@ describe("EventFlow", () => {
     expect(router.inputs.timeout).toBe(60);
 
     const flow = JSON.parse(router.inputs.environment.variables.SST_EVENTFLOW);
+    expect(flow.contract).toBe(1);
     expect(flow.workerName).toBe(worker.inputs.name);
     expect(flow.workerQualifier).toBe("7");
     expect(flow.runTimeoutSeconds).toBe(14 * 86400);

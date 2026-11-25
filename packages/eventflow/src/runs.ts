@@ -1,4 +1,4 @@
-import { awsFetch } from "../client.js";
+import { awsFetch } from "./client.js";
 import type { Engine } from "./engine.js";
 import { replayId } from "./ids.js";
 import type { RunPayload, WireEvent } from "./types.js";

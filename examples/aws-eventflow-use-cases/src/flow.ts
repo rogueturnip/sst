@@ -1,4 +1,4 @@
-import { serve } from "sst/aws/eventflow";
+import { serve } from "@sst-community/eventflow";
 import { flow } from "./client";
 import { summarizeDocument } from "./use-cases/ai-chain";
 import { onSignup } from "./use-cases/background-job";

@@ -1,4 +1,4 @@
-import type { AwsOptions } from "../client.js";
+import type { AwsOptions } from "./client.js";
 import { randomInt } from "node:crypto";
 import { AwsError, dynamo, isConditionFailure, isTransient } from "./aws.js";
 import { hash, key as keyOf } from "./ids.js";

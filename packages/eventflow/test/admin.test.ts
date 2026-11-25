@@ -1,8 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { ExecutionStatus, LocalDurableTestRunner } from "@aws/durable-execution-sdk-js-testing";
 import { Cluster, finishRuns, waitFor } from "./harness.ts";
-import { ONCE } from "../../src/aws/eventflow/worker.ts";
-import { memoFrom, toSteps } from "../../src/aws/eventflow/runs.ts";
+import { ONCE } from "../src/worker.ts";
+import { memoFrom, toSteps } from "../src/runs.ts";
 
 beforeAll(async () => {
   await LocalDurableTestRunner.setupTestEnvironment({ skipTime: true });

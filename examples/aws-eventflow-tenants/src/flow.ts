@@ -2,7 +2,7 @@
 // Each step also records when it ran, in the Results table, so the burst can be
 // measured. Take those lines out in your own app.
 
-import { EventFlow, eventType, NonRetriableError, serve, staticSchema } from "sst/aws/eventflow";
+import { EventFlow, eventType, NonRetriableError, serve, staticSchema } from "@sst-community/eventflow";
 import { record } from "./results";
 
 export const flow = new EventFlow({ id: "contacts" });

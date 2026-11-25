@@ -90,7 +90,7 @@ new sst.aws.Function("Api", {
   <TabItem label="src/client.ts">
 ```ts
 import { z } from "zod";
-import { EventFlow, eventType } from "sst/aws/eventflow";
+import { EventFlow, eventType } from "@sst-community/eventflow";
 
 export const flow = new EventFlow({ id: "shop" });
 
@@ -101,7 +101,7 @@ export const orderPlaced = eventType("order/placed", {
   </TabItem>
   <TabItem label="src/flow.ts">
 ```ts
-import { serve } from "sst/aws/eventflow";
+import { serve } from "@sst-community/eventflow";
 import { flow, orderPlaced } from "./client";
 
 const processOrder = flow.createFunction(

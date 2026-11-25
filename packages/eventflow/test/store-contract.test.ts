@@ -1,16 +1,16 @@
 import { Agent, request } from "node:http";
 import { describe, expect, it, setDefaultTimeout } from "bun:test";
-import { DynamoStore, tenantKey, type LeaseWaiter, type Limit, type Store } from "../../src/aws/eventflow/store.ts";
-import { AwsError } from "../../src/aws/eventflow/aws.ts";
+import { DynamoStore, tenantKey, type LeaseWaiter, type Limit, type Store } from "../src/store.ts";
+import { AwsError } from "../src/aws.ts";
 import { MemoryStore } from "./memory-store.ts";
 
 // The lease rules, held to by both stores: the one in memory that the other tests
 // use, and the one on DynamoDB that runs in AWS. The DynamoDB one runs against a real
 // table when EVENTFLOW_TEST_TABLE names one, with a `pk` and `sk` string key:
 //
-//   EVENTFLOW_TEST_TABLE=my-table AWS_REGION=ca-central-1 bun test test/eventflow/store-contract.test.ts
+//   EVENTFLOW_TEST_TABLE=my-table AWS_REGION=ca-central-1 bun test test/store-contract.test.ts
 //
-// EVENTFLOW_TEST_ENDPOINT sends its calls to DynamoDB Local instead.
+// EVENTFLOW_TEST_ENDPOINT sends its calls to DynamoDB Local instead: `npm run test:table`.
 
 const table = process.env.EVENTFLOW_TEST_TABLE;
 const endpoint = process.env.EVENTFLOW_TEST_ENDPOINT;
@@ -853,7 +853,7 @@ for (const [name, make] of stores) {
         await store.enqueue(waiter("q2", "b", Date.now(), [l]));
         (store as any).scan = async () =>
           (await DynamoStore.prototype.scan.call(store, "C#", 100_000)).filter((i) => i.pk === l.item);
-        const { handleAdmin } = await import("../../src/aws/eventflow/admin.ts");
+        const { handleAdmin } = await import("../src/admin.ts");
         const answer: any = await handleAdmin({ op: "leases" }, new Map(), { store } as any);
         expect(answer.result).toEqual([expect.objectContaining({ label: "fn:x", limit: 1, active: 1, queued: 2 })]);
       });

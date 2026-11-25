@@ -1,0 +1,63 @@
+name: eventflow-release
+
+# Publishes the EventFlow runtime to npm from a tag of its own, like
+# `eventflow-v0.2.0`, so a fix to the engine doesn't wait for an SST release. The
+# release.yml of SST skips it, as it's "private" until its first version is published.
+# See MAINTAINING.md.
+on:
+  push:
+    tags:
+      - "eventflow-v*"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: release
+    defaults:
+      run:
+        working-directory: packages/eventflow
+    services:
+      dynamodb:
+        image: amazon/dynamodb-local:2.5.3
+        ports:
+          - 8000:8000
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: Check the tag
+        run: test "$GITHUB_REF_NAME" = "eventflow-v$(node -p "require('./package.json').version")"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+      - name: Test the table's contract
+        run: npm run test:table
+        env:
+          EVENTFLOW_TEST_ENDPOINT: http://localhost:8000
+
+      - name: Publish
+        run: |
+          tag=latest
+          case "$GITHUB_REF_NAME" in *-v*-*) tag=next ;; esac
+          npm publish --access public --tag "$tag"
+        env:
+          NPM_CONFIG_PROVENANCE: true

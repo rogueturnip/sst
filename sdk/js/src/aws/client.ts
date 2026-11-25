@@ -75,14 +75,9 @@ export async function awsFetch(
   service: string,
   path: string,
   init: Omit<AwsFetchOptions, "aws">,
-  options?: {
-    aws?: AwsOptions;
-    /** How many times a 5xx or a 429 is tried again. Defaults to aws4fetch's 10. */
-    retries?: number;
-  },
+  options?: { aws?: AwsOptions },
 ) {
   const c = await client(options?.aws);
-  if (options?.retries !== undefined) c.retries = options.retries;
   const region = options?.aws?.region ?? c.region;
   return c.fetch(`https://${service}.${region}.amazonaws.com${path}`, {
     ...init,

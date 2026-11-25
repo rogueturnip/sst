@@ -189,7 +189,7 @@ export interface EventFlowArgs
  * ```
  *
  * ```ts title="src/flow.ts"
- * import { EventFlow, serve } from "sst/aws/eventflow";
+ * import { EventFlow, serve } from "@sst-community/eventflow";
  *
  * export const flow = new EventFlow({ id: "my-app" });
  *
@@ -282,7 +282,7 @@ export interface EventFlowArgs
  *
  * ```ts title="src/media.ts"
  * import { Resource } from "sst";
- * import { EventFlow } from "sst/aws/eventflow";
+ * import { EventFlow } from "@sst-community/eventflow";
  *
  * export const media = new EventFlow({ id: "media", resource: Resource.Media });
  * ```
@@ -427,7 +427,7 @@ export class EventFlow extends Component {
     const env = (fields: Record<string, Input<string | number | undefined>>) =>
       all([output(args.environment ?? {}), output(fields), keyParam.name]).apply(([environment, f, param]) => ({
         ...environment,
-        SST_EVENTFLOW: JSON.stringify(f),
+        SST_EVENTFLOW: JSON.stringify({ contract: CONTRACT, ...f }),
         SST_EVENTFLOW_KEY_PARAM: param,
       }));
 
@@ -653,6 +653,14 @@ export class EventFlow extends Component {
     };
   }
 }
+
+/**
+ * What the component and the runtime, `@sst-community/eventflow`, agree on: the
+ * resources, their permissions, and what the functions' environment has. The runtime is
+ * versioned apart from SST, and refuses to run on a contract it doesn't know. It goes up
+ * when a runtime needs something new from the component.
+ */
+const CONTRACT = 1;
 
 const __pulumiType = "sst:aws:EventFlow";
 // @ts-expect-error

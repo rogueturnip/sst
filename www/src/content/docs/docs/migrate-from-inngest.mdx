@@ -55,7 +55,7 @@ export const handler = serve({ client: inngest, functions: [processOrder] });
   </TabItem>
   <TabItem label="EventFlow">
 ```ts title="src/flow.ts"
-import { EventFlow, eventType, NonRetriableError, serve } from "sst/aws/eventflow";
+import { EventFlow, eventType, NonRetriableError, serve } from "@sst-community/eventflow";
 import { z } from "zod";
 
 export const inngest = new EventFlow({ id: "shop" });
@@ -109,7 +109,7 @@ new sst.aws.Function("Api", {
   </TabItem>
 </Tabs>
 
-The function bodies are the same. What changed: the import, `new Inngest` to `new EventFlow`, `serve` comes from `sst/aws/eventflow`, and the infrastructure is an `EventFlow` instead of an endpoint that Inngest calls. Send the events with a `tenant`, so fair queues and fair shares know who they belong to:
+The function bodies are the same. What changed: the import, `new Inngest` to `new EventFlow`, `serve` comes from `@sst-community/eventflow`, and the infrastructure is an `EventFlow` instead of an endpoint that Inngest calls. Send the events with a `tenant`, so fair queues and fair shares know who they belong to:
 
 ```ts
 await inngest.send(orderPlaced.create({ orderId, tenantId }, { tenant: tenantId }));

@@ -1275,7 +1275,8 @@ function renderType(
       ((type as any)._target?.fileName as string | undefined);
     if (
       fileName?.startsWith("sdk/js/src/") ||
-      fileName?.includes("/sdk/js/src/")
+      fileName?.includes("/sdk/js/src/") ||
+      fileName?.includes("packages/eventflow/src/")
     ) {
       return renderReferenceType(type);
     }
@@ -2675,7 +2676,6 @@ async function buildSdk() {
       "../sdk/js/src/aws/realtime.ts",
       "../sdk/js/src/aws/task.ts",
       "../sdk/js/src/aws/workflow.ts",
-      "../sdk/js/src/aws/eventflow.ts",
       "../sdk/js/src/vector/index.ts",
     ],
     tsconfig: "../sdk/js/tsconfig.json",
@@ -2687,7 +2687,28 @@ async function buildSdk() {
   // Generate JSON (generated for debugging purposes)
   if (process.env.DEBUG) await app.generateJson(project, "sdk-doc.json");
 
-  return project.getChildrenByKind(TypeDoc.ReflectionKind.Module);
+  return [
+    ...project.getChildrenByKind(TypeDoc.ReflectionKind.Module),
+    await buildEventFlowSdk(),
+  ];
+}
+
+// The EventFlow runtime is a package of its own. With one entry point, TypeDoc makes
+// the project the module.
+async function buildEventFlowSdk() {
+  const app = await TypeDoc.Application.bootstrap({
+    skipErrorChecking: true,
+    jsDocCompatibility: {
+      defaultTag: false,
+    },
+    entryPoints: ["../packages/eventflow/src/index.ts"],
+    tsconfig: "../packages/eventflow/tsconfig.json",
+  });
+
+  const project = await app.convert();
+  if (!project) throw new Error("Failed to convert the EventFlow package");
+  project.name = "aws/eventflow";
+  return project as unknown as TypeDoc.DeclarationReflection;
 }
 
 async function buildExamples() {

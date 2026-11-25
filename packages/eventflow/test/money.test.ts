@@ -1,8 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { ExecutionStatus, LocalDurableTestRunner } from "@aws/durable-execution-sdk-js-testing";
 import { Cluster, finishRuns, waitFor } from "./harness.ts";
-import { idempotencyKey, ONCE } from "../../src/aws/eventflow/worker.ts";
-import { onceSteps } from "../../src/aws/eventflow/runs.ts";
+import { idempotencyKey, ONCE } from "../src/worker.ts";
+import { onceSteps } from "../src/runs.ts";
 
 // Moving money: a step with a side effect must happen once, through retries,
 // crashes, and retries of the run after a fix.

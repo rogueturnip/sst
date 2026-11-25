@@ -53,6 +53,10 @@ export interface RunPayload {
 
 /** What the engine's resource gives the SDK, from the link or the environment. */
 export interface EngineResource {
+  /**
+   * What the component and the runtime agree on. Only the router and the worker have it.
+   */
+  contract?: number;
   /** The URL of the queue that events are sent to. */
   queueUrl: string;
   /** The name of the router function, which also serves the admin API. */
@@ -68,6 +72,11 @@ export interface EngineResource {
   /** The longest a run can take, in seconds. */
   runTimeoutSeconds?: number;
 }
+
+/** The contract this runtime needs from the component, at least. */
+export const CONTRACT = 1;
+/** The newest admin API this runtime serves. `sst eventflow` reads it. */
+export const ADMIN_VERSION = 1;
 
 export const RUN_MARKER = "sst:eventflow" as const;
 export const TICK_MARKER = "sst:eventflow:tick" as const;

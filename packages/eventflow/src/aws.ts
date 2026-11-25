@@ -1,4 +1,4 @@
-import { awsFetch, type AwsOptions } from "../client.js";
+import { awsFetch, type AwsOptions } from "./client.js";
 
 // The few SQS and DynamoDB calls EventFlow makes, over their JSON protocols, with the
 // same signed fetch as the rest of the SDK. There's no AWS SDK in the bundle.

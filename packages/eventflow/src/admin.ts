@@ -3,6 +3,7 @@ import { toWireEvent, type Engine, type SendPayload } from "./engine.js";
 import type { Definition } from "./definition.js";
 import { cancelAll, cancelRun, getRun, listRuns, rerun, rerunAll, type ListInput } from "./runs.js";
 import { parseLease } from "./store.js";
+import { ADMIN_VERSION } from "./types.js";
 import type { Registered } from "./worker.js";
 
 // The admin API. The router serves it, to whatever may invoke the router: the
@@ -216,7 +217,7 @@ export async function handleAdmin(
   try {
     const args = request?.args && typeof request.args === "object" ? request.args : {};
     const result = await run(String(request?.op), args, registry, engine);
-    return { ok: true as const, result };
+    return { ok: true as const, version: ADMIN_VERSION, result };
   } catch (error) {
     return {
       ok: false as const,

@@ -10,5 +10,8 @@
   "devDependencies": {
     "@types/aws-lambda": "^8.10.155",
     "sst": "file:../../sdk/js"
+  },
+  "dependencies": {
+    "@sst-community/eventflow": "file:../../packages/eventflow"
   }
 }

@@ -1,23 +1,23 @@
 import type { Context as LambdaContext, SQSEvent } from "aws-lambda";
 import type { AwsOptions } from "./client.js";
-import { define, type FunctionOptions, type TriggerInput } from "./eventflow/definition.js";
-import type { DurationInput } from "./eventflow/duration.js";
-import { Engine, toWireEvent, type SendPayload } from "./eventflow/engine.js";
-import { handleAdmin } from "./eventflow/admin.js";
-import type { DeadLetter, FunctionInfo, LimitInfo, Overview, WaitInfo } from "./eventflow/admin.js";
-import { runId as makeRunId } from "./eventflow/ids.js";
-import { loadKey } from "./eventflow/sign.js";
-import { routeBatch, tick } from "./eventflow/router.js";
-import type { ListInput, Run, RunSummary } from "./eventflow/runs.js";
-import type { Store } from "./eventflow/store.js";
-import { ADMIN_MARKER, TICK_MARKER, type EngineResource, type WireEvent } from "./eventflow/types.js";
-import { createWorker, type Registered } from "./eventflow/worker.js";
+import { define, type FunctionOptions, type TriggerInput } from "./definition.js";
+import type { DurationInput } from "./duration.js";
+import { Engine, toWireEvent, type SendPayload } from "./engine.js";
+import { handleAdmin } from "./admin.js";
+import type { DeadLetter, FunctionInfo, LimitInfo, Overview, WaitInfo } from "./admin.js";
+import { runId as makeRunId } from "./ids.js";
+import { loadKey } from "./sign.js";
+import { routeBatch, tick } from "./router.js";
+import type { ListInput, Run, RunSummary } from "./runs.js";
+import type { Store } from "./store.js";
+import { ADMIN_MARKER, TICK_MARKER, type EngineResource, type WireEvent } from "./types.js";
+import { createWorker, type Registered } from "./worker.js";
 
-export { NonRetriableError, RetryAfterError, InvokeFailedError, StepFailedError } from "./eventflow/worker.js";
-export { SendError } from "./eventflow/engine.js";
-export type { Run, RunSummary, RunStatus, StepRecord, ListInput } from "./eventflow/runs.js";
-export type { DeadLetter, FunctionInfo, LimitInfo, Overview, QueueInfo, WaitInfo } from "./eventflow/admin.js";
-export type { EngineResource } from "./eventflow/types.js";
+export { NonRetriableError, RetryAfterError, InvokeFailedError, StepFailedError } from "./worker.js";
+export { SendError } from "./engine.js";
+export type { Run, RunSummary, RunStatus, StepRecord, ListInput } from "./runs.js";
+export type { DeadLetter, FunctionInfo, LimitInfo, Overview, QueueInfo, WaitInfo } from "./admin.js";
+export type { EngineResource } from "./types.js";
 
 /**
  * The `EventFlow` SDK lets you write event-driven functions with an API shaped like

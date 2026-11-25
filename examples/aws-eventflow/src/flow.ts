@@ -1,4 +1,4 @@
-import { serve } from "sst/aws/eventflow";
+import { serve } from "@sst-community/eventflow";
 import { flow } from "./client";
 import { hourlyReport } from "./functions/hourly-report";
 import { processOrder } from "./functions/process-order";

@@ -1,12 +1,13 @@
-import { Resource } from "../../resource/index.js";
-import { awsFetch, type AwsOptions } from "../client.js";
-import { workflow } from "../workflow.js";
+import { Resource } from "sst/resource";
+import { awsFetch, type AwsOptions } from "./client.js";
+import { LambdaError, startExecution, stopExecution, succeedCallback } from "./lambda.js";
 import { sqs } from "./aws.js";
 import { ulid } from "./ids.js";
 import { sign } from "./sign.js";
 import { DynamoStore, type Store } from "./store.js";
 import {
   ADMIN_MARKER,
+  CONTRACT,
   ENV_RESOURCE,
   type EngineResource,
   type Message,
@@ -107,9 +108,9 @@ export class Engine {
   async startRun(payload: RunPayload, worker = this.worker) {
     const signed = sign(payload);
     try {
-      return await workflow.start(worker, { name: payload.runId, payload: signed }, { aws: this.aws });
+      return await startExecution(worker, { name: payload.runId, payload: signed }, this.aws);
     } catch (error) {
-      if (error instanceof workflow.StartError) {
+      if (error instanceof LambdaError) {
         const body = await error.response.text().catch(() => "");
         // The name is used by a run with another payload. The run already happened.
         if (error.response.status === 409 && body.includes("AlreadyStarted")) return undefined;
@@ -130,10 +131,10 @@ export class Engine {
   async callback(callbackId: string, payload: unknown) {
     for (let attempt = 0; ; attempt++) {
       try {
-        await workflow.succeed(callbackId, { payload }, { aws: this.aws });
+        await succeedCallback(callbackId, payload, this.aws);
         return true;
       } catch (error) {
-        const status = error instanceof workflow.SucceedError ? error.response.status : undefined;
+        const status = error instanceof LambdaError ? error.response.status : undefined;
         if (status === 400 || status === 404) return false;
         const transient = status === undefined || status === 429 || status >= 500;
         if (!transient || attempt >= 4) throw error;
@@ -145,10 +146,10 @@ export class Engine {
   /** Stop a run. Returns false when it had already ended. */
   async stopRun(arn: string) {
     try {
-      await workflow.stop(arn, undefined, { aws: this.aws });
+      await stopExecution(arn, this.aws);
       return true;
     } catch (error) {
-      if (error instanceof workflow.StopError && [400, 404, 409].includes(error.response.status)) return false;
+      if (error instanceof LambdaError && [400, 404, 409].includes(error.response.status)) return false;
       throw error;
     }
   }
@@ -247,9 +248,22 @@ export function toWireEvent(input: SendPayload, now = Date.now()): WireEvent {
   return event;
 }
 
+/**
+ * The runtime is versioned apart from SST. One that needs something the deployed
+ * component doesn't have says so at the start, not part way through a run.
+ */
+export function checkContract(resource: EngineResource) {
+  const deployed = resource.contract ?? 0;
+  if (deployed < CONTRACT)
+    throw new Error(
+      `This version of @sst-community/eventflow needs an EventFlow component with contract ${CONTRACT}, and the deployed one has ${deployed}. Update SST and deploy again, or use an older version of the package.`,
+    );
+  return resource;
+}
+
 function findResource(): EngineResource {
   const fromEnv = process.env[ENV_RESOURCE];
-  if (fromEnv) return JSON.parse(fromEnv);
+  if (fromEnv) return checkContract(JSON.parse(fromEnv));
 
   const linked = Object.entries(Resource as Record<string, any>).filter(
     ([, value]) => value && typeof value === "object" && value.type === "sst.aws.EventFlow",
@@ -263,5 +277,3 @@ function findResource(): EngineResource {
       .join(", ")}). Pass the one to use, like "new EventFlow({ id, resource: Resource.${linked[0][0]} })".`,
   );
 }
-
-void sign;

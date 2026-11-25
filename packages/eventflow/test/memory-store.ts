@@ -7,8 +7,8 @@ import {
   type Limit,
   type Store,
   type Waiter,
-} from "../../src/aws/eventflow/store.ts";
-import type { WireEvent } from "../../src/aws/eventflow/types.ts";
+} from "../src/store.ts";
+import type { WireEvent } from "../src/types.ts";
 
 interface LimitItem {
   cap: number;

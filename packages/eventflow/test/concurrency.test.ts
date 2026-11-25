@@ -2,8 +2,8 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { ExecutionStatus, LocalDurableTestRunner } from "@aws/durable-execution-sdk-js-testing";
 import { Cluster, finishRuns, waitFor } from "./harness.ts";
 import { MemoryStore } from "./memory-store.ts";
-import { backoffMs } from "../../src/aws/eventflow/worker.ts";
-import type { LeaseWaiter, Limit } from "../../src/aws/eventflow/store.ts";
+import { backoffMs } from "../src/worker.ts";
+import type { LeaseWaiter, Limit } from "../src/store.ts";
 
 beforeAll(async () => {
   await LocalDurableTestRunner.setupTestEnvironment({ skipTime: true });

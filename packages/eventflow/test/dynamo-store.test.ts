@@ -6,8 +6,8 @@ import { describe, expect, it, mock } from "bun:test";
 
 const calls: { action: string; body: any }[] = [];
 let respond: (action: string, body: any, n: number) => Response;
-const actual = await import("../../src/aws/client.ts");
-mock.module("../../src/aws/client.ts", () => ({
+const actual = await import("../src/client.ts");
+mock.module("../src/client.ts", () => ({
   ...actual,
   awsFetch: async (_s: string, _p: string, init: RequestInit) => {
     const action = String((init.headers as any)["X-Amz-Target"]).split(".").pop()!;
@@ -16,8 +16,8 @@ mock.module("../../src/aws/client.ts", () => ({
     return respond(action, body, calls.filter((c) => c.action === action).length);
   },
 }));
-const { DynamoStore } = await import("../../src/aws/eventflow/store.ts");
-const { AwsError, isConditionFailure, isTransient } = await import("../../src/aws/eventflow/aws.ts");
+const { DynamoStore } = await import("../src/store.ts");
+const { AwsError, isConditionFailure, isTransient } = await import("../src/aws.ts");
 
 const err = (status: number, type: string, extra: any = {}) =>
   new Response(JSON.stringify({ __type: `com.amazonaws.dynamodb.v20120810#${type}`, message: type, ...extra }), { status });

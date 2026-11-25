@@ -1,4 +1,4 @@
-import { NonRetriableError } from "sst/aws/eventflow";
+import { NonRetriableError } from "@sst-community/eventflow";
 import { CardDeclined, charge } from "../payments";
 import { flow, orderApproved, orderPlaced } from "../client";
 import { sendReceipt } from "./send-receipt";

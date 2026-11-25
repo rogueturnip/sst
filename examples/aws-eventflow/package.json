@@ -8,6 +8,7 @@
     "remove": "go run ../../cmd/sst remove"
   },
   "dependencies": {
+    "@sst-community/eventflow": "file:../../packages/eventflow",
     "zod": "^3.25.0"
   },
   "devDependencies": {

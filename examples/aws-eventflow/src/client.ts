@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { EventFlow, eventType, staticSchema } from "sst/aws/eventflow";
+import { EventFlow, eventType, staticSchema } from "@sst-community/eventflow";
 
 // The client. Functions are created with it, and events are sent with it. It finds
 // the EventFlow it's linked to.

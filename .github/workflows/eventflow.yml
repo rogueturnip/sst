@@ -1,0 +1,64 @@
+name: eventflow
+
+# Runs the EventFlow runtime's tests: the engine in the local durable test runner, and
+# the table's contract against DynamoDB Local, where the concurrency races are.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "packages/eventflow/**"
+      - ".github/workflows/eventflow.yml"
+  pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened]
+    paths:
+      - "packages/eventflow/**"
+      - ".github/workflows/eventflow.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/eventflow
+    services:
+      dynamodb:
+        image: amazon/dynamodb-local:2.5.3
+        ports:
+          - 8000:8000
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+      - name: Test the table's contract
+        run: npm run test:table
+        env:
+          EVENTFLOW_TEST_ENDPOINT: http://localhost:8000

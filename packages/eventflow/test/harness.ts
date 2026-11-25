@@ -29,8 +29,8 @@ const state: { cluster?: Cluster; all: Cluster[] } = { all: [] };
 // The router and the worker sign runs with this key.
 process.env.SST_EVENTFLOW_KEY = "test-signing-key";
 
-const actualClient = await import("../../src/aws/client.ts");
-mock.module("../../src/aws/client.ts", () => ({
+const actualClient = await import("../src/client.ts");
+mock.module("../src/client.ts", () => ({
   ...actualClient,
   awsFetch: (service: string, path: string, init: RequestInit) => {
     if (!state.cluster) throw new Error("No test cluster");
@@ -38,7 +38,7 @@ mock.module("../../src/aws/client.ts", () => ({
   },
 }));
 
-export const sdk = await import("../../src/aws/eventflow.ts");
+export const sdk = await import("../src/index.ts");
 
 let messageCounter = 0;
 

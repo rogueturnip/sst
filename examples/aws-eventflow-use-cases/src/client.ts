@@ -1,4 +1,4 @@
-import { EventFlow } from "sst/aws/eventflow";
+import { EventFlow } from "@sst-community/eventflow";
 
 export const flow = new EventFlow({ id: "use-cases" });
 

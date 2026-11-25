@@ -1,11 +1,11 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { ExecutionStatus, LocalDurableTestRunner } from "@aws/durable-execution-sdk-js-testing";
 import { Cluster, finishRuns, sdk, waitFor } from "./harness.ts";
-import { evaluate, getPath, parseExpression } from "../../src/aws/eventflow/expression.ts";
-import { matcher } from "../../src/aws/eventflow/worker.ts";
-import { parseCron, cronMatches, localMinute } from "../../src/aws/eventflow/cron.ts";
-import { checkEvent } from "../../src/aws/eventflow/engine.ts";
-import { sign } from "../../src/aws/eventflow/sign.ts";
+import { evaluate, getPath, parseExpression } from "../src/expression.ts";
+import { matcher } from "../src/worker.ts";
+import { parseCron, cronMatches, localMinute } from "../src/cron.ts";
+import { checkEvent } from "../src/engine.ts";
+import { sign } from "../src/sign.ts";
 
 // Each test here is a finding of the security or correctness review, reproduced, so
 // it stays fixed.
@@ -63,7 +63,7 @@ describe("only the router starts runs", () => {
 
   it("drops a signed message that expired", async () => {
     const cluster = new Cluster((flow) => [flow.createFunction({ id: "charge" }, async () => "charged")]);
-    const { sign } = await import("../../src/aws/eventflow/sign.ts");
+    const { sign } = await import("../src/sign.ts");
     const old = sign({
       kind: "invoke",
       fn: "charge",

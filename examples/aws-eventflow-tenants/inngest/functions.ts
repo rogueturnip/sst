@@ -4,7 +4,7 @@
 import { eventType, Inngest, NonRetriableError, staticSchema } from "inngest";
 import { serve } from "inngest/lambda";
 
-// EventFlow: `new EventFlow({ id })` from "sst/aws/eventflow". No event or signing key.
+// EventFlow: `new EventFlow({ id })` from "@sst-community/eventflow". No event or signing key.
 export const inngest = new Inngest({ id: "contacts" });
 
 export const importRequested = eventType("contacts/import.requested", {
@@ -69,6 +69,6 @@ export const notifyTenant = inngest.createFunction(
   },
 );
 
-// EventFlow: `serve` from "sst/aws/eventflow". It's the handler of the EventFlow
+// EventFlow: `serve` from "@sst-community/eventflow". It's the handler of the EventFlow
 // component, not a URL that Inngest calls.
 export const handler = serve({ client: inngest, functions: [importContacts, notifyTenant] });
