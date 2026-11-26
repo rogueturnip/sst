@@ -372,7 +372,7 @@ On AWS, with a step that charges and then crashes the Lambda before its result i
 - Every side effect goes in a step, with `idempotencyKey`, or `atMostOnce`. Never outside a step: that code runs again on every replay of the run.
 - Give events from your system an `id`, like the order's ID, so sending one twice starts one run.
 - Use `idempotency: "event.data.orderId"` on the function as well, to start one run per order in 24 hours, whatever the event IDs.
-- `cancelOn` and `flow.runs.cancel()` stop a run where it is. The steps that ran aren't undone. Refund in `onFailure`, or in a step after a `waitForEvent`, not by cancelling. Once the function has returned or failed, an event no longer cancels the run: its `onFailure` and the run that invoked it aren't cut off. A singleton's later run waits, with `"cancel"`, until the one that's ending has ended.
+- `cancelOn` and `flow.runs.cancel()` stop a run where it is. The steps that ran aren't undone. Refund in `onFailure`, or in a step after a `waitForEvent`, not by cancelling. Once the function has returned or failed, an event no longer cancels the run: its `onFailure` and the run that invoked it aren't cut off. Nor does `flow.runs.cancel()`, which throws then, unless you pass `{ force: true }` (`--force` in the CLI). A singleton's later run waits, with `"cancel"`, until the one that's ending has ended, however long its `onFailure` takes: it looks again each minute.
 - A replay runs every step again, with the same idempotency keys. A provider that keeps keys for a limited time, like 24 hours, may charge again after that: retry, which reuses the saved results, rather than replay. A retry runs again what comes after the first step it runs again, so give money steps keys that say what they're of, and retry within the provider's window.
 
 ---
@@ -503,7 +503,7 @@ One run per key value, per tenant, in 24 hours. Others are skipped.
 singleton: { mode: "skip", key: "event.data.accountId" },
 ```
 
-One run at a time, of each key and tenant. With `"skip"`, another is skipped, and with `"cancel"`, the one that's running is cancelled. It's held while a run is held by a throttle, sleeps, or waits. A run that ended without giving it back, as when it was stopped, loses it to the next. A key that's `false` isn't a singleton.
+One run at a time, of each key and tenant. With `"skip"`, another is skipped, and with `"cancel"`, the one that's running is cancelled. Which is later is by when the router received the events, so an earlier event whose message comes again late doesn't cancel a later one's run: it's skipped. It's held while a run is held by a throttle, sleeps, or waits. A run that ended without giving it back, as when it was stopped, loses it to the next. A key that's `false` isn't a singleton.
 
 ### Debounce
 

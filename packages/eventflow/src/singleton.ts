@@ -24,6 +24,7 @@ export function singletonKey(def: Definition, event: WireEvent) {
 export interface LockRuns {
   find(run: string): Promise<{ arn: string } | undefined>;
   running(arn: string): Promise<boolean>;
+  /** "ending" when its end is decided and what's done about it still runs, like onFailure. */
   stop(run: string, arn: string): Promise<unknown>;
 }
 
@@ -33,9 +34,9 @@ export interface LockRuns {
  * was taken from is kept with it until they're stopped, so one isn't left running however
  * this stops.
  */
-export async function takeLock(engine: Engine, runs: LockRuns, item: string, id: string, mode: "skip" | "cancel") {
+export async function takeLock(engine: Engine, runs: LockRuns, item: string, id: string, mode: "skip" | "cancel", order?: string) {
   for (let attempt = 0; attempt < 10; attempt++) {
-    const held = await engine.store.lockTake(item, { run: id, until: Date.now() + LOCK_GRACE_MS }, lockTtl(engine));
+    const held = await engine.store.lockTake(item, { run: id, until: Date.now() + LOCK_GRACE_MS, ...(order ? { order } : {}) }, lockTtl(engine));
     if (!held) {
       await settleLock(engine, runs, item, id);
       return true;
@@ -43,12 +44,15 @@ export async function takeLock(engine: Engine, runs: LockRuns, item: string, id:
     const arn = held.arn ?? (await runs.find(held.run))?.arn;
     const running = arn ? await runs.running(arn) : held.until > Date.now();
     if (running && mode === "skip") return false;
+    // A later event's run replaced this one already, as when this message came again late.
+    if (mode === "cancel" && order && held.order && held.order > order) return false;
     // Too many that it can't be sure of: those first.
     if ((held.replaces?.length ?? 0) >= 50) await settleLock(engine, runs, item, held.run);
     const mine: Lock = {
       run: id,
       until: Date.now() + LOCK_GRACE_MS,
       replaces: [...(held.replaces ?? []), { run: held.run, ...(arn ? { arn } : {}) }],
+      ...(order ? { order } : {}),
     };
     if (!(await engine.store.lockMove(item, held.run, mine, lockTtl(engine)))) continue;
     await settleLock(engine, runs, item, id);
@@ -57,14 +61,20 @@ export async function takeLock(engine: Engine, runs: LockRuns, item: string, id:
   throw new Error("A singleton is busy.");
 }
 
-/** Stop the runs a singleton was taken from. One that hasn't started finds that it lost it. */
-export async function settleLock(engine: Engine, runs: LockRuns, item: string, id: string) {
+/**
+ * Stop the runs a singleton was taken from. One that hasn't started finds that it lost it.
+ * `ending` when one of them is ending, and runs what's done about how it ended: the run
+ * that took it waits for that.
+ */
+export async function settleLock(engine: Engine, runs: LockRuns, item: string, id: string): Promise<(Lock & { ending?: boolean }) | undefined> {
   const lock = await engine.store.lockRead(item);
   if (lock?.run !== id || !lock.replaces?.length) return lock;
+  let ending = false;
   for (const r of lock.replaces) {
     const arn = r.arn ?? (await runs.find(r.run))?.arn;
-    if (arn) await runs.stop(r.run, arn);
+    if (arn && (await runs.stop(r.run, arn)) === "ending") ending = true;
   }
+  if (ending) return { ...lock, ending };
   await engine.store.lockSettled(item, id);
   return lock;
 }

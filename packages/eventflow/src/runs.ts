@@ -7,7 +7,7 @@ import type { RunPayload, WireEvent } from "./types.js";
 import { key as keyOf } from "./ids.js";
 import { takeLock, type LockRuns } from "./singleton.js";
 import { sendSystemEvents } from "./system.js";
-import { ONCE, type InvokeOutcome, type Registered } from "./worker.js";
+import { endedKey, ONCE, type InvokeOutcome, type Registered } from "./worker.js";
 
 /** How long a run's retry is remembered: as long as AWS keeps the run. */
 const RETENTION_MS = 90 * 86_400_000;
@@ -207,9 +207,18 @@ export async function getRun(engine: Engine, runId: string): Promise<Run | undef
   };
 }
 
-export async function cancelRun(engine: Engine, runId: string, registry: Map<string, Registered>) {
+export async function cancelRun(engine: Engine, runId: string, registry: Map<string, Registered>, options: { force?: boolean } = {}) {
   const found = await findRun(engine, runId);
   if (!found) throw new Error(`There's no run "${runId}".`);
+  // One whose end is decided isn't cut off in what's done about it, like onFailure's refund,
+  // or telling the run that invoked it, as a cancelOn event doesn't, unless it's forced.
+  const ended = (await engine.store.successor(endedKey(runId), "stopping", (RETENTION_MS + 86_400_000) * 2)) === "ended";
+  if (ended && !options.force) {
+    const { running } = await runStatus(engine, found.arn);
+    if (running)
+      throw new Error(`The run "${runId}" has returned or failed, and runs what's done about it, like its onFailure. Cancel it with force to cut that off.`);
+    return { id: runId, stopped: false };
+  }
   const stopped = await engine.stopRun(found.arn);
   const { status, payload } = await runStatus(engine, found.arn);
   // One that was stopped already is told again: what stopped it may have stopped first.
@@ -418,13 +427,13 @@ export async function rerunAll(
  * once. Before an EventFlow with many runs in flight is removed, this is faster than
  * `sst remove`, which stops them one at a time.
  */
-export async function cancelAll(engine: Engine, input: ListInput, registry: Map<string, Registered>) {
+export async function cancelAll(engine: Engine, input: ListInput, registry: Map<string, Registered>, options: { force?: boolean } = {}) {
   const runs: RunSummary[] = [];
   for (const status of input.status ? [input.status] : (["RUNNING", "PAUSED"] as RunStatus[]))
     runs.push(...(await listRuns(engine, { ...input, status, limit: Math.min(input.limit ?? 500, 500) })));
   const out: { id: string; stopped?: boolean; error?: string }[] = [];
   for (let i = 0; i < runs.length; i += 10) {
-    const results = await Promise.allSettled(runs.slice(i, i + 10).map((r) => cancelRun(engine, r.id, registry)));
+    const results = await Promise.allSettled(runs.slice(i, i + 10).map((r) => cancelRun(engine, r.id, registry, options)));
     results.forEach((r, j) =>
       out.push(
         r.status === "fulfilled"

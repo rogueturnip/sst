@@ -1069,13 +1069,13 @@ function makeStep(state: RunState) {
   const sendSignal = (idInput: string | { id: string }, options: { signal: string; data?: unknown }) => {
     if (state.fence.down) return never();
     const { id, base, first } = claim(state, idInput);
-    const saved = earlier(id);
-    if (saved) return saved as Promise<{ runId: string | undefined }>;
     // Which signal of the ID this is, by the signal, so a retry where a list changed finds each
-    // one's own record.
+    // one's own record. One whose result is reused counts too, so the next isn't taken for it.
     const sk = `${base}\n${options?.signal}`;
     const nth = state.sent.get(sk) ?? 0;
     state.sent.set(sk, nth + 1);
+    const saved = earlier(id);
+    if (saved) return saved as Promise<{ runId: string | undefined }>;
     begin(first);
     try {
       checkSignal(options);
@@ -1093,17 +1093,18 @@ function makeStep(state: RunState) {
           // answer that too.
           // By the run's root: a retry or replay of the run doesn't tell another wait, nor one that
           // began after it was first sent.
-          const to = await engine.store.successor(
-            key("GS", state.root, state.namespace, base, item, nth),
-            wait ? JSON.stringify([wait.callbackId, wait.runId]) : "",
-            ((engine.resource.runTimeoutSeconds ?? MAX_WAIT_S) + 106 * 86_400) * 1000,
-          );
+          const ttl = ((engine.resource.runTimeoutSeconds ?? MAX_WAIT_S) + 106 * 86_400) * 1000;
+          const record = key("GS", state.root, state.namespace, base, item, nth);
+          const to = await engine.store.successor(record, wait ? JSON.stringify([wait.callbackId, wait.runId]) : "", ttl);
           if (!to) return { runId: undefined };
           const [callbackId, runId] = JSON.parse(to) as [string, string];
           if (wait && wait.callbackId !== callbackId) return { runId: undefined };
           const told = await engine.callback(callbackId, { signal: options.signal, data: options.data ?? null });
+          // Kept, so a try after one that told it, and stopped, says it was told too, and not a
+          // send to a wait that was gone.
+          if (told) await engine.store.claim(`${record}\ntold`, "told", ttl);
           await engine.store.signalFree(item, callbackId);
-          return { runId: told || wait?.callbackId !== callbackId ? runId : undefined };
+          return { runId: told || (await engine.store.owner(`${record}\ntold`)) ? runId : undefined };
         }), { serdes: state.shared.places.serdes(id), subType: "EventFlowSignalSend" }),
       ),
     ).then((r: any) => ({ runId: r?.runId ?? undefined }));

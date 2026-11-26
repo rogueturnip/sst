@@ -106,6 +106,8 @@ export interface Lock {
   until: number;
   /** The runs it took it from, that aren't known to be stopped yet. */
   replaces?: { run: string; arn?: string }[];
+  /** Where its event came, by when it was received and its ID: an earlier one doesn't take it. */
+  order?: string;
 }
 
 /** A run that waits for a signal. */
@@ -2063,6 +2065,7 @@ function lockItem(lock: Lock) {
     until: N(lock.until),
     ...(lock.arn ? { arn: S(lock.arn) } : {}),
     ...(lock.replaces?.length ? { replaces: S(JSON.stringify(lock.replaces)) } : {}),
+    ...(lock.order ? { ord: S(lock.order) } : {}),
   };
 }
 
@@ -2073,6 +2076,7 @@ function lockOf(item: any): Lock | undefined {
     until: Number(item.until.N),
     ...(item.arn ? { arn: String(item.arn.S) } : {}),
     ...(item.replaces ? { replaces: JSON.parse(item.replaces.S) } : {}),
+    ...(item.ord ? { order: String(item.ord.S) } : {}),
   };
 }
 

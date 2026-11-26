@@ -476,9 +476,12 @@ export class Runs {
     return revive((await this.engine().admin<Run | null>("runs.get", { runId })) ?? undefined);
   }
 
-  /** Stop a run. Its steps that already ran aren't undone. */
-  async cancel(runId: string): Promise<{ id: string; stopped: boolean }> {
-    return this.engine().admin("runs.cancel", { runId });
+  /**
+   * Stop a run. Its steps that already ran aren't undone. A run that has returned or failed,
+   * and runs what's done about it, like its `onFailure`, isn't cut off unless `force`.
+   */
+  async cancel(runId: string, options: { force?: boolean } = {}): Promise<{ id: string; stopped: boolean }> {
+    return this.engine().admin("runs.cancel", { runId, ...(options.force ? { force: true } : {}) });
   }
 
   /**
@@ -491,7 +494,7 @@ export class Runs {
    * await flow.runs.cancelAll({ function: importContacts });
    * ```
    */
-  async cancelAll(input: ListInput = {}) {
+  async cancelAll(input: ListInput & { force?: boolean } = {}) {
     const fn = typeof input.function === "string" ? input.function : input.function?.id;
     return this.engine().admin<{ id: string; stopped?: boolean; error?: string }[]>("runs.cancelAll", {
       ...input,

@@ -270,6 +270,8 @@ var CmdEventFlow = &cli.Command{
 					"",
 					"A run that another run invoked fails that run's invoke, so it doesn't wait for it.",
 					"",
+					"A run that has returned or failed, and still runs what's done about it, like its `onFailure`, isn't cut off: pass `--force` to stop it anyway.",
+					"",
 					"Pass `--all` instead of a run ID to cancel every run that's running or paused, up to 500 at a time, or the ones the flags pick. Do this before you remove an EventFlow with many runs in flight: `sst remove` stops them one at a time.",
 					"",
 					"```bash frame=\"none\"",
@@ -295,6 +297,14 @@ var CmdEventFlow = &cli.Command{
 						Long:  "Cancel every run that's running or paused, or the ones the other flags pick, instead of one run.",
 					},
 				},
+				{
+					Name: "force",
+					Type: "bool",
+					Description: cli.Description{
+						Short: "Also stop a run in its onFailure",
+						Long:  "A run that has returned or failed, and still runs its `onFailure` or tells the run that invoked it, isn't cut off unless you pass `--force`.",
+					},
+				},
 				eventflowYesFlag,
 			}, eventflowListFlags...),
 			Run: func(c *cli.Cli) error {
@@ -307,6 +317,7 @@ var CmdEventFlow = &cli.Command{
 					if err != nil {
 						return err
 					}
+					args.Force = c.Bool("force")
 					if err := eventflowConfirm(c, "Cancel every run that's running or paused, that the flags pick?"); err != nil {
 						return err
 					}
@@ -324,7 +335,11 @@ var CmdEventFlow = &cli.Command{
 				if runID == "" {
 					return util.NewReadableError(nil, "Pass the ID of the run to cancel, or --all for the runs in flight")
 				}
-				return eventflowCall(c, "runs.cancel", eventflow.RunArgs(runID), func(raw json.RawMessage) error {
+				cancelArgs := eventflow.RunArgs(runID)
+				if c.Bool("force") {
+					cancelArgs["force"] = true
+				}
+				return eventflowCall(c, "runs.cancel", cancelArgs, func(raw json.RawMessage) error {
 					var result eventflow.Cancelled
 					if err := json.Unmarshal(raw, &result); err != nil {
 						return err

@@ -494,9 +494,9 @@ export async function startRun(
       );
   }
 
-  if (admission.decision === "hold" && admission.at > Date.now() + 1000) {
-    // Hold the run: send it back to the queue, to come again when it's due. A queue
-    // delays a message at most 15 minutes, so a longer wait comes back more than once.
+  // Hold the run: send it back to the queue, to come again when it's due. A queue
+  // delays a message at most 15 minutes, so a longer wait comes back more than once.
+  const hold = async (admission: { at: number }) => {
     await engine.sendMessages([
       {
         message: sign({
@@ -519,13 +519,22 @@ export async function startRun(
         delaySeconds: Math.min(900, Math.ceil((admission.at - Date.now()) / 1000)),
       },
     ]);
-    return;
-  }
+  };
+  if (admission.decision === "hold" && admission.at > Date.now() + 1000) return hold(admission);
 
   // A run that had the singleton, and lost it to a later one while it was held. The runs it
   // took it from are stopped first.
-  if (lockItem && (await settleLock(engine, lockRuns(engine, registry), lockItem, id))?.run !== id)
-    return skip("singleton", "Skipped a run that a later one replaced");
+  if (lockItem) {
+    const lock = await settleLock(engine, lockRuns(engine, registry), lockItem, id);
+    if (lock?.run !== id) return skip("singleton", "Skipped a run that a later one replaced");
+    // The run it replaces is ending, and runs what's done about how it ended, like onFailure:
+    // this one starts once it has, and is held till then without using the message's tries.
+    if (lock.ending) {
+      const { ending: _, ...mine } = lock;
+      await engine.store.lockMove(lockItem, id, { ...mine, until: Date.now() + SINGLETON_WAIT_MS + LOCK_GRACE_MS }, lockTtl(engine));
+      return hold({ at: Date.now() + SINGLETON_WAIT_MS });
+    }
+  }
 
   const payload: RunPayload = {
     "sst:eventflow": 1,
@@ -541,6 +550,14 @@ export async function startRun(
   };
   const started = await engine.startRun(payload);
   if (lockItem && started?.arn) await engine.store.lockStarted(lockItem, id, started.arn);
+}
+
+/** How often a singleton's run that waits for the one it replaces to end looks again. */
+const SINGLETON_WAIT_MS = 60_000;
+
+/** Where an event comes among a singleton's: by when it was received, then its ID. */
+function lockOrder(event: WireEvent, received: number) {
+  return `${String(received).padStart(15, "0")}:${event.id}`;
 }
 
 const SKIPPED: Record<string, string> = {
@@ -589,7 +606,7 @@ async function admit(
     if (lockItem) await engine.store.lockFree(lockItem, id);
     return { decision: "skip", reason };
   };
-  if (lockItem && !(await takeLock(engine, lockRuns(engine, registry), lockItem, id, def.singleton!.mode))) return skip("singleton");
+  if (lockItem && !(await takeLock(engine, lockRuns(engine, registry), lockItem, id, def.singleton!.mode, lockOrder(event, opts.received)))) return skip("singleton");
   let at = opts.notBefore ?? 0;
   if (def.throttle) {
     // Each held run takes its own slot, so they come back one at a time, in order. One that
@@ -607,8 +624,11 @@ async function admit(
   }
   if (at <= now + 1000) return { decision: "start" };
   // While it's held there's no run to find.
-  if (lockItem)
-    await engine.store.lockMove(lockItem, id, { run: id, until: at + LOCK_GRACE_MS }, at - now + lockTtl(engine));
+  if (lockItem) {
+    // What it replaces, and is still to stop, stays with it.
+    const replaces = (await engine.store.lockRead(lockItem))?.replaces;
+    await engine.store.lockMove(lockItem, id, { run: id, until: at + LOCK_GRACE_MS, order: lockOrder(event, opts.received), ...(replaces?.length ? { replaces } : {}) }, at - now + lockTtl(engine));
+  }
   return { decision: "hold", at };
 }
 
@@ -623,11 +643,11 @@ export function lockRuns(engine: Engine, registry: Map<string, Registered>): Loc
     running: async (arn) => (await runStatus(engine, arn)).running,
     stop: async (runId, arn) => {
       // One whose end is decided runs what's done about it, like onFailure: the next isn't
-      // started beside it. The message comes again, and finds it ended.
-      if ((await engine.store.owner(endedKey(runId))) === "ended" && (await runStatus(engine, arn)).running)
-        throw new Error("The singleton's run is ending. The next is started once it has.");
+      // started beside it, and waits.
+      if ((await engine.store.owner(endedKey(runId))) === "ended" && (await runStatus(engine, arn)).running) return "ending";
       if (await stop(engine, registry, { arn, runId, message: "The run was cancelled by a later one, as it's a singleton." }))
         log("Cancelled a run that a later one replaced", { run: runId });
+      return "stopped";
     },
   };
 }
