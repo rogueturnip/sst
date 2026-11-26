@@ -372,7 +372,7 @@ On AWS, with a step that charges and then crashes the Lambda before its result i
 - Every side effect goes in a step, with `idempotencyKey`, or `atMostOnce`. Never outside a step: that code runs again on every replay of the run.
 - Give events from your system an `id`, like the order's ID, so sending one twice starts one run.
 - Use `idempotency: "event.data.orderId"` on the function as well, to start one run per order in 24 hours, whatever the event IDs.
-- `cancelOn` and `flow.runs.cancel()` stop a run where it is. The steps that ran aren't undone. Refund in `onFailure`, or in a step after a `waitForEvent`, not by cancelling.
+- `cancelOn` and `flow.runs.cancel()` stop a run where it is. The steps that ran aren't undone. Refund in `onFailure`, or in a step after a `waitForEvent`, not by cancelling. Once the function has returned or failed, an event no longer cancels the run: its `onFailure` and the run that invoked it aren't cut off.
 - A replay runs every step again, with the same idempotency keys. A provider that keeps keys for a limited time, like 24 hours, may charge again after that: retry, which reuses the saved results, rather than replay. A retry runs again what comes after a step whose ID was used more than once, so give money steps IDs of their own, or keys that say what they're of, and retry within the provider's window.
 
 ---

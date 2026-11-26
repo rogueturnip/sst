@@ -25,7 +25,7 @@ export const missing = { ms: 30_000 };
 
 const OWN = 0, MARK = 1, CUT = 2;
 /** The attempt of the function it's of, by which one that ended before can be told. */
-export type Place = [scope: string, id: string, seq: number, attempt: number, kind: number, led?: string];
+export type Place = [scope: string, id: string, seq: number, attempt: number, kind: number, led?: string, base?: string];
 
 /** A result with its place, as it's saved. */
 export function unwrap(text: string | undefined | null): { value: any; place?: Place } {
@@ -75,6 +75,8 @@ export class Places {
   readonly callers = new Map<string, number>();
   /** The result each was called on, as the function came to it: "" for its start. */
   readonly leds = new Map<string, string>();
+  /** The ID each was called with, of which it's a use. */
+  readonly bases = new Map<string, string>();
 
   /** The order of the results of a retry's run that have no place: they're given in it. */
   readonly rank: Map<string, number>;
@@ -131,12 +133,12 @@ export class Places {
       this.own.set(id, (own = { seq: ++this.last, attempt: this.callers.get(id) ?? this.attempt }));
       this.onTake?.(id, own.seq, own.attempt);
     }
-    return JSON.stringify({ [ORDER]: [this.scope, id, own.seq, own.attempt, OWN, this.leds.get(id)], v: value });
+    return JSON.stringify({ [ORDER]: [this.scope, id, own.seq, own.attempt, OWN, this.leds.get(id), this.bases.get(id)], v: value });
   }
 
   /** A place for a result that has none, or one that the attempt goes on without. */
   mark(id: string, attempt: number): Place {
-    const place: Place = [this.scope, id, ++this.last, attempt, MARK, this.leds.get(id)];
+    const place: Place = [this.scope, id, ++this.last, attempt, MARK, this.leds.get(id), this.bases.get(id)];
     this.add(place);
     this.onTake?.(id, place[2], attempt);
     return place;
@@ -196,6 +198,8 @@ export class Order {
   fresh = false;
   /** The step whose result it's going on from. */
   current?: string;
+  /** The steps whose results it has had. */
+  readonly given = new Set<string>();
   /** The time it has for that, in this invocation. */
   grace?: Grace;
   /** The places of which the results aren't given yet. */
@@ -321,6 +325,7 @@ export class Order {
       this.ready.delete(seq);
       this.fresh = true;
       this.current = giving;
+      if (giving !== undefined) this.given.add(giving);
       this.grace = this.inv.given();
       next.give(this.grace);
       // All that comes of it at once, before the next.

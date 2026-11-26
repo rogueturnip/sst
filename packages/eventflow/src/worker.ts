@@ -315,6 +315,8 @@ interface Call {
   given: boolean;
   /** The result it was called on. */
   led: string;
+  /** The ID it was called with. */
+  base: string;
 }
 
 interface Claim {
@@ -361,7 +363,7 @@ function claim(state: RunState, input: StepInput): Claim {
     state.refuse(error);
     throw error;
   }
-  const call = { link: at, name: occurrence(state, id), given: false, led: order.fresh ? (order.current ?? "") : `~${at.parent?.name ?? ""}` };
+  const call = { link: at, name: occurrence(state, id), base: id, given: false, led: `${at.parent?.name ?? ""}\n${order.fresh ? (order.current ?? "") : ""}` };
   at.name = call.name;
   // A step that an earlier attempt ended, on a path that the function didn't take again: its
   // result would be found by its ID, and could be another call's.
@@ -462,13 +464,22 @@ function makeStep(state: RunState) {
       throw error;
     });
   // A step of the run this one is a retry of.
+  // Whether the function came to a step as before: after the same step in its async context,
+  // which is the same whatever the timing, and once it had the result it was called on then. That
+  // one may have come in another order, as in a join, where the rest were there too, but if it
+  // isn't there yet, the function went on from another, like the other of a race.
+  const sameWay = (before: string, now: string | undefined) => {
+    if (now === undefined) return false;
+    const [prev, on] = before.split("\n");
+    return prev === now.split("\n")[0] && (!on || state.order.given.has(on));
+  };
   const earlier = (id: string): Promise<any> | undefined => {
     const saved = memo(id);
     if (!saved.hit) return undefined;
     // One after the step a retry runs again is reused only where the function came to it from
     // the same result: on another path it could be another call's.
     const led = state.calling?.name === id ? state.calling.led : undefined;
-    if (state.memoLed && Object.prototype.hasOwnProperty.call(state.memoLed, id) && state.memoLed[id] !== led) {
+    if (state.memoLed && Object.prototype.hasOwnProperty.call(state.memoLed, id) && !sameWay(state.memoLed[id], led)) {
       // The retry was made for it to be reused, and an atMostOnce step isn't run again by surprise.
       const error = new UsageError(
         `The function came to the step "${id}" another way than the run this retries, so whose result it is can't be told. Replay the run.`,
@@ -491,7 +502,10 @@ function makeStep(state: RunState) {
     }
     if (before) return before.promise;
     state.shared.places.callers.set(id, state.attempt);
-    if (state.calling?.name === id) state.shared.places.leds.set(id, state.calling.led);
+    if (state.calling?.name === id) {
+      state.shared.places.leds.set(id, state.calling.led);
+      state.shared.places.bases.set(id, state.calling.base);
+    }
     const promise = begin();
     promise.catch(() => {});
     ops.set(id, { kind, promise });
@@ -1155,6 +1169,7 @@ function withMiddleware(state: RunState): Record<string, any> {
   const tool = (type: string, name: string) => (idInput: StepInput, ...rest: any[]) => {
     if (state.fence.down) return never();
     const claimed = claim(state, idInput);
+    const calling = state.calling;
     const id = stepId(idInput);
     const info = hooks.info(id, typeof idInput === "object" ? idInput.name : undefined, type);
     const inner = async (child: durable.DurableContext) => {
@@ -1175,7 +1190,7 @@ function withMiddleware(state: RunState): Record<string, any> {
       if (stepId(options) !== id) throw new UsageError(`A middleware changes the ID of the step "${id}", which EventFlow doesn't allow.`);
       if (takesInput) args = changed.input;
       const given: any = { ...info, options, input: takesInput ? args : undefined };
-      const tools = makeStep({ ...state, ctx: child, claimed });
+      const tools = makeStep({ ...state, ctx: child, claimed, calling });
       const call = name.split(".").reduce((t: any, k) => t[k], tools);
       const handler = takesInput
         ? (...a: any[]) => handledWith(state, given, (stepKeys.getStore()?.attempt ?? 0) + 1, () => fn(...a))
@@ -1373,7 +1388,8 @@ async function listen(
     const event = await fat(engine, kept);
     if (!eventMatches(event, input.field, input.value, waiter.condition)) continue;
     await engine.store.deleteWaiter(k, waiter).catch(() => {});
-    return { event: kept, registered };
+    // A run has it now: its data is kept as long as the run's.
+    return { event: kept.blob ? await slim(engine, event) : kept, registered };
   }
   return { event: null, registered };
 }
@@ -1626,8 +1642,14 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
     const load = async () => {
       if (payload.batch) {
         const batch = payload.batch;
-        events = await read(inv, ctx.lambdaContext, "the run's batch", async () => engine.store.batchEvents(await engine.store.batchRead(batch.item, batch.n)), false);
-        if (!events.length) throw new NonRetriableError("The run's batch is gone.");
+        let refs = 0;
+        events = await read(inv, ctx.lambdaContext, "the run's batch", async () => {
+          const found = await engine.store.batchRead(batch.item, batch.n);
+          refs = found.length;
+          return engine.store.batchEvents(found);
+        }, false);
+        // Part of it isn't the run it was: it's said, not run on what's left.
+        if (!events.length || events.length < refs) throw new NonRetriableError(`The run's batch is gone: ${refs - events.length} of its ${refs} events have expired.`);
       }
       if (events.some((e) => e.blob))
         events = await read(inv, ctx.lambdaContext, "the run's event", () => Promise.all(events.map((e) => fat(engine, e))), false);
@@ -1860,6 +1882,22 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
       if (def.cancelOn.length && root.saved("sst:cancelOn")) cancelKeys = (await root.step("sst:cancelOn", async () => ({ keys: [] as typeof cancelKeys, found: false }))).keys;
     }
 
+    const endingFirst = async (what: string, fn: () => Promise<void>) => {
+      try {
+        await fn();
+      } catch (failure) {
+        if (isDurableInternal(failure)) throw failure;
+        log("error", `Failed to ${what}`, { run: runId, error: errorInfo(failure).message });
+      }
+    };
+    // How it ended is decided: an event that cancels it doesn't stop what's done about that, like
+    // onFailure's refund, or a parent being told.
+    if (cancelKeys.length)
+      await endingFirst("stop listening", () =>
+        tellRun("sst:cancelOn:end", async () => {
+          await Promise.all(cancelKeys.map((k) => engine.store.deleteWaiter(k.key, k)));
+        }),
+      );
     const isCancelled = !outcome.ok && (outcome.error instanceof CancelledError || errorInfo(outcome.error).name === CANCELLED);
     if (!outcome.ok && def.onFailure && !isCancelled) {
       const { error } = outcome;
@@ -1906,12 +1944,6 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
       const output = outcome.value;
       await ending("tell the middleware", () => tellRun("sst:onRunComplete", () => hooks.tell("onRunComplete", { output })));
     }
-    if (cancelKeys.length)
-      await ending("stop listening", () =>
-        tellRun("sst:cancelOn:end", async () => {
-          await Promise.all(cancelKeys.map((k) => engine.store.deleteWaiter(k.key, k)));
-        }),
-      );
     // Start what it deferred, unless it was cancelled.
     if (defers.size && !isCancelled)
       await ending("start what it deferred", () =>

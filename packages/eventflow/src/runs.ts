@@ -447,10 +447,12 @@ export function memoFrom(events: any[], earlier: Pick<RunPayload, "memo" | "memo
   const blobs: Record<string, string> = Object.create(null);
   const saved: Place[] = [];
   const led: Record<string, string> = Object.create(null);
+  const bases: Record<string, string> = Object.create(null);
   const place = (p: Place | undefined) => {
     if (p?.[0] !== "") return;
     saved.push(p);
     if (typeof p[5] === "string") led[p[1]] = p[5];
+    if (typeof p[6] === "string") bases[p[1]] = p[6];
   };
   for (const e of events) {
     if (e.ParentId) continue;
@@ -509,7 +511,11 @@ export function memoFrom(events: any[], earlier: Pick<RunPayload, "memo" | "memo
   // than once could be another call's: those steps run again. The others are reused, in the
   // order they had.
   const names = new Set([...ids, ...Object.keys(memo), ...Object.keys(blobs), ...Object.keys(earlier.memo ?? {})]);
-  const once = (id: string) => !/:\d+$/.test(id) && !names.has(`${id}:1`);
+  // By the ID each was called with, as the worker saved it: an ID of the user's like "page:3"
+  // isn't a use of "page".
+  const uses = new Map<string, number>();
+  for (const b of Object.values(bases)) uses.set(b, (uses.get(b) ?? 0) + 1);
+  const once = (id: string) => (bases[id] !== undefined ? uses.get(bases[id]) === 1 : !/:\d+$/.test(id) && !names.has(`${id}:1`));
   // With the result each was called on: one that's reused is where the function came to it the
   // same way. One that was reused already keeps what it had.
   const ledOf = (id: string) => earlier.memoLed?.[id] ?? (earlier.memo && id in earlier.memo && !earlier.memoRest?.includes(id) ? undefined : led[id]);

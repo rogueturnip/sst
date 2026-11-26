@@ -14,14 +14,14 @@ export const INLINE_BYTES = 100 * 1024;
 export class GoneError extends NonRetriableError {}
 
 /** The event with its data kept apart, if that's large. The same event makes the same reference. */
-export async function slim(engine: Engine, event: WireEvent): Promise<WireEvent> {
+export async function slim(engine: Engine, event: WireEvent, ttlMs = blobTtl(engine)): Promise<WireEvent> {
   if (event.blob) return event;
   const body = JSON.stringify(event.data) ?? "null";
   const bytes = Buffer.byteLength(body);
   if (bytes <= INLINE_BYTES) return event;
   // Named by what's in it, for its tenant, so one that's written again is the same.
   const key = `X#${hash(JSON.stringify([event.tenant ?? null, event.id, hash(body, 52)]), 52)}`;
-  await engine.store.putBlob(key, body, blobTtl(engine));
+  await engine.store.putBlob(key, body, ttlMs);
   return { ...event, data: null, blob: { key, bytes } };
 }
 

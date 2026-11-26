@@ -214,8 +214,16 @@ async function notifyParent(engine: Engine, parent: string, error: { name: strin
 async function resolveWaits(event: WireEvent, receivedAt: number, engine: Engine, registry: Map<string, Registered>) {
   const fields = await engine.store.waitFields(event.name, event.tenant);
   if (!fields.length) return;
-  const kept = await slim(engine, event);
+  // Its data, for waits that start in the next hour, is kept that long, unless one takes it. A
+  // sender can't make the table keep what no run uses.
+  let kept = await slim(engine, event, RECENT_MS + 86_400_000);
   await engine.store.putRecent(recentKey(event.name, event.tenant), kept, receivedAt, RECENT_MS);
+  let taken = false;
+  const take = async () => {
+    if (!taken) kept = await slim(engine, event);
+    taken = true;
+    return kept;
+  };
   const now = Date.now();
   for (const field of fields) {
     const raw = field === "*" ? undefined : getPath(event, field.split("."));
@@ -224,7 +232,8 @@ async function resolveWaits(event: WireEvent, receivedAt: number, engine: Engine
     const k = waitKey(event.name, event.tenant, field, value);
     const waiters = (await engine.store.waiters(k, now))
       // A wait that started after the event came finds it itself.
-      .filter((w) => w.createdAt <= receivedAt)
+      // With a second's margin for the clocks of SQS and of the worker: one told twice is the same.
+      .filter((w) => w.createdAt <= receivedAt + 1000)
       .filter((w) => eventMatches(event, field, value, w.condition));
     // Many runs can wait for one event: some at a time, so none is throttled out.
     for (let i = 0; i < waiters.length; i += 25)
@@ -234,7 +243,7 @@ async function resolveWaits(event: WireEvent, receivedAt: number, engine: Engine
             const arn = w.callbackId.slice(STOP.length);
             if (await stop(engine, registry, { arn, runId: w.runId, parent: w.parent, message: `The run was cancelled by "${event.name}".` }))
               log("Cancelled a run", { run: w.runId, event: event.id });
-          } else if (await engine.callback(w.callbackId, kept)) {
+          } else if (await engine.callback(w.callbackId, await take())) {
             log("Resolved a wait for an event", { run: w.runId, event: event.id });
           }
           await engine.store.deleteWaiter(k, w).catch(() => {});
@@ -299,7 +308,8 @@ function inBatch(def: Definition, event: WireEvent) {
 
 function batchTtl(engine: Engine) {
   // As long as its run can be looked at, retried and replayed.
-  return ((engine.resource.runTimeoutSeconds ?? MAX_WAIT_S) + 90 * 86_400) * 1000;
+  // From when it closes, and as long as its events' data.
+  return ((engine.resource.runTimeoutSeconds ?? MAX_WAIT_S) + 106 * 86_400) * 1000;
 }
 
 async function addToBatch(def: Definition, event: WireEvent, receivedAt: number, engine: Engine, registry: Map<string, Registered>) {
@@ -307,7 +317,7 @@ async function addToBatch(def: Definition, event: WireEvent, receivedAt: number,
   const tenant = event.tenant ?? null;
   const item = key("B", def.id, tenant, batch.key?.({ event }) ?? null);
   const order = `${String(receivedAt).padStart(15, "0")}#${hash(event.id, 16)}`;
-  await engine.store.batchAdd(item, key("BE", item, event.id), order, await slim(engine, event), receivedAt, batchTtl(engine));
+  await engine.store.batchAdd(item, key("BE", item, event.id), order, await slim(engine, event), receivedAt, batchTtl(engine) + batch.timeoutMs);
   // Each event has a timer of its own, so however this stops, the batch is closed in time.
   await engine.sendTimer({ type: "batch", fn: def.id, item, tenant: event.tenant }, receivedAt + batch.timeoutMs);
   await closeBatches(def, item, engine, registry);
