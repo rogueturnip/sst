@@ -25,7 +25,7 @@ export const missing = { ms: 30_000 };
 
 const OWN = 0, MARK = 1, CUT = 2;
 /** The attempt of the function it's of, by which one that ended before can be told. */
-export type Place = [scope: string, id: string, seq: number, attempt: number, kind: number];
+export type Place = [scope: string, id: string, seq: number, attempt: number, kind: number, led?: string];
 
 /** A result with its place, as it's saved. */
 export function unwrap(text: string | undefined | null): { value: any; place?: Place } {
@@ -45,7 +45,7 @@ export function placeOfError(data: unknown): Place | undefined {
 export const isMarker = (name: unknown) => typeof name === "string" && name.startsWith(`${ORDER}:`);
 
 /** The places that are saved, by what they're of. */
-export function placesOf(ctx: durable.DurableContext): (scope: string, earlier?: string[]) => Places {
+export function placesOf(ctx: durable.DurableContext): (scope: string, earlier?: string[], rest?: string[]) => Places {
   const all = new Map<string, Place[]>();
   for (const op of Object.values(((ctx as any)._executionContext?._stepData ?? {}) as Record<string, any>)) {
     const text = op?.StepDetails?.Result ?? op?.ContextDetails?.Result;
@@ -54,7 +54,7 @@ export function placesOf(ctx: durable.DurableContext): (scope: string, earlier?:
     if (!place && typeof text === "string" && text.startsWith(`{"${ORDER}":[`)) place = unwrap(text).place;
     if (place) all.set(place[0], [...(all.get(place[0]) ?? []), place]);
   }
-  return (scope, earlier) => new Places(scope, all.get(scope) ?? [], earlier);
+  return (scope, earlier, rest) => new Places(scope, all.get(scope) ?? [], earlier, rest);
 }
 
 /**
@@ -73,13 +73,20 @@ export class Places {
   private readonly entities = new Map<string, string>();
   /** The attempt that began each step, in this invocation. */
   readonly callers = new Map<string, number>();
+  /** The result each was called on, as the function came to it: "" for its start. */
+  readonly leds = new Map<string, string>();
 
-  /** `earlier` are the results of the run it's a retry of, in their order. */
+  /** The order of the results of a retry's run that have no place: they're given in it. */
+  readonly rank: Map<string, number>;
+
+  /** `earlier` are the results of the run it's a retry of, in their order, and `rest` those after the first step it runs again. */
   constructor(
     readonly scope: string,
     saved: Place[],
     earlier: string[] = [],
+    rest: string[] = [],
   ) {
+    this.rank = new Map(rest.map((id, i) => [id, i]));
     earlier.forEach((id, i) => this.own.set(id, { seq: i + 1, attempt: -1 }));
     this.last = earlier.length;
     for (const place of saved) this.add(place);
@@ -124,12 +131,12 @@ export class Places {
       this.own.set(id, (own = { seq: ++this.last, attempt: this.callers.get(id) ?? this.attempt }));
       this.onTake?.(id, own.seq, own.attempt);
     }
-    return JSON.stringify({ [ORDER]: [this.scope, id, own.seq, own.attempt, OWN], v: value });
+    return JSON.stringify({ [ORDER]: [this.scope, id, own.seq, own.attempt, OWN, this.leds.get(id)], v: value });
   }
 
   /** A place for a result that has none, or one that the attempt goes on without. */
   mark(id: string, attempt: number): Place {
-    const place: Place = [this.scope, id, ++this.last, attempt, MARK];
+    const place: Place = [this.scope, id, ++this.last, attempt, MARK, this.leds.get(id)];
     this.add(place);
     this.onTake?.(id, place[2], attempt);
     return place;
@@ -187,6 +194,8 @@ export class Failed extends durable.DurableOperationError {
 export class Order {
   /** The function is going on from its start, or from a result, and nothing else. */
   fresh = false;
+  /** The step whose result it's going on from. */
+  current?: string;
   /** The time it has for that, in this invocation. */
   grace?: Grace;
   /** The places of which the results aren't given yet. */
@@ -253,6 +262,14 @@ export class Order {
     const { places } = this;
     const work = async () => {
       for (let given = false; !given && !this.closed; ) {
+        // Of those that are there at once, the first in the order they had.
+        const rank = places.rank.get(id);
+        if (!places.at(id) && rank !== undefined)
+          while (!this.closed) {
+            const before = [...this.called].find((o) => o !== id && (places.rank.get(o) ?? Infinity) < rank && !places.at(o));
+            if (!before) break;
+            await new Promise<void>((resolve) => immediate(() => resolve()));
+          }
         if (!places.at(id)) await this.save(this.name(id), () => places.mark(id, this.attempt));
         const entity = places.entity(id);
         if (entity !== undefined) await this.inv.written(entity);
@@ -299,14 +316,17 @@ export class Order {
         break;
       }
       this.unstall();
+      const giving = this.expected.get(seq)?.id;
       this.expected.delete(seq);
       this.ready.delete(seq);
       this.fresh = true;
+      this.current = giving;
       this.grace = this.inv.given();
       next.give(this.grace);
       // All that comes of it at once, before the next.
       await new Promise<void>((resolve) => immediate(() => resolve()));
       this.fresh = false;
+      this.current = undefined;
       this.grace = undefined;
     }
     this.pumping = false;

@@ -328,15 +328,31 @@ export async function rerun(
   const memo = found_ ? { ...(payload.memo ?? {}), ...found_.memo } : undefined;
   const memoBlobs = found_ ? { ...(payload.memoBlobs ?? {}), ...found_.blobs } : undefined;
   if (memo && memoBlobs) for (const id of Object.keys(found_!.memo)) delete memoBlobs[id];
+  // Only what it reuses, also of the run that run retried: what it doesn't is run again, and
+  // checked as that.
+  // One that an earlier retry reused isn't in this run's history, so it can't be told whether
+  // it was atMostOnce: running it again is done on purpose only.
+  const dropped: string[] = [];
+  if (found_ && memo && memoBlobs) {
+    const keep = new Set([...found_.order, ...found_.rest]);
+    for (const m of [memo, memoBlobs])
+      for (const id of Object.keys(m))
+        if (!keep.has(id)) {
+          delete (m as any)[id];
+          dropped.push(`${id}, which an earlier retry reused`);
+        }
+  }
   const reused = [...Object.keys(memo ?? {}), ...Object.keys(memoBlobs ?? {})];
   const memoOrder = found_?.order;
+  const memoRest = found_?.rest;
+  const memoLed = found_?.led;
   if (memo && Buffer.byteLength(JSON.stringify(memo)) > MAX_MEMO_BYTES)
     throw new Error(`The saved results of "${runId}" are over ${MAX_MEMO_BYTES} bytes. Replay it instead, to run every step again.`);
 
   // A rerun that would run an at-most-once step again, here or in a run it invoked,
   // is only done on purpose.
   if (!options.force) {
-    const risky = await riskySteps(engine, events, reuse ? Object.fromEntries(reused.map((id) => [id, true])) : undefined);
+    const risky = [...dropped, ...(await riskySteps(engine, events, reuse ? Object.fromEntries(reused.map((id) => [id, true])) : undefined))];
     if (risky.length)
       throw new InterruptedRunError(
         `A ${reuse ? "retry" : "replay"} of "${runId}" would run again atMostOnce steps that started: ${risky
@@ -362,7 +378,7 @@ export async function rerun(
     const taken = await takeLock(engine, lockRuns, payload.lock, id, "skip");
     if (!taken) throw new Error(`Another run has the singleton of "${runId}". Rerun it once that one has ended.`);
   }
-  await engine.startRun({ ...rest, runId: id, root: payload.root ?? runId, replayOf: runId, memo, memoBlobs, memoOrder, at: Date.now() });
+  await engine.startRun({ ...rest, runId: id, root: payload.root ?? runId, replayOf: runId, memo, memoBlobs, memoOrder, memoRest, memoLed, at: Date.now() });
   return { id, replayOf: runId, reused };
 }
 
@@ -426,11 +442,16 @@ function isWhole(text: string | undefined) {
  * The results of a run's top-level steps that succeeded, by step ID, from its
  * history. A retry passes them to its run, so those steps aren't run again.
  */
-export function memoFrom(events: any[], earlier: Pick<RunPayload, "memo" | "memoBlobs" | "memoOrder"> = {}): { memo: Record<string, unknown>; blobs: Record<string, string>; order: string[] } {
+export function memoFrom(events: any[], earlier: Pick<RunPayload, "memo" | "memoBlobs" | "memoOrder" | "memoRest" | "memoLed"> = {}): { memo: Record<string, unknown>; blobs: Record<string, string>; order: string[]; rest: string[]; led: Record<string, string> } {
   const memo: Record<string, unknown> = Object.create(null);
   const blobs: Record<string, string> = Object.create(null);
   const saved: Place[] = [];
-  const place = (p: Place | undefined) => void (p?.[0] === "" && saved.push(p));
+  const led: Record<string, string> = Object.create(null);
+  const place = (p: Place | undefined) => {
+    if (p?.[0] !== "") return;
+    saved.push(p);
+    if (typeof p[5] === "string") led[p[1]] = p[5];
+  };
   for (const e of events) {
     if (e.ParentId) continue;
     const name: string | undefined = e.Name;
@@ -484,12 +505,19 @@ export function memoFrom(events: any[], earlier: Pick<RunPayload, "memo" | "memo
   const ids = places.map(([id]) => id);
   const first = ids.findIndex((id) => !kept(id));
   const order = first < 0 ? ids : ids.slice(0, first);
-  // After it the function may take another path, and a result found by its ID could be
-  // another call's: those steps run again.
-  const keep = new Set(order);
+  // After it the function may take another path. A result found by an ID that was used more
+  // than once could be another call's: those steps run again. The others are reused, in the
+  // order they had.
+  const names = new Set([...ids, ...Object.keys(memo), ...Object.keys(blobs), ...Object.keys(earlier.memo ?? {})]);
+  const once = (id: string) => !/:\d+$/.test(id) && !names.has(`${id}:1`);
+  // With the result each was called on: one that's reused is where the function came to it the
+  // same way. One that was reused already keeps what it had.
+  const ledOf = (id: string) => earlier.memoLed?.[id] ?? (earlier.memo && id in earlier.memo && !earlier.memoRest?.includes(id) ? undefined : led[id]);
+  const rest = [...new Set([...(earlier.memoRest ?? []), ...ids.slice(order.length)])].filter((id) => kept(id) && once(id) && !order.includes(id) && typeof ledOf(id) === "string");
+  const keep = new Set([...order, ...rest]);
   for (const id of Object.keys(memo)) if (!keep.has(id)) delete memo[id];
   for (const id of Object.keys(blobs)) if (!keep.has(id)) delete blobs[id];
-  return { memo, blobs, order };
+  return { memo, blobs, order, rest, led: Object.fromEntries(rest.map((id) => [id, ledOf(id)!])) };
 }
 
 // The child contexts EventFlow makes, by their subtype.

@@ -93,6 +93,10 @@ export interface RunPayload {
   memoBlobs?: Record<string, string>;
   /** The order the function had them in, up to the first step that's run again. */
   memoOrder?: string[];
+  /** After it, those of step IDs that it used once, in their order. */
+  memoRest?: string[];
+  /** Of those, the result each was called on. */
+  memoLed?: Record<string, string>;
 
   /** When its event came: the steps of runs that came first go first. */
   at?: number;

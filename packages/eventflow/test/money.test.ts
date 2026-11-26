@@ -247,6 +247,22 @@ describe("rerunning a run with an atMostOnce step", () => {
       return [wire, flow.createFunction({ id: "order" }, async () => "done")];
     });
 
+  it("is refused when a result an earlier retry reused wouldn't be reused again", async () => {
+    const cluster = flow();
+    // A retry of an earlier version reused "wire", which isn't in its own history.
+    cluster.history.set("order-6", {
+      status: "FAILED",
+      payload: { ...payload("order", "order-6"), memo: { wire: 1, list: ["A"] }, memoOrder: [] },
+      events: placed([
+        { EventType: "StepFailed", Id: "1", Name: "risk", StepFailedDetails: { Error: { Payload: { ErrorMessage: "no" } } } },
+        { EventType: "StepSucceeded", Id: "2", Name: "charge", StepSucceededDetails: ok(1) },
+        { EventType: "StepSucceeded", Id: "3", Name: "charge:1", StepSucceededDetails: ok(1) },
+      ]),
+    });
+    await expect(cluster.flow.runs.retry("order-6")).rejects.toThrow("which an earlier retry reused");
+    expect((await cluster.flow.runs.retry("order-6", { force: true })).reused).toEqual([]);
+  });
+
   it("is refused when the step is in a run it invoked, which a retry starts again", async () => {
     const cluster = flow();
     cluster.history.set("order-1", {

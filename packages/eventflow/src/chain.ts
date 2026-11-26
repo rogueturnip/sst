@@ -13,6 +13,8 @@ interface Link {
   depth: number;
   /** What the function has left of the time after it. */
   grace?: Grace;
+  /** The step's name. */
+  name?: string;
 }
 
 const links = new AsyncLocalStorage<Link>();

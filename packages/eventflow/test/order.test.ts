@@ -405,6 +405,58 @@ describe("a run that's retried", () => {
     expect([...charged.values()].sort()).toEqual(["alice", "bob", "carol"]);
   }, 30_000);
 
+  it("reuses what came after a step that failed and was caught, so it charges and sends once", async () => {
+    let charges = 0;
+    let first = true;
+    const c = new Cluster((flow) => [
+      flow.createFunction({ id: "f", triggers: { event: "go" }, retries: 0 }, async ({ step }: any) => {
+        try { await step.run("loyalty", () => { if (first) throw new Error("down"); }); } catch {}
+        const at = await step.run("stamp", () => new Date().toISOString());
+        await step.run("charge", () => ++charges);
+        await step.sendEvent("bill", { name: "billing/charge", data: { at } });
+        await step.run("ship", () => { if (first) throw new NonRetriableError("carrier down"); return "shipped"; });
+        return "ok";
+      }),
+    ]);
+    await c.flow.send({ name: "go" });
+    await c.drain();
+    const run = c.runOf("f");
+    await st(run);
+    first = false;
+    c.history.set(run.runId, { status: "FAILED", payload: run.payload, events: (await run.result).getHistoryEvents() });
+    const again = await c.flow.runs.retry(run.runId);
+    expect(again.reused).toEqual(expect.arrayContaining(["stamp", "charge", "bill"]));
+    expect((await st(c.run(again.id))).v).toBe("ok");
+    expect(charges).toBe(1);
+    const bills = c.queue.filter((m) => m.body.includes("billing/charge")).map((m) => JSON.parse(m.body).event?.id);
+    expect(new Set(bills).size).toBe(1);
+  }, 30_000);
+
+  it("refuses a result that the function came to another way", async () => {
+    let speeds: any = { x: 5, y: 150 };
+    const did: string[] = [];
+    const c = new Cluster((flow) => [
+      flow.createFunction({ id: "f", triggers: { event: "go" }, retries: 0 }, async ({ step }: any) => {
+        try { await step.run("flaky", () => { if (speeds.x === 5) throw new Error("down"); }); } catch {}
+        const first = await Promise.race([step.run("x", () => settle(speeds.x).then(() => "x")), step.run("y", () => settle(speeds.y).then(() => "y"))]);
+        await step.run("ship", () => void did.push(first));
+        if (speeds.x === 5) throw new NonRetriableError("later");
+        await step.sleep("s", "1s");
+        return first;
+      }),
+    ]);
+    await c.flow.send({ name: "go" });
+    await c.drain();
+    const run = c.runOf("f");
+    await st(run);
+    c.history.set(run.runId, { status: "FAILED", payload: run.payload, events: (await run.result).getHistoryEvents() });
+    speeds = { x: 150, y: 5 };
+    const r = await st(c.run((await c.flow.runs.retry(run.runId)).id));
+    // The race isn't decided again: its results are reused, in the order they had.
+    expect(r.v ?? r.e?.errorMessage).toMatch(/^x$|another way/);
+    expect(did.every((d) => d === "x")).toBe(true);
+  }, 30_000);
+
   it("has the same order for a result that's read from the table", async () => {
     const did: string[] = [];
     const big = { x: "y".repeat(150_000) };
@@ -437,28 +489,27 @@ describe("a run that's retried", () => {
 });
 
 describe("what a step sends", () => {
-  it("has IDs by what it is, so a replay with another list sends each once", async () => {
+  it("has the same IDs in a replay, also with data made outside a step, and its own where it's given one", async () => {
     let list = ["A", "B"];
     const c = new Cluster((flow) => [
       flow.createFunction({ id: "f", triggers: { event: "go" }, retries: 0 }, async ({ step }: any) => {
         const orders = await step.run("list", () => list);
-        for (const o of orders) await step.sendEvent("charge-order", { name: "order/charge", data: { o } });
+        await step.sendEvent("stamped", { name: "order/stamped", data: { at: Date.now() } });
+        for (const o of orders) await step.sendEvent("charge-order", { name: "order/charge", id: `charge-${o}`, data: { o } });
       }),
     ]);
     await c.flow.send({ name: "go" });
     await c.drain();
     const run = c.runOf("f");
     await st(run);
-    const ids = () => c.queue.filter((m) => JSON.parse(m.body).kind === "event").flatMap((m) => [JSON.parse(m.body)].map((b) => [b.event?.id ?? b.id, b.event?.data?.o]));
-    const first = new Map(ids().map(([id, o]) => [o, id]));
+    const sent = () => c.queue.filter((m) => JSON.parse(m.body).kind === "event").map((m) => JSON.parse(m.body).event ?? JSON.parse(m.body));
+    const stamped = sent().filter((e) => e.name === "order/stamped").map((e) => e.id);
     c.history.set(run.runId, { status: "FAILED", payload: run.payload, events: (await run.result).getHistoryEvents() });
     list = ["C", "A", "B"];
-    const again = await c.flow.runs.replay(run.runId);
-    await st(c.run(again.id));
-    const all = ids();
-    expect(all.filter(([, o]) => o === "A").every(([id]) => id === first.get("A"))).toBe(true);
-    expect(all.filter(([, o]) => o === "B").every(([id]) => id === first.get("B"))).toBe(true);
-    expect(new Set(all.map(([id]) => id)).size).toBe(3);
+    await st(c.run((await c.flow.runs.replay(run.runId)).id));
+    const all = sent();
+    expect(new Set(all.filter((e) => e.name === "order/stamped").map((e) => e.id))).toEqual(new Set(stamped));
+    expect(new Set(all.filter((e) => e.name === "order/charge").map((e) => e.id))).toEqual(new Set(["charge-A", "charge-B", "charge-C"]));
   }, 30_000);
 
   it("isn't sent once the run has failed", async () => {
@@ -525,8 +576,8 @@ describe("what's saved", () => {
     const events = (await c.runOf("f").result).getHistoryEvents();
     const { memo, order } = memoFrom(events);
     expect(order).toEqual(["2", "0", "1-slow"]);
-    // What came after the step that failed runs again.
-    expect(memo).toEqual({ "2": "2", "0": "0", "1-slow": "1-slow" });
+    // What came after the step that failed is reused where its ID was used once.
+    expect(memo).toEqual({ "2": "2", "0": "0", "1-slow": "1-slow", after: "after", z: true });
     expect(toSteps(events).some((s) => s.id.includes("sst:order"))).toBe(false);
     expect(toSteps(events).find((s) => s.id === "3-fails")).toMatchObject({ status: "failed", error: { message: "no" } });
   }, 20_000);
