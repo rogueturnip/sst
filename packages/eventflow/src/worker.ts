@@ -309,8 +309,6 @@ interface Call {
   link: Link;
   name: string;
   given: boolean;
-  /** The result it was called on. */
-  led: string;
   /** The ID it was called with. */
   base: string;
 }
@@ -359,7 +357,7 @@ function claim(state: RunState, input: StepInput): Claim {
     state.refuse(error);
     throw error;
   }
-  const call = { link: at, name: occurrence(state, id), base: id, given: false, led: `${at.parent?.name ?? ""}\n${order.fresh && order.current !== undefined ? `${order.current}\n${order.given.get(order.current)}` : ""}` };
+  const call = { link: at, name: occurrence(state, id), base: id, given: false };
   at.name = call.name;
   // A step that an earlier attempt ended, on a path that the function didn't take again: its
   // result would be found by its ID, and could be another call's.
@@ -453,11 +451,6 @@ function makeStep(state: RunState) {
     const saved = memo(id);
     if (!saved.hit) return undefined;
     const { value } = saved;
-    // Its place is saved with what it was called with and on, for a retry of this one.
-    if (state.calling?.name === id) {
-      state.shared.places.leds.set(id, state.calling.led);
-      state.shared.places.bases.set(id, state.calling.base);
-    }
     return value instanceof BlobMemo ? reading("the result", () => fatValue(engine, { blob: value.blob })) : Promise.resolve(value);
   };
   // A step that an earlier attempt of the function began is the same step.
@@ -472,10 +465,6 @@ function makeStep(state: RunState) {
     }
     if (before) return before.promise;
     state.shared.places.callers.set(id, state.attempt);
-    if (state.calling?.name === id) {
-      state.shared.places.leds.set(id, state.calling.led);
-      state.shared.places.bases.set(id, state.calling.base);
-    }
     const promise = begin();
     promise.catch(() => {});
     ops.set(id, { kind, promise });
@@ -912,10 +901,24 @@ function makeStep(state: RunState) {
       data?: unknown;
       meta?: SendPayload["meta"];
       timeout?: DurationInput | Date;
+      /** What it's of, like an order's ID: the invoked run's idempotency keys come from it. */
+      idempotencyKey?: string | number;
     },
   ) => {
     if (state.fence.down) return never();
-    const { id, first } = claim(state, idInput);
+    const { id, base, first } = claim(state, idInput);
+    const of = options?.idempotencyKey;
+    if (of !== undefined && (typeof of === "number" ? !Number.isFinite(of) : typeof of !== "string" || !of))
+      throw new UsageError(`The idempotencyKey of step "${id}" is what the run it invokes is of, like an order's ID.`);
+    // Which use of an ID is which can be another in a retry or a replay, where a list changed, and
+    // then the run it invokes would have another's keys.
+    if (of === undefined && (state.uses.get(base) ?? 0) > 1) {
+      const error = new UsageError(
+        `The step ID "${base}" invokes more than once, so the run it invokes could have another's idempotency keys in a replay. Say what each is of: step.invoke(id, { ..., idempotencyKey: order.id }).`,
+      );
+      state.refuse(error);
+      throw error;
+    }
     const saved = earlier(id);
     if (saved) return saved;
     begin(first);
@@ -956,7 +959,7 @@ function makeStep(state: RunState) {
             // The child run is new for each run that invokes it, as a retry of the
             // parent needs its own. Its root, which its idempotency keys come from,
             // is the same for every retry and replay of the parent.
-            const root = hash(JSON.stringify([state.root, state.namespace, id]), 26);
+            const root = hash(JSON.stringify(of === undefined ? [state.root, state.namespace, id] : [state.root, state.namespace, base, String(of)]), 26);
             const event: WireEvent = {
               id: hash(identity),
               name: "inngest/function.invoked",
@@ -1079,7 +1082,8 @@ function makeStep(state: RunState) {
           // The wait it found first, so a try that comes after the run waits again doesn't
           // answer that too.
           const to = await engine.store.successor(
-            key("GS", state.runId, state.namespace, id),
+            // By the run's root: a retry or replay of the run doesn't tell another wait.
+            key("GS", state.root, state.namespace, id),
             wait ? JSON.stringify([wait.callbackId, wait.runId]) : "",
             86_400_000,
           );
@@ -1840,7 +1844,8 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
         OUTCOME,
         async () => {
           // First, so an event that cancels it from now on doesn't stop what's done about it.
-          if (def.cancelOn.length) await engine.store.claim(endedKey(payload.runId), "ended", ttlMs + 86_400_000);
+          // The router stops a run only if it says it does first: one or the other.
+          await engine.store.successor(endedKey(payload.runId), "ended", ttlMs + 86_400_000);
           return {
           ...(ended.ok ? { ok: true, ...(await slimValue(engine, `outcome\n${payload.runId}`, ended.value)) } : { ok: false, error: errorInfo(ended.error) }),
           defers: await Promise.all(

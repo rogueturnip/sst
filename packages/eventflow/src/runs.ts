@@ -376,6 +376,12 @@ export async function rerun(
     const taken = await takeLock(engine, lockRuns, payload.lock, id, "skip");
     if (!taken) throw new Error(`Another run has the singleton of "${runId}". Rerun it once that one has ended.`);
   }
+  // What it reuses from the table is kept as long again, for it, and a retry of it.
+  for (const blob of Object.values(memoBlobs ?? {})) {
+    const body = await engine.store.getBlob(blob);
+    if (body === undefined) throw new Error(`A saved result of "${runId}" is gone from the table. Replay it instead.`);
+    await engine.store.putBlob(blob, body, ((engine.resource.runTimeoutSeconds ?? 31_622_400) + 106 * 86_400) * 1000);
+  }
   await engine.startRun({ ...rest, runId: id, root: payload.root ?? runId, replayOf: runId, memo, memoBlobs, memoOrder, at: Date.now() });
   return { id, replayOf: runId, reused };
 }

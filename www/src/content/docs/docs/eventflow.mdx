@@ -257,7 +257,7 @@ const approval = await step.waitForSignal("approval", { signal: `approve-${id}`,
 await flow.sendSignal({ signal: `approve-${id}`, data: { by: user.id }, tenant });
 ```
 
-A signal goes to the one run of its tenant that waits for its name. A second run that waits for it throws a `SignalConflictError`, or takes its place with `onConflict: "replace"`. A signal that's sent before a run waits isn't kept. Its data is at most 200 KB. `step.sendSignal()` returns the `runId` it went to, if any.
+A signal goes to the one run of its tenant that waits for its name. A second run that waits for it throws a `SignalConflictError`, or takes its place with `onConflict: "replace"`. A signal that's sent before a run waits isn't kept. Its data is at most 200 KB. `step.sendSignal()` returns the `runId` it went to, if any. It's sent once for the run: a retry or replay of the run that sends it doesn't send it again.
 
 ### Fetch and AI
 
@@ -279,7 +279,7 @@ const order = channel({ name: (id: string) => `order:${id}`, topics: { status: {
 await step.realtime.publish("tell", order(id).status, { state: "paid" });
 ```
 
-Messages to browsers, through SST's [`Realtime`](/docs/component/aws/realtime) component, linked to the EventFlow. `step.realtime.publish()` publishes once; `flow.realtime.publish()` now. Browsers subscribe with MQTT, to `flow.realtime.topic(order(id).status)`, which the component's authorizer has to allow. Inngest's subscription tokens and `useRealtime` aren't here. A message is at most 120 KB.
+Messages to browsers, through SST's [`Realtime`](/docs/component/aws/realtime) component, linked to the EventFlow. `step.realtime.publish()` publishes at least once, again where its step runs again, as after a crash or in a retry; `flow.realtime.publish()` now. Browsers subscribe with MQTT, to `flow.realtime.topic(order(id).status)`, which the component's authorizer has to allow. Inngest's subscription tokens and `useRealtime` aren't here. A message is at most 120 KB.
 
 ### Defer
 
@@ -322,7 +322,7 @@ Every function gets `idempotencyKey()`. Call it inside a step, and pass it to th
 
 A step ID that's used more than once, as in a loop, has no key of its own: which use is which can be another in a replay, or a retry where a step before it now succeeds, and then one would be paid for with another's key. Say what it's of, like `idempotencyKey(order.id)`. Without that, `idempotencyKey()` throws in the second use, and the step fails. A key comes from the step's ID, so a step that's renamed has new keys: don't rename a step that has run, before you retry or replay its runs. In a step whose ID may be used more than once, always say what it's of: the first use can't tell that a second will come, and in a replay with another list it would have another's key.
 
-It's made from the run's **root**, which the router makes from the first run's ID with the signing key, and signs into the run. So it can't be worked out from the event. A retry or replay keeps the root, so it sends the same keys. A run that another run invokes gets a root from its parent's, so a retry of the parent sends its child's keys again too. `onFailure` has keys of its own. The IDs of events a step sends are made the same way, from the step's ID and the event's place in what it sends, so a retried step, a crash, and a retry or replay of the run don't send them twice. So is the root of a run it invokes. Where a replay, or a retry, takes another path, as from a list that changed, a step ID that's used more than once can be another use's, and an event then has another's ID: give events an `id` of your own, like the order's ID, when you send them in a loop or a list.
+It's made from the run's **root**, which the router makes from the first run's ID with the signing key, and signs into the run. So it can't be worked out from the event. A retry or replay keeps the root, so it sends the same keys. A run that another run invokes gets a root from its parent's, so a retry of the parent sends its child's keys again too. `onFailure` has keys of its own. The IDs of events a step sends are made the same way, from the step's ID and the event's place in what it sends, so a retried step, a crash, and a retry or replay of the run don't send them twice. So is the root of a run it invokes. Where a replay, or a retry, takes another path, as from a list that changed, a step ID that's used more than once can be another use's, and an event then has another's ID: give events an `id` of your own, like the order's ID, when you send them in a loop or a list. The router skips an event ID it has seen in the last 24 hours: a retry or a replay later than that sends them again.
 
 ```ts
 flow.createFunction(
@@ -351,7 +351,7 @@ await step.run({ id: "wire", atMostOnce: true }, () => bank.sendWire(details));
 
 AWS saves that the step started before its code runs. If the worker stops part way, the step isn't run again: the run fails with `StepInterrupted`, since the wire may or may not have been sent. It isn't retried when it throws, either. `sst eventflow run` says to check it.
 
-A retry or replay that would run an `atMostOnce` step again is refused until you pass `--force`, after you've reconciled with the bank. A retry runs one again unless it reuses the step's saved result, so it's refused when the step didn't finish, threw, or is in `onFailure`. A replay reuses nothing, so it's refused when one started at all. Runs the run invoked are checked too, since a rerun starts them again unless it reuses their result. It's all found in the histories, whatever the run's error says, so a run that timed out in the middle of the step is caught too.
+A retry or replay that would run an `atMostOnce` step again is refused until you pass `--force`, after you've reconciled with the bank. A retry runs one again unless it reuses the step's saved result, so it's refused when the step didn't finish, threw, comes after the first step the retry runs again, or is in `onFailure`. A replay reuses nothing, so it's refused when one started at all. Runs the run invoked are checked too, since a rerun starts them again unless it reuses their result. It's all found in the histories, whatever the run's error says, so a run that timed out in the middle of the step is caught too.
 
 ### What was tested
 
@@ -407,6 +407,8 @@ const receipt = await step.invoke("send-receipt", {
 });
 ```
 
+An invoked run's idempotency keys come from the step that invokes it. A step ID that invokes more than once, as in a loop, says what each is of, like `step.invoke("charge", { function: charge, data, idempotencyKey: order.id })`: in a replay with another list, one would have another's keys. Without it, the second use fails the run. A retry or replay of the run invokes the run again with the same keys, past its function's `idempotency`.
+
 It starts a run of another function of the same EventFlow, waits for it, and returns what it returns. If that run fails, or doesn't finish within the timeout, it throws an `InvokeError`. The invoked run keeps the tenant, and its own flow control applies. A timeout doesn't stop it.
 
 ### Send events
@@ -445,7 +447,7 @@ Flow control is set on each function. The three kinds limit different things.
 |--------|----------------|----------------|-------|
 | `concurrency` | Steps running at once | The step waits in line for a lease | The worker, at each step |
 | `throttle` | Runs started per period | The run is held, and starts later | The router |
-| `rateLimit` | Runs started per period | The run is skipped | The router |
+| `rateLimit` | Runs started per period, by GCRA: a period's worth at once, then one each period ÷ limit, so up to twice the limit less one in a period from its start | The run is skipped | The router |
 | `idempotency` | One run per key in 24 hours | The run is skipped | The router |
 | `singleton` | One run per key at a time | The run is skipped, or the other cancelled | The router |
 | `debounce` | One run once events stop | Earlier events are replaced | The router |

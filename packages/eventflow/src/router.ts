@@ -262,8 +262,8 @@ export async function stop(
   run: { arn: string; runId: string; parent?: string; message: string },
 ) {
   // One whose end is decided isn't stopped in the middle of what's done about it, like
-  // onFailure's refund.
-  if (await engine.store.owner(endedKey(run.runId))) return false;
+  // onFailure's refund. Whichever says so first, the worker or this, decides.
+  if ((await engine.store.successor(endedKey(run.runId), "stopping", ((engine.resource.runTimeoutSeconds ?? MAX_WAIT_S) + 86_400) * 1000)) === "ended") return false;
   const stopped = await engine.stopRun(run.arn);
   const { status, payload } = await runStatus(engine, run.arn);
   if (!stopped && status !== "STOPPED") return false;
@@ -582,10 +582,14 @@ async function admit(
   if (def.debounce && !opts.fired && !opts.parent && !opts.identity && !opts.runId) return { decision: "debounce" };
   const claimed = def.idempotency?.(scope);
   const idempotency = claimed === undefined ? undefined : key("I", def.id, tenant, claimed);
-  if (idempotency && !(await engine.store.claim(idempotency, id, DEDUP_MS))) return { decision: "skip", reason: "idempotency" };
+  // An invoked run's key is its root's: the same invoke, from a retry or a replay of the run
+  // that invoked it, is let through again, with the same idempotency keys.
+  const owner = opts.parent && opts.root ? `root:${opts.root}` : id;
+  if (idempotency && (owner === id ? !(await engine.store.claim(idempotency, id, DEDUP_MS)) : (await engine.store.successor(idempotency, owner, DEDUP_MS)) !== owner))
+    return { decision: "skip", reason: "idempotency" };
   // A run that's skipped after all gives back what it took.
   const skip = async (reason: string): Promise<Admission> => {
-    if (idempotency) await engine.store.unclaim(idempotency, id);
+    if (idempotency) await engine.store.unclaim(idempotency, owner);
     if (lockItem) await engine.store.lockFree(lockItem, id);
     return { decision: "skip", reason };
   };
