@@ -582,14 +582,10 @@ async function admit(
   if (def.debounce && !opts.fired && !opts.parent && !opts.identity && !opts.runId) return { decision: "debounce" };
   const claimed = def.idempotency?.(scope);
   const idempotency = claimed === undefined ? undefined : key("I", def.id, tenant, claimed);
-  // An invoked run's key is its root's: the same invoke, from a retry or a replay of the run
-  // that invoked it, is let through again, with the same idempotency keys.
-  const owner = opts.parent && opts.root ? `root:${opts.root}` : id;
-  if (idempotency && (owner === id ? !(await engine.store.claim(idempotency, id, DEDUP_MS)) : (await engine.store.successor(idempotency, owner, DEDUP_MS)) !== owner))
-    return { decision: "skip", reason: "idempotency" };
+  if (idempotency && !(await engine.store.claim(idempotency, id, DEDUP_MS))) return { decision: "skip", reason: "idempotency" };
   // A run that's skipped after all gives back what it took.
   const skip = async (reason: string): Promise<Admission> => {
-    if (idempotency) await engine.store.unclaim(idempotency, owner);
+    if (idempotency) await engine.store.unclaim(idempotency, id);
     if (lockItem) await engine.store.lockFree(lockItem, id);
     return { decision: "skip", reason };
   };

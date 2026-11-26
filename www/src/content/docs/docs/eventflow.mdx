@@ -407,7 +407,7 @@ const receipt = await step.invoke("send-receipt", {
 });
 ```
 
-An invoked run's idempotency keys come from the step that invokes it. A step ID that invokes more than once, as in a loop, says what each is of, like `step.invoke("charge", { function: charge, data, idempotencyKey: order.id })`: in a replay with another list, one would have another's keys. Without it, the second use fails the run. A retry or replay of the run invokes the run again with the same keys, past its function's `idempotency`.
+An invoked run's idempotency keys come from the step that invokes it. A step ID that invokes more than once, as in a loop, says what each is of, like `step.invoke("charge", { function: charge, data, idempotencyKey: order.id })`: in a replay with another list, one would have another's keys. Without it, the second use fails the run. A retry or replay of the run invokes the run again with the same keys. A function's own `idempotency` still applies to it: a retried invoke of a run whose key was taken in the last 24 hours is skipped, and the invoke fails. Adding `idempotencyKey` to a step that has invoked changes the keys of the run it invokes, so don't add it before you retry or replay runs that invoked without it. A function of another EventFlow gets new keys in each retry or replay of the run that calls it.
 
 It starts a run of another function of the same EventFlow, waits for it, and returns what it returns. If that run fails, or doesn't finish within the timeout, it throws an `InvokeError`. The invoked run keeps the tenant, and its own flow control applies. A timeout doesn't stop it.
 

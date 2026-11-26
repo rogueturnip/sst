@@ -1023,7 +1023,9 @@ function makeStep(state: RunState) {
     const saved = earlier(id);
     if (saved) return saved as Promise<{ ids: string[] }>;
     begin(first);
-    const list = Array.isArray(payload) ? payload : [payload];
+    // Each event's ID from the run's root, the step and its place in what's sent, before a
+    // middleware changes the list: one it adds has its ID by its own place among those added.
+    const list = (Array.isArray(payload) ? payload : [payload]).map((p, i) => ({ ...p, id: p.id ?? hash(JSON.stringify([state.root, state.namespace, id, i]), 26) }));
     const send = async (events: any[]) => {
       // IDs come from the run's root and the step, so a retried step, and a retry
       // or replay of the run, send the same events, and the router skips the ones
@@ -1034,7 +1036,7 @@ function makeStep(state: RunState) {
           // From the run's root and the step, as the step is in the run, so a retried step, a crash
           // and a retry or replay of the run send the same events, and the router skips the ones
           // it has seen.
-          id: p.id ?? hash(JSON.stringify([state.root, state.namespace, id, i]), 26),
+          id: p.id ?? hash(JSON.stringify([state.root, state.namespace, id, "added", i]), 26),
           tenant: p.tenant ?? state.event.tenant,
         }, undefined, engine.propagateSessions ? state.sessions : undefined),
       );
@@ -1083,9 +1085,9 @@ function makeStep(state: RunState) {
           // answer that too.
           const to = await engine.store.successor(
             // By the run's root: a retry or replay of the run doesn't tell another wait.
-            key("GS", state.root, state.namespace, id),
+            key("GS", state.root, state.namespace, id, item),
             wait ? JSON.stringify([wait.callbackId, wait.runId]) : "",
-            86_400_000,
+            ((engine.resource.runTimeoutSeconds ?? MAX_WAIT_S) + 106 * 86_400) * 1000,
           );
           if (!to) return { runId: undefined };
           const [callbackId, runId] = JSON.parse(to) as [string, string];
@@ -1845,7 +1847,10 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
         async () => {
           // First, so an event that cancels it from now on doesn't stop what's done about it.
           // The router stops a run only if it says it does first: one or the other.
-          await engine.store.successor(endedKey(payload.runId), "ended", ttlMs + 86_400_000);
+          const decided = await engine.store.successor(endedKey(payload.runId), "ended", ttlMs + 86_400_000);
+          // The router said first that it stops the run: it's cancelled, as it would have been a
+          // moment before, and nothing's done about how it ended.
+          if (decided === "stopping") return { ok: false, stopped: true, error: { name: CANCELLED, message: "The run was stopped." }, defers: [] };
           return {
           ...(ended.ok ? { ok: true, ...(await slimValue(engine, `outcome\n${payload.runId}`, ended.value)) } : { ok: false, error: errorInfo(ended.error) }),
           defers: await Promise.all(
@@ -1855,7 +1860,7 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
         },
         LEASING,
       )) as any;
-      if (wasSaved) {
+      if (wasSaved || saved.stopped) {
         defers.clear();
         for (const [name, d] of saved.defers)
           defers.set(name, { fn: d.fn, sessions: d.sessions, data: await read(inv, ctx.lambdaContext, "what it deferred", () => fatValue(engine, d), false) });
