@@ -233,8 +233,6 @@ interface RunState {
   runId: string;
   event: WireEvent;
   memo: Record<string, unknown>;
-  /** Of the results after the step a retry runs again, the result each was called on. */
-  memoLed?: Record<string, string>;
   counts: Map<string, number>;
   /**
    * The run this one started from: a retry or a replay of a run has the same root,
@@ -260,8 +258,6 @@ interface RunState {
   order: Order;
   /** How many times each step ID is used. */
   uses: Map<string, number>;
-  /** The IDs whose first use was given a result from after the step a retry runs again. */
-  loose: Set<string>;
   /** The last call of each step ID that's used, and whether the function has its result. */
   calls: Map<string, Call>;
   /** The step that was called last, as it's called. */
@@ -374,17 +370,6 @@ function claim(state: RunState, input: StepInput): Claim {
     state.refuse(error);
     throw error;
   }
-  // A result from after the step a retry runs again is found by its ID, which the failed run used
-  // once. If this run uses it again, the result could have been the other use's.
-  const rest = Object.prototype.hasOwnProperty.call(state.memo, call.name) && state.shared.places.at(call.name)?.attempt !== -1;
-  if (call.name !== id && state.loose.has(id)) {
-    const error = new UsageError(
-      `The step ID "${id}" is used more than once, and its first use was given a result of the run this retries, which used it once: whose result it is can't be told. Replay the run.`,
-    );
-    state.refuse(error);
-    throw error;
-  }
-  if (rest) state.loose.add(id);
   state.uses.set(id, (state.uses.get(id) ?? 0) + 1);
   state.calls.set(id, call);
   state.calling = call;
@@ -464,48 +449,10 @@ function makeStep(state: RunState) {
       throw error;
     });
   // A step of the run this one is a retry of.
-  // Whether the function came to a step as before: after the same step in its async context,
-  // which is the same whatever the timing, and once it had the result it was called on then. That
-  // one may have come in another order, as in a join, where the rest were there too, but if it
-  // isn't there yet, the function went on from another, like the other of a race.
-  // "same", "other" where it came after the same step, and on a result that's another now, or
-  // "no".
-  const sameWay = (before: string, now: string | undefined): "same" | "other" | "no" => {
-    if (now === undefined) return "no";
-    const [prev, on, what] = before.split("\n");
-    const [prevNow, onNow, whatNow] = now.split("\n");
-    if (prev !== prevNow) return "no";
-    // Called on the same result, with the same value, it's the same. On another, as the other of
-    // a race, or the last of a join that came in another order, or on another value, as in a loop
-    // over a list a step returned, or a failure that was caught and is fixed now, it may be
-    // another path, or the same: it's run again.
-    return (on ?? "") === (onNow ?? "") && what === whatNow ? "same" : "other";
-  };
-  const earlier = (id: string, again = false): Promise<any> | undefined => {
+  const earlier = (id: string, _again = false): Promise<any> | undefined => {
     const saved = memo(id);
     if (!saved.hit) return undefined;
-    // What an invocation before this one decided is what's in the history: the step was begun,
-    // or the result was given. It isn't decided again, as it could be another way.
-    if (ctx.known(id)) return undefined;
-    const decided = state.shared.places.at(id) !== undefined;
-    // One after the step a retry runs again is reused only where the function came to it from
-    // the same result: on another path it could be another call's. Where it's the same but for
-    // the value it was called on, a step that runs code is run again, with the same key.
-    const led = state.calling?.name === id ? state.calling.led : undefined;
-    const way = !decided && state.memoLed && Object.prototype.hasOwnProperty.call(state.memoLed, id) ? sameWay(state.memoLed[id], led) : "same";
-    if (way === "other" && again) return undefined;
-    if (way !== "same") {
-      // The retry was made for it to be reused, and an atMostOnce step isn't run again by surprise.
-      const error = new UsageError(
-        way === "other"
-          ? `The function came to the step "${id}" on a result that's another than in the run this retries, and it can't be run again, as it's atMostOnce or waits, so whose result it is can't be told. Replay the run.`
-          : `The function came to the step "${id}" another way than the run this retries, so whose result it is can't be told. Replay the run.`,
-      );
-      state.refuse(error);
-      throw error;
-    }
     const { value } = saved;
-    state.order.reused.add(id);
     // Its place is saved with what it was called with and on, for a retry of this one.
     if (state.calling?.name === id) {
       state.shared.places.leds.set(id, state.calling.led);
@@ -1544,16 +1491,16 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
     const given = () => {
       const memo: Record<string, unknown> = Object.assign(Object.create(null), payload.memo ?? {});
       for (const [id, blob] of Object.entries(payload.memoBlobs ?? {})) memo[id] = new BlobMemo(blob);
-      // Only those it had in order, and those after that of IDs used once: a result of another
-      // could be another call's.
+      // Only those it had in order: after the first step it runs again, the function may take
+      // another path, and a result found by its ID could be another call's.
       if (payload.memoOrder) {
-        const ordered = new Set([...payload.memoOrder, ...(payload.memoRest ?? [])]);
+        const ordered = new Set(payload.memoOrder);
         for (const id of Object.keys(memo)) if (!ordered.has(id)) delete memo[id];
       }
       return memo;
     };
     const placesIn = placesOf(ctx);
-    const sharedOf = (scope: string, earlier?: string[], rest?: string[]): Shared => ({ places: placesIn(scope, earlier, rest), ops: new Map(), code: new Map(), ended: false, running: new Set() });
+    const sharedOf = (scope: string, earlier?: string[]): Shared => ({ places: placesIn(scope, earlier), ops: new Map(), code: new Map(), ended: false, running: new Set() });
     const newState = (more: Partial<RunState> & { shared: Shared }): RunState => {
       const state: RunState = {
         ctx,
@@ -1563,7 +1510,6 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
         runId,
         event,
         memo: given(),
-        memoLed: payload.memoLed,
         // The root is signed with the payload. A payload from before roots is its own.
         root: payload.root ?? payload.runId,
         namespace: "",
@@ -1576,7 +1522,6 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
         used: new Set(),
         calls: new Map(),
         uses: new Map(),
-        loose: new Set(),
         sessions: shared,
         defers,
         deferCounts: new Map(),
@@ -1735,7 +1680,7 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
 
       return attempts(root, {
         namespace: "",
-        shared: sharedOf("", payload.memoOrder?.filter((id) => id in (payload.memo ?? {}) || id in (payload.memoBlobs ?? {})), payload.memoRest),
+        shared: sharedOf("", payload.memoOrder?.filter((id) => id in (payload.memo ?? {}) || id in (payload.memoBlobs ?? {}))),
         run: async (state, child) => {
           // What an attempt that failed deferred, the next does again, if it comes to it.
           defers.clear();
@@ -1941,7 +1886,7 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
           const done = await attempts(named(child, replay), {
             namespace: "onFailure",
             shared: sharedOf("onFailure"),
-            more: { memo: Object.create(null), memoLed: undefined, start: async () => {} },
+            more: { memo: Object.create(null), start: async () => {} },
             run: (state) => {
               const args = makeArgs(state, {
                 error,

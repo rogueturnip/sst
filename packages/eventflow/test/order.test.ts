@@ -575,8 +575,8 @@ describe("what's saved", () => {
     const events = (await c.runOf("f").result).getHistoryEvents();
     const { memo, order } = memoFrom(events);
     expect(order).toEqual(["2", "0", "1-slow"]);
-    // What came after the step that failed is reused where its ID was used once.
-    expect(memo).toEqual({ "2": "2", "0": "0", "1-slow": "1-slow", after: "after", z: true });
+    // What came after the step that failed runs again.
+    expect(memo).toEqual({ "2": "2", "0": "0", "1-slow": "1-slow" });
     expect(toSteps(events).some((s) => s.id.includes("sst:order"))).toBe(false);
     expect(toSteps(events).find((s) => s.id === "3-fails")).toMatchObject({ status: "failed", error: { message: "no" } });
   }, 20_000);

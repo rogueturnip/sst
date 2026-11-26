@@ -4,8 +4,7 @@ import { Cluster, finishRuns, sdk, settle } from "./harness.ts";
 import { currentStep } from "../src/worker.ts";
 
 // Each was a defect that the seventh review reproduced: a retry after a failure the function
-// caught, which reuses what comes after it where the function comes to it the same way, and
-// otherwise runs it again with the same keys.
+// caught runs what comes after it again, with the same keys, so it charges once.
 
 const { NonRetriableError, Middleware } = sdk as any;
 beforeAll(async () => {
@@ -47,7 +46,7 @@ async function retried(options: any, body: (step: any, first: boolean, charge: (
 }
 
 describe("a retry after a failure the function caught", () => {
-  it("reuses a step after a join, in whatever order its results come", async () => {
+  it("runs again, with its key, a step after a join, in whatever order its results come", async () => {
     const { again, result, charges } = await retried({}, async (step, first, charge) => {
       await Promise.allSettled([
         step.run("loyalty", async () => { if (first) throw new Error("down"); await settle(50); }),
@@ -55,12 +54,11 @@ describe("a retry after a failure the function caught", () => {
       ]);
       await step.run("charge", charge);
     });
-    expect(again.reused).toContain("charge");
     expect(result.v).toBe("ok");
     expect(charges()).toBe(1);
   }, 30_000);
 
-  it("reuses a step whose ID ends in a number", async () => {
+  it("runs again, with its key, a step whose ID ends in a number", async () => {
     const { again, result, charges } = await retried({}, async (step, first, charge) => {
       try { await step.run("loyalty", () => { if (first) throw new Error("down"); }); } catch {}
       await step.run("charge:42", charge);
@@ -79,7 +77,7 @@ describe("a retry after a failure the function caught", () => {
     expect(charges()).toBe(1);
   }, 30_000);
 
-  it("reuses a step after other work, however long it takes", async () => {
+  it("runs again, with its key, a step after other work, however long it takes", async () => {
     let slow = true;
     const { result, charges } = await retried({}, async (step, first, charge) => {
       try { await step.run("loyalty", () => { if (first) throw new Error("down"); }); } catch {}

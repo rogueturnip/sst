@@ -54,7 +54,7 @@ export function placeOfError(data: unknown): Place | undefined {
 export const isMarker = (name: unknown) => typeof name === "string" && name.startsWith(`${ORDER}:`);
 
 /** The places that are saved, by what they're of. */
-export function placesOf(ctx: durable.DurableContext): (scope: string, earlier?: string[], rest?: string[]) => Places {
+export function placesOf(ctx: durable.DurableContext): (scope: string, earlier?: string[]) => Places {
   const all = new Map<string, Place[]>();
   for (const op of Object.values(((ctx as any)._executionContext?._stepData ?? {}) as Record<string, any>)) {
     const text = op?.StepDetails?.Result ?? op?.ContextDetails?.Result;
@@ -63,7 +63,7 @@ export function placesOf(ctx: durable.DurableContext): (scope: string, earlier?:
     if (!place && typeof text === "string" && text.startsWith(`{"${ORDER}":[`)) place = unwrap(text).place;
     if (place) all.set(place[0], [...(all.get(place[0]) ?? []), place]);
   }
-  return (scope, earlier, rest) => new Places(scope, all.get(scope) ?? [], earlier, rest);
+  return (scope, earlier) => new Places(scope, all.get(scope) ?? [], earlier);
 }
 
 /**
@@ -87,17 +87,12 @@ export class Places {
   /** The ID each was called with, of which it's a use. */
   readonly bases = new Map<string, string>();
 
-  /** The order of the results of a retry's run that have no place: they're given in it. */
-  readonly rank: Map<string, number>;
-
-  /** `earlier` are the results of the run it's a retry of, in their order, and `rest` those after the first step it runs again. */
+  /** `earlier` are the results of the run it's a retry of, in their order. */
   constructor(
     readonly scope: string,
     saved: Place[],
     earlier: string[] = [],
-    rest: string[] = [],
   ) {
-    this.rank = new Map(rest.map((id, i) => [id, i]));
     earlier.forEach((id, i) => this.own.set(id, { seq: i + 1, attempt: -1 }));
     this.last = earlier.length;
     for (const place of saved) this.add(place);
@@ -207,8 +202,6 @@ export class Order {
   fresh = false;
   /** The step whose result it's going on from. */
   current?: string;
-  /** The steps whose results are reused, of the run a retry is of. */
-  readonly reused = new Set<string>();
   /** The steps whose results it has had, with what each was. */
   readonly given = new Map<string, string>();
   /** The time it has for that, in this invocation. */
@@ -277,15 +270,6 @@ export class Order {
     const { places } = this;
     const work = async () => {
       for (let given = false; !given && !this.closed; ) {
-        // Of those that are there at once, the first in the order they had.
-        const rank = places.rank.get(id);
-        if (!places.at(id) && rank !== undefined)
-          while (!this.closed) {
-            // Only of those that are reused: one that runs again comes when it ends.
-            const before = [...this.reused].find((o) => o !== id && this.called.has(o) && (places.rank.get(o) ?? Infinity) < rank && !places.at(o));
-            if (!before) break;
-            await new Promise<void>((resolve) => immediate(() => resolve()));
-          }
         if (!places.at(id)) await this.save(this.name(id), () => places.mark(id, this.attempt));
         const entity = places.entity(id);
         if (entity !== undefined) await this.inv.written(entity);

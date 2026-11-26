@@ -334,7 +334,7 @@ export async function rerun(
   // it was atMostOnce: running it again is done on purpose only.
   const dropped: string[] = [];
   if (found_ && memo && memoBlobs) {
-    const keep = new Set([...found_.order, ...found_.rest]);
+    const keep = new Set(found_.order);
     for (const m of [memo, memoBlobs])
       for (const id of Object.keys(m))
         if (!keep.has(id)) {
@@ -344,8 +344,6 @@ export async function rerun(
   }
   const reused = [...Object.keys(memo ?? {}), ...Object.keys(memoBlobs ?? {})];
   const memoOrder = found_?.order;
-  const memoRest = found_?.rest;
-  const memoLed = found_?.led;
   if (memo && Buffer.byteLength(JSON.stringify(memo)) > MAX_MEMO_BYTES)
     throw new Error(`The saved results of "${runId}" are over ${MAX_MEMO_BYTES} bytes. Replay it instead, to run every step again.`);
 
@@ -378,7 +376,7 @@ export async function rerun(
     const taken = await takeLock(engine, lockRuns, payload.lock, id, "skip");
     if (!taken) throw new Error(`Another run has the singleton of "${runId}". Rerun it once that one has ended.`);
   }
-  await engine.startRun({ ...rest, runId: id, root: payload.root ?? runId, replayOf: runId, memo, memoBlobs, memoOrder, memoRest, memoLed, at: Date.now() });
+  await engine.startRun({ ...rest, runId: id, root: payload.root ?? runId, replayOf: runId, memo, memoBlobs, memoOrder, at: Date.now() });
   return { id, replayOf: runId, reused };
 }
 
@@ -442,17 +440,13 @@ function isWhole(text: string | undefined) {
  * The results of a run's top-level steps that succeeded, by step ID, from its
  * history. A retry passes them to its run, so those steps aren't run again.
  */
-export function memoFrom(events: any[], earlier: Pick<RunPayload, "memo" | "memoBlobs" | "memoOrder" | "memoRest" | "memoLed"> = {}): { memo: Record<string, unknown>; blobs: Record<string, string>; order: string[]; rest: string[]; led: Record<string, string> } {
+export function memoFrom(events: any[], earlier: Pick<RunPayload, "memo" | "memoBlobs" | "memoOrder"> = {}): { memo: Record<string, unknown>; blobs: Record<string, string>; order: string[] } {
   const memo: Record<string, unknown> = Object.create(null);
   const blobs: Record<string, string> = Object.create(null);
   const saved: Place[] = [];
-  const led: Record<string, string> = Object.create(null);
-  const bases: Record<string, string> = Object.create(null);
   const place = (p: Place | undefined) => {
     if (p?.[0] !== "") return;
     saved.push(p);
-    if (typeof p[5] === "string") led[p[1]] = p[5];
-    if (typeof p[6] === "string") bases[p[1]] = p[6];
   };
   for (const e of events) {
     if (e.ParentId) continue;
@@ -507,23 +501,12 @@ export function memoFrom(events: any[], earlier: Pick<RunPayload, "memo" | "memo
   const ids = places.map(([id]) => id);
   const first = ids.findIndex((id) => !kept(id));
   const order = first < 0 ? ids : ids.slice(0, first);
-  // After it the function may take another path. A result found by an ID that was used more
-  // than once could be another call's: those steps run again. The others are reused, in the
-  // order they had.
-  const names = new Set([...ids, ...Object.keys(memo), ...Object.keys(blobs), ...Object.keys(earlier.memo ?? {})]);
-  // By the ID each was called with, as the worker saved it: an ID of the user's like "page:3"
-  // isn't a use of "page".
-  const uses = new Map<string, number>();
-  for (const b of Object.values(bases)) uses.set(b, (uses.get(b) ?? 0) + 1);
-  const once = (id: string) => (bases[id] !== undefined ? uses.get(bases[id]) === 1 : !/:\d+$/.test(id) && !names.has(`${id}:1`));
-  // With the result each was called on: one that's reused is where the function came to it the
-  // same way. One that was reused already keeps what it had.
-  const ledOf = (id: string) => earlier.memoLed?.[id] ?? (earlier.memo && id in earlier.memo && !earlier.memoRest?.includes(id) ? undefined : led[id]);
-  const rest = [...new Set([...(earlier.memoRest ?? []), ...ids.slice(order.length)])].filter((id) => kept(id) && once(id) && !order.includes(id) && typeof ledOf(id) === "string");
-  const keep = new Set([...order, ...rest]);
+  // After it the function may take another path, and a result found by its ID could be another
+  // call's: the steps after it run again, with the same idempotency keys.
+  const keep = new Set(order);
   for (const id of Object.keys(memo)) if (!keep.has(id)) delete memo[id];
   for (const id of Object.keys(blobs)) if (!keep.has(id)) delete blobs[id];
-  return { memo, blobs, order, rest, led: Object.fromEntries(rest.map((id) => [id, ledOf(id)!])) };
+  return { memo, blobs, order };
 }
 
 // The child contexts EventFlow makes, by their subtype.
