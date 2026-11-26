@@ -405,14 +405,15 @@ describe("a run that's retried", () => {
     expect([...charged.values()].sort()).toEqual(["alice", "bob", "carol"]);
   }, 30_000);
 
-  it("reuses what came after a step that failed and was caught, so it charges and sends once", async () => {
-    let charges = 0;
+  it("runs again what came after a step that failed and was caught, with the same keys, so it charges and sends once", async () => {
+    const keys = new Set<string>();
     let first = true;
     const c = new Cluster((flow) => [
       flow.createFunction({ id: "f", triggers: { event: "go" }, retries: 0 }, async ({ step }: any) => {
         try { await step.run("loyalty", () => { if (first) throw new Error("down"); }); } catch {}
         const at = await step.run("stamp", () => new Date().toISOString());
-        await step.run("charge", () => ++charges);
+        // A provider that charges once for each key.
+        await step.run("charge", () => void keys.add(currentStep()!.key));
         await step.sendEvent("bill", { name: "billing/charge", data: { at } });
         await step.run("ship", () => { if (first) throw new NonRetriableError("carrier down"); return "shipped"; });
         return "ok";
@@ -425,14 +426,13 @@ describe("a run that's retried", () => {
     first = false;
     c.history.set(run.runId, { status: "FAILED", payload: run.payload, events: (await run.result).getHistoryEvents() });
     const again = await c.flow.runs.retry(run.runId);
-    expect(again.reused).toEqual(expect.arrayContaining(["stamp", "charge", "bill"]));
     expect((await st(c.run(again.id))).v).toBe("ok");
-    expect(charges).toBe(1);
+    expect(keys.size).toBe(1);
     const bills = c.queue.filter((m) => m.body.includes("billing/charge")).map((m) => JSON.parse(m.body).event?.id);
     expect(new Set(bills).size).toBe(1);
   }, 30_000);
 
-  it("refuses a result that the function came to another way", async () => {
+  it("doesn't give a step after a race the other's result", async () => {
     let speeds: any = { x: 5, y: 150 };
     const did: string[] = [];
     const c = new Cluster((flow) => [
@@ -452,9 +452,8 @@ describe("a run that's retried", () => {
     c.history.set(run.runId, { status: "FAILED", payload: run.payload, events: (await run.result).getHistoryEvents() });
     speeds = { x: 150, y: 5 };
     const r = await st(c.run((await c.flow.runs.retry(run.runId)).id));
-    // The race isn't decided again: its results are reused, in the order they had.
-    expect(r.v ?? r.e?.errorMessage).toMatch(/^x$|another way/);
-    expect(did.every((d) => d === "x")).toBe(true);
+    // It's decided again, or as it was, and what comes after it is of the one that won.
+    expect(r.v).toBe(did.at(-1));
   }, 30_000);
 
   it("has the same order for a result that's read from the table", async () => {

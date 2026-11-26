@@ -12,7 +12,7 @@ import { LOCK_GRACE_MS, lockTtl, settleLock, singletonKey, takeLock, type LockRu
 import type { Admission, Pending } from "./store.js";
 import { sendSystemEvents } from "./system.js";
 import { SYSTEM_EVENTS, type Message, type RunPayload, type Timer, type WireEvent } from "./types.js";
-import { eventMatches, MAX_WAIT_S, RECENT_MS, recentKey, signalKey, startKey, STOP, waitKey, type InvokeOutcome, type Registered } from "./worker.js";
+import { endedKey, eventMatches, MAX_WAIT_S, RECENT_MS, recentKey, signalKey, startKey, STOP, waitKey, type InvokeOutcome, type Registered } from "./worker.js";
 
 // The router reads the engine's queue. For each event it resolves the waits that
 // match it, and starts a run of each function it triggers. It also gets the tick of
@@ -232,8 +232,7 @@ async function resolveWaits(event: WireEvent, receivedAt: number, engine: Engine
     const k = waitKey(event.name, event.tenant, field, value);
     const waiters = (await engine.store.waiters(k, now))
       // A wait that started after the event came finds it itself.
-      // With a second's margin for the clocks of SQS and of the worker: one told twice is the same.
-      .filter((w) => w.createdAt <= receivedAt + 1000)
+      .filter((w) => w.createdAt <= receivedAt)
       .filter((w) => eventMatches(event, field, value, w.condition));
     // Many runs can wait for one event: some at a time, so none is throttled out.
     for (let i = 0; i < waiters.length; i += 25)
@@ -262,6 +261,9 @@ export async function stop(
   registry: Map<string, Registered>,
   run: { arn: string; runId: string; parent?: string; message: string },
 ) {
+  // One whose end is decided isn't stopped in the middle of what's done about it, like
+  // onFailure's refund.
+  if (await engine.store.owner(endedKey(run.runId))) return false;
   const stopped = await engine.stopRun(run.arn);
   const { status, payload } = await runStatus(engine, run.arn);
   if (!stopped && status !== "STOPPED") return false;

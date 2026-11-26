@@ -220,6 +220,20 @@ for (const [name, make] of stores) {
       expect(await store.getBlob(`${key}-none`)).toBeUndefined();
     });
 
+    it("never keeps a blob for less time than it was kept, when it's written again", async () => {
+      const store = make();
+      if (!(store instanceof DynamoStore)) return;
+      const key = `X#ttl-${run}-${n++}`;
+      const body = "x".repeat(600_000);
+      await store.putBlob(key, body, 40 * 86_400_000);
+      await store.putBlob(key, body, 86_400_000);
+      const items = await (store as any).db("Query", { KeyConditionExpression: "pk = :pk", ExpressionAttributeValues: { ":pk": { S: key } } });
+      const days = items.Items.map((i: any) => Math.round((Number(i.expires.N) * 1000 - Date.now()) / 86_400_000));
+      expect(days.length).toBeGreaterThan(1);
+      expect(Math.min(...days)).toBe(40);
+      expect(await store.getBlob(key)).toBe(body);
+    });
+
     it("has one run wait for a signal, unless it's replaced or over", async () => {
       const store = make();
       const item = `G#contract-${run}-${n++}`;

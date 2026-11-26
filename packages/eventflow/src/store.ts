@@ -1950,11 +1950,18 @@ export class DynamoStore implements Store {
   async putBlob(key: string, body: string, ttlMs: number) {
     const expires = { N: seconds(Date.now() + ttlMs) };
     const parts = split(body);
+    // A blob is named by what's in it: written again, it's kept at least as long as it was.
+    const put = (Item: Record<string, any>) =>
+      this.db("PutItem", {
+        Item,
+        ConditionExpression: "attribute_not_exists(pk) OR expires < :e",
+        ExpressionAttributeValues: { ":e": expires },
+      }).catch((error) => {
+        if (!isConditionFailure(error)) throw error;
+      });
     for (let i = 0; i < parts.length; i += 8)
-      await Promise.all(
-        parts.slice(i, i + 8).map((part, j) => this.db("PutItem", { Item: { pk: S(key), sk: S(`p#${pad(i + j)}`), part: S(part), expires } })),
-      );
-    await this.db("PutItem", { Item: { pk: S(key), sk: S("-"), count: N(parts.length), expires } });
+      await Promise.all(parts.slice(i, i + 8).map((part, j) => put({ pk: S(key), sk: S(`p#${pad(i + j)}`), part: S(part), expires })));
+    await put({ pk: S(key), sk: S("-"), count: N(parts.length), expires });
   }
 
   async getBlob(key: string) {

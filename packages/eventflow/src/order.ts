@@ -27,6 +27,15 @@ const OWN = 0, MARK = 1, CUT = 2;
 /** The attempt of the function it's of, by which one that ended before can be told. */
 export type Place = [scope: string, id: string, seq: number, attempt: number, kind: number, led?: string, base?: string];
 
+/** What a result was, in short: a step called on it is called the same way where it's the same. */
+function digestOf(value: unknown) {
+  let text: string | undefined;
+  try {
+    text = JSON.stringify(value);
+  } catch {}
+  return hash(text ?? "undefined", 16);
+}
+
 /** A result with its place, as it's saved. */
 export function unwrap(text: string | undefined | null): { value: any; place?: Place } {
   if (text === undefined || text === null || text === "") return { value: undefined };
@@ -198,13 +207,15 @@ export class Order {
   fresh = false;
   /** The step whose result it's going on from. */
   current?: string;
-  /** The steps whose results it has had. */
-  readonly given = new Set<string>();
+  /** The steps whose results are reused, of the run a retry is of. */
+  readonly reused = new Set<string>();
+  /** The steps whose results it has had, with what each was. */
+  readonly given = new Map<string, string>();
   /** The time it has for that, in this invocation. */
   grace?: Grace;
   /** The places of which the results aren't given yet. */
   private readonly expected = new Map<number, { id: string; attempt: number }>();
-  private readonly ready = new Map<number, { give: (grace: Grace) => void; moved: () => void }>();
+  private readonly ready = new Map<number, { give: (grace: Grace) => void; moved: () => void; digest: string }>();
   private readonly called = new Set<string>();
   private pumping = false;
   private stalled?: { seq: number; timer: any };
@@ -246,14 +257,14 @@ export class Order {
     this.called.add(id);
     if (this.stalled && this.expected.get(this.stalled.seq)?.id === id) this.unstall();
     const given = new Promise<T>((resolve, reject) => {
-      const settled = (give: () => void) =>
-        void this.settle(id, (grace) => {
+      const settled = (give: () => void, digest: string) =>
+        void this.settle(id, digest, (grace) => {
           onGiven(grace);
           give();
         });
       promise.then(
-        (v) => settled(() => resolve(v)),
-        (e) => settled(() => reject(e)),
+        (v) => settled(() => resolve(v), digestOf(v)),
+        (e) => settled(() => reject(e), `!${digestOf((e as any)?.message ?? String(e))}`),
       );
     });
     // One that fails before the function awaits it isn't an error of the process.
@@ -261,7 +272,7 @@ export class Order {
     return given;
   }
 
-  private async settle(id: string, give: (grace: Grace) => void) {
+  private async settle(id: string, digest: string, give: (grace: Grace) => void) {
     if (this.closed) return;
     const { places } = this;
     const work = async () => {
@@ -270,7 +281,8 @@ export class Order {
         const rank = places.rank.get(id);
         if (!places.at(id) && rank !== undefined)
           while (!this.closed) {
-            const before = [...this.called].find((o) => o !== id && (places.rank.get(o) ?? Infinity) < rank && !places.at(o));
+            // Only of those that are reused: one that runs again comes when it ends.
+            const before = [...this.reused].find((o) => o !== id && this.called.has(o) && (places.rank.get(o) ?? Infinity) < rank && !places.at(o));
             if (!before) break;
             await new Promise<void>((resolve) => immediate(() => resolve()));
           }
@@ -287,6 +299,7 @@ export class Order {
               resolve(true);
             },
             moved: () => resolve(false),
+            digest,
           });
           void this.pump();
         });
@@ -325,7 +338,7 @@ export class Order {
       this.ready.delete(seq);
       this.fresh = true;
       this.current = giving;
-      if (giving !== undefined) this.given.add(giving);
+      if (giving !== undefined) this.given.set(giving, next.digest);
       this.grace = this.inv.given();
       next.give(this.grace);
       // All that comes of it at once, before the next.

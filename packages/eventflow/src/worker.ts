@@ -363,7 +363,7 @@ function claim(state: RunState, input: StepInput): Claim {
     state.refuse(error);
     throw error;
   }
-  const call = { link: at, name: occurrence(state, id), base: id, given: false, led: `${at.parent?.name ?? ""}\n${order.fresh ? (order.current ?? "") : ""}` };
+  const call = { link: at, name: occurrence(state, id), base: id, given: false, led: `${at.parent?.name ?? ""}\n${order.fresh && order.current !== undefined ? `${order.current}\n${order.given.get(order.current)}` : ""}` };
   at.name = call.name;
   // A step that an earlier attempt ended, on a path that the function didn't take again: its
   // result would be found by its ID, and could be another call's.
@@ -468,26 +468,49 @@ function makeStep(state: RunState) {
   // which is the same whatever the timing, and once it had the result it was called on then. That
   // one may have come in another order, as in a join, where the rest were there too, but if it
   // isn't there yet, the function went on from another, like the other of a race.
-  const sameWay = (before: string, now: string | undefined) => {
-    if (now === undefined) return false;
-    const [prev, on] = before.split("\n");
-    return prev === now.split("\n")[0] && (!on || state.order.given.has(on));
+  // "same", "other" where it came after the same step, and on a result that's another now, or
+  // "no".
+  const sameWay = (before: string, now: string | undefined): "same" | "other" | "no" => {
+    if (now === undefined) return "no";
+    const [prev, on, what] = before.split("\n");
+    const [prevNow, onNow, whatNow] = now.split("\n");
+    if (prev !== prevNow) return "no";
+    // Called on the same result, with the same value, it's the same. On another, as the other of
+    // a race, or the last of a join that came in another order, or on another value, as in a loop
+    // over a list a step returned, or a failure that was caught and is fixed now, it may be
+    // another path, or the same: it's run again.
+    return (on ?? "") === (onNow ?? "") && what === whatNow ? "same" : "other";
   };
-  const earlier = (id: string): Promise<any> | undefined => {
+  const earlier = (id: string, again = false): Promise<any> | undefined => {
     const saved = memo(id);
     if (!saved.hit) return undefined;
+    // What an invocation before this one decided is what's in the history: the step was begun,
+    // or the result was given. It isn't decided again, as it could be another way.
+    if (ctx.known(id)) return undefined;
+    const decided = state.shared.places.at(id) !== undefined;
     // One after the step a retry runs again is reused only where the function came to it from
-    // the same result: on another path it could be another call's.
+    // the same result: on another path it could be another call's. Where it's the same but for
+    // the value it was called on, a step that runs code is run again, with the same key.
     const led = state.calling?.name === id ? state.calling.led : undefined;
-    if (state.memoLed && Object.prototype.hasOwnProperty.call(state.memoLed, id) && !sameWay(state.memoLed[id], led)) {
+    const way = !decided && state.memoLed && Object.prototype.hasOwnProperty.call(state.memoLed, id) ? sameWay(state.memoLed[id], led) : "same";
+    if (way === "other" && again) return undefined;
+    if (way !== "same") {
       // The retry was made for it to be reused, and an atMostOnce step isn't run again by surprise.
       const error = new UsageError(
-        `The function came to the step "${id}" another way than the run this retries, so whose result it is can't be told. Replay the run.`,
+        way === "other"
+          ? `The function came to the step "${id}" on a result that's another than in the run this retries, and it can't be run again, as it's atMostOnce or waits, so whose result it is can't be told. Replay the run.`
+          : `The function came to the step "${id}" another way than the run this retries, so whose result it is can't be told. Replay the run.`,
       );
       state.refuse(error);
       throw error;
     }
     const { value } = saved;
+    state.order.reused.add(id);
+    // Its place is saved with what it was called with and on, for a retry of this one.
+    if (state.calling?.name === id) {
+      state.shared.places.leds.set(id, state.calling.led);
+      state.shared.places.bases.set(id, state.calling.base);
+    }
     return value instanceof BlobMemo ? reading("the result", () => fatValue(engine, { blob: value.blob })) : Promise.resolve(value);
   };
   // A step that an earlier attempt of the function began is the same step.
@@ -674,7 +697,7 @@ function makeStep(state: RunState) {
   const run = <T>(idInput: StepInput, fn: (...args: any[]) => T | Promise<T>, ...args: any[]): Promise<T> => {
     if (state.fence.down) return never();
     const { id, base } = claim(state, idInput);
-    const saved = earlier(id);
+    const saved = earlier(id, !atMostOnce(idInput));
     if (saved) return saved as Promise<T>;
     state.shared.code.set(id, { fn, args, base, counts: state.uses });
     return stepOp(id, limits.length ? "EventFlowStep" : atMostOnce(idInput) ? ONCE : "STEP", () => runStep<T>(id, idInput));
@@ -799,7 +822,8 @@ function makeStep(state: RunState) {
   const sleep = (idInput: string | { id: string }, duration: DurationInput) => {
     if (state.fence.down) return never();
     const { id, first } = claim(state, idInput);
-    if (earlier(id)) return Promise.resolve();
+    // A sleep called on another result than before is slept again.
+    if (earlier(id, true)) return Promise.resolve();
     begin(first);
     const seconds = bounded(parseDuration(duration, `duration of step "${id}"`), `sleep of step "${id}"`);
     return op(id, "WAIT", () => eager(ctx.wait(id, seconds)));
@@ -808,7 +832,8 @@ function makeStep(state: RunState) {
   const sleepUntil = (idInput: string | { id: string }, time: Date | string) => {
     if (state.fence.down) return never();
     const { id, first } = claim(state, idInput);
-    if (earlier(id)) return Promise.resolve();
+    // A sleep called on another result than before is slept again.
+    if (earlier(id, true)) return Promise.resolve();
     begin(first);
     const at = time instanceof Date ? time.getTime() : Date.parse(time);
     if (!Number.isFinite(at)) throw new UsageError(`The time of step "${id}" isn't a date.`);
@@ -1328,6 +1353,11 @@ export function matcher(
 
 export function waitKey(name: string, tenant: string | undefined, field: string, value?: string) {
   return key("W", name, tenant ?? null, field, value ?? null);
+}
+
+/** That how a run ended is decided: an event that cancels it doesn't stop it any more. */
+export function endedKey(runId: string) {
+  return key("D", runId);
 }
 
 /** Whether a run with a start timeout started, or was cancelled first. */
@@ -1863,12 +1893,16 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
       const ended = outcome;
       const saved = (await root.step(
         OUTCOME,
-        async () => ({
+        async () => {
+          // First, so an event that cancels it from now on doesn't stop what's done about it.
+          if (def.cancelOn.length) await engine.store.claim(endedKey(payload.runId), "ended", ttlMs + 86_400_000);
+          return {
           ...(ended.ok ? { ok: true, ...(await slimValue(engine, `outcome\n${payload.runId}`, ended.value)) } : { ok: false, error: errorInfo(ended.error) }),
           defers: await Promise.all(
             [...defers].map(async ([name, d]) => [name, { ...d, data: undefined, ...(await slimValue(engine, `defer\n${payload.runId}\n${name}`, d.data)) }] as const),
           ),
-        }),
+        };
+        },
         LEASING,
       )) as any;
       if (wasSaved) {
