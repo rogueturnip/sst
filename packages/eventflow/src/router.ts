@@ -622,6 +622,10 @@ export function lockRuns(engine: Engine, registry: Map<string, Registered>): Loc
     find: (run) => findRun(engine, run),
     running: async (arn) => (await runStatus(engine, arn)).running,
     stop: async (runId, arn) => {
+      // One whose end is decided runs what's done about it, like onFailure: the next isn't
+      // started beside it. The message comes again, and finds it ended.
+      if ((await engine.store.owner(endedKey(runId))) === "ended" && (await runStatus(engine, arn)).running)
+        throw new Error("The singleton's run is ending. The next is started once it has.");
       if (await stop(engine, registry, { arn, runId, message: "The run was cancelled by a later one, as it's a singleton." }))
         log("Cancelled a run that a later one replaced", { run: runId });
     },

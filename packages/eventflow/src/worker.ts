@@ -258,6 +258,8 @@ interface RunState {
   order: Order;
   /** How many times each step ID is used. */
   uses: Map<string, number>;
+  /** How many of each signal each step ID has sent. */
+  sent: Map<string, number>;
   /** The last call of each step ID that's used, and whether the function has its result. */
   calls: Map<string, Call>;
   /** The step that was called last, as it's called. */
@@ -914,7 +916,7 @@ function makeStep(state: RunState) {
     // then the run it invokes would have another's keys.
     if (of === undefined && (state.uses.get(base) ?? 0) > 1) {
       const error = new UsageError(
-        `The step ID "${base}" invokes more than once, so the run it invokes could have another's idempotency keys in a replay. Say what each is of: step.invoke(id, { ..., idempotencyKey: order.id }).`,
+        `The step ID "${base}" invokes more than once, so the run it invokes could have another's idempotency keys in a replay. Say what each is of: step.invoke(id, { ..., idempotencyKey: order.id }). The run it invoked first has its keys from the step's ID, and a retry or replay after the change gives it others: check it first.`,
       );
       state.refuse(error);
       throw error;
@@ -1027,6 +1029,7 @@ function makeStep(state: RunState) {
     // middleware changes the list: one it adds has its ID by its own place among those added.
     const list = (Array.isArray(payload) ? payload : [payload]).map((p, i) => ({ ...p, id: p.id ?? hash(JSON.stringify([state.root, state.namespace, id, i]), 26) }));
     const send = async (events: any[]) => {
+      let added = 0;
       // IDs come from the run's root and the step, so a retried step, and a retry
       // or replay of the run, send the same events, and the router skips the ones
       // it has seen.
@@ -1036,7 +1039,7 @@ function makeStep(state: RunState) {
           // From the run's root and the step, as the step is in the run, so a retried step, a crash
           // and a retry or replay of the run send the same events, and the router skips the ones
           // it has seen.
-          id: p.id ?? hash(JSON.stringify([state.root, state.namespace, id, "added", i]), 26),
+          id: p.id ?? hash(JSON.stringify([state.root, state.namespace, id, "added", added++]), 26),
           tenant: p.tenant ?? state.event.tenant,
         }, undefined, engine.propagateSessions ? state.sessions : undefined),
       );
@@ -1065,9 +1068,14 @@ function makeStep(state: RunState) {
 
   const sendSignal = (idInput: string | { id: string }, options: { signal: string; data?: unknown }) => {
     if (state.fence.down) return never();
-    const { id, first } = claim(state, idInput);
+    const { id, base, first } = claim(state, idInput);
     const saved = earlier(id);
     if (saved) return saved as Promise<{ runId: string | undefined }>;
+    // Which signal of the ID this is, by the signal, so a retry where a list changed finds each
+    // one's own record.
+    const sk = `${base}\n${options?.signal}`;
+    const nth = state.sent.get(sk) ?? 0;
+    state.sent.set(sk, nth + 1);
     begin(first);
     try {
       checkSignal(options);
@@ -1083,14 +1091,16 @@ function makeStep(state: RunState) {
           const wait = await engine.store.signalRead(item);
           // The wait it found first, so a try that comes after the run waits again doesn't
           // answer that too.
+          // By the run's root: a retry or replay of the run doesn't tell another wait, nor one that
+          // began after it was first sent.
           const to = await engine.store.successor(
-            // By the run's root: a retry or replay of the run doesn't tell another wait.
-            key("GS", state.root, state.namespace, id, item),
+            key("GS", state.root, state.namespace, base, item, nth),
             wait ? JSON.stringify([wait.callbackId, wait.runId]) : "",
             ((engine.resource.runTimeoutSeconds ?? MAX_WAIT_S) + 106 * 86_400) * 1000,
           );
           if (!to) return { runId: undefined };
           const [callbackId, runId] = JSON.parse(to) as [string, string];
+          if (wait && wait.callbackId !== callbackId) return { runId: undefined };
           const told = await engine.callback(callbackId, { signal: options.signal, data: options.data ?? null });
           await engine.store.signalFree(item, callbackId);
           return { runId: told || wait?.callbackId !== callbackId ? runId : undefined };
@@ -1528,6 +1538,7 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
         used: new Set(),
         calls: new Map(),
         uses: new Map(),
+        sent: new Map(),
         sessions: shared,
         defers,
         deferCounts: new Map(),
@@ -1702,6 +1713,9 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
           if (hooks.any) await state.settled();
           return value;
         },
+        // At once, in a step: an event that cancels it from here on doesn't stop what's done about
+        // how it ended, like onFailure's refund, as the code of its last steps ends.
+        decide: () => root.step("sst:decided", async () => engine.store.successor(endedKey(payload.runId), "ended", ttlMs + 86_400_000), LEASING),
         failed: async (n, error, last, state) => {
           if (hooks.has("onRunError"))
             await root.step(`sst:onRunError:${n}`, async () => hooks.tell("onRunError", { ctx: state?.args, error, isFinalAttempt: last }));
@@ -1739,6 +1753,8 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
         more?: Partial<RunState>;
         run: (state: RunState, child: durable.DurableContext) => Promise<unknown>;
         failed?: (n: number, error: unknown, last: boolean, state: RunState | undefined) => Promise<void>;
+        /** How it ended is decided: "stopping" if the router said first that it stops the run. */
+        decide?: () => Promise<string>;
       },
     ): Promise<Outcome> => {
       const { shared, namespace } = options;
@@ -1776,6 +1792,7 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
           state.order.close();
           if (outcome!.ok) {
             shared.ended = true;
+            if (options.decide && (await options.decide()) === "stopping") return { ok: false, error: new CancelledError("The run was stopped.") };
             // The worker stops as the run ends: code that runs would be cut off.
             const left = (ctx.lambdaContext?.getRemainingTimeInMillis?.() ?? 900_000) - 15_000;
             if (!(await quiet(shared, Math.min(600_000, Math.max(0, left)))))
@@ -1794,11 +1811,15 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
         if (!failure) {
           // Nothing of the function starts any more if it isn't tried again, and what runs ends,
           // before what's done about its failure.
-          if (delayMs === undefined) shared.ended = true;
+          const decide = async () => {
+            shared.ended = true;
+            if (options.decide && (await options.decide()) === "stopping") error = new CancelledError("The run was stopped.");
+          };
+          if (delayMs === undefined) await decide();
           if (!(await quiet(shared, 60_000)) && delayMs !== undefined) {
             log("warn", "A step of the function didn't end after the function failed, so it isn't tried again.", { run: runId });
-            shared.ended = true;
             delayMs = undefined;
+            await decide();
           }
         }
         if (!failure && delayMs !== undefined) {

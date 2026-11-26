@@ -439,7 +439,10 @@ describe("timeouts", () => {
     await settle(100);
     await cluster.fire("start");
     const second = [...cluster.runs.values()].find((r) => r.payload.event.data.n === 2)!;
-    expect(cluster.stopped).toEqual([`arn/${second.runId}`]);
+    // Of this test's runs: one of an earlier test, which the local runner couldn't stop, may stop
+    // itself now.
+    const mine = new Set([...cluster.runs.keys()].map((id) => `arn/${id}`));
+    expect(cluster.stopped.filter((a) => mine.has(a))).toEqual([`arn/${second.runId}`]);
     // The local runner can't stop it: given its lease after all, it doesn't run.
     gates[0]();
     await second.result;

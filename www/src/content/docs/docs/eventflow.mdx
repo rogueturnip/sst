@@ -372,7 +372,7 @@ On AWS, with a step that charges and then crashes the Lambda before its result i
 - Every side effect goes in a step, with `idempotencyKey`, or `atMostOnce`. Never outside a step: that code runs again on every replay of the run.
 - Give events from your system an `id`, like the order's ID, so sending one twice starts one run.
 - Use `idempotency: "event.data.orderId"` on the function as well, to start one run per order in 24 hours, whatever the event IDs.
-- `cancelOn` and `flow.runs.cancel()` stop a run where it is. The steps that ran aren't undone. Refund in `onFailure`, or in a step after a `waitForEvent`, not by cancelling. Once the function has returned or failed, an event no longer cancels the run: its `onFailure` and the run that invoked it aren't cut off.
+- `cancelOn` and `flow.runs.cancel()` stop a run where it is. The steps that ran aren't undone. Refund in `onFailure`, or in a step after a `waitForEvent`, not by cancelling. Once the function has returned or failed, an event no longer cancels the run: its `onFailure` and the run that invoked it aren't cut off. A singleton's later run waits, with `"cancel"`, until the one that's ending has ended.
 - A replay runs every step again, with the same idempotency keys. A provider that keeps keys for a limited time, like 24 hours, may charge again after that: retry, which reuses the saved results, rather than replay. A retry runs again what comes after the first step it runs again, so give money steps keys that say what they're of, and retry within the provider's window.
 
 ---
@@ -487,7 +487,7 @@ Up to `burst + 1` runs start at once, then one each `period / limit`, so at most
 rateLimit: { limit: 1, period: "1h", key: "event.data.userId" },
 ```
 
-Up to `limit` runs start in each `period`. Runs over it are skipped, and logged. Without a `key`, it's per tenant. What was decided for an event is saved, so an event that's delivered again, after a start failed, isn't counted twice.
+Up to `limit` runs start at once, then one each `period` ÷ `limit`, as with Inngest's GCRA: so in a `period` from its start, up to twice the limit less one. Runs over it are skipped, and logged. Without a `key`, it's per tenant. What was decided for an event is saved, so an event that's delivered again, after a start failed, isn't counted twice.
 
 ### Idempotency
 
