@@ -61,7 +61,9 @@ describe('sigdup', () => {
 
 describe('singleton', () => {
 
-  it("a later run of a cancel singleton runs while the earlier one's onFailure does", async () => {
+  // As in Inngest, where onFailure is a function of its own, a later run may start beside it; it
+  // never cuts it off.
+  it("a later run of a cancel singleton doesn't cut off the earlier one's onFailure", async () => {
     const log: string[] = [];
     let busy = 0, most = 0;
     const enter = (s: string) => { busy++; most = Math.max(most, busy); log.push(`+${s}`); };
@@ -83,8 +85,10 @@ describe('singleton', () => {
     await waitFor(() => (log.includes("+undo-1") ? true : undefined), 600);
     await c.flow.send({ name: "go", data: { acct: "x", n: 2 } });
     await c.pump(4000);
-    void (log, "most at once", most, "stopped", c.stopped);
-    expect(most).toBe(1);
+    await waitFor(() => (log.includes("-undo-1") ? true : undefined), 600);
+    expect(c.stopped).toEqual([]);
+    expect(log.filter((l) => l.startsWith("-"))).toEqual(expect.arrayContaining(["-undo-1", "-write-2"]));
+    void most;
   }, 40_000);
 
 });

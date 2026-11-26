@@ -1098,13 +1098,15 @@ function makeStep(state: RunState) {
           const to = await engine.store.successor(record, wait ? JSON.stringify([wait.callbackId, wait.runId]) : "", ttl);
           if (!to) return { runId: undefined };
           const [callbackId, runId] = JSON.parse(to) as [string, string];
+          // A try after one that told it, and stopped before it saved, as the run waits again.
+          if (await engine.store.owner(`${record}\ntold`)) return { runId };
           if (wait && wait.callbackId !== callbackId) return { runId: undefined };
           const told = await engine.callback(callbackId, { signal: options.signal, data: options.data ?? null });
           // Kept, so a try after one that told it, and stopped, says it was told too, and not a
           // send to a wait that was gone.
           if (told) await engine.store.claim(`${record}\ntold`, "told", ttl);
           await engine.store.signalFree(item, callbackId);
-          return { runId: told || (await engine.store.owner(`${record}\ntold`)) ? runId : undefined };
+          return { runId: told ? runId : undefined };
         }), { serdes: state.shared.places.serdes(id), subType: "EventFlowSignalSend" }),
       ),
     ).then((r: any) => ({ runId: r?.runId ?? undefined }));

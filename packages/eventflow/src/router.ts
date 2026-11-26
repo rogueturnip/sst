@@ -524,17 +524,8 @@ export async function startRun(
 
   // A run that had the singleton, and lost it to a later one while it was held. The runs it
   // took it from are stopped first.
-  if (lockItem) {
-    const lock = await settleLock(engine, lockRuns(engine, registry), lockItem, id);
-    if (lock?.run !== id) return skip("singleton", "Skipped a run that a later one replaced");
-    // The run it replaces is ending, and runs what's done about how it ended, like onFailure:
-    // this one starts once it has, and is held till then without using the message's tries.
-    if (lock.ending) {
-      const { ending: _, ...mine } = lock;
-      await engine.store.lockMove(lockItem, id, { ...mine, until: Date.now() + SINGLETON_WAIT_MS + LOCK_GRACE_MS }, lockTtl(engine));
-      return hold({ at: Date.now() + SINGLETON_WAIT_MS });
-    }
-  }
+  if (lockItem && (await settleLock(engine, lockRuns(engine, registry), lockItem, id))?.run !== id)
+    return skip("singleton", "Skipped a run that a later one replaced");
 
   const payload: RunPayload = {
     "sst:eventflow": 1,
@@ -551,9 +542,6 @@ export async function startRun(
   const started = await engine.startRun(payload);
   if (lockItem && started?.arn) await engine.store.lockStarted(lockItem, id, started.arn);
 }
-
-/** How often a singleton's run that waits for the one it replaces to end looks again. */
-const SINGLETON_WAIT_MS = 60_000;
 
 /** Where an event comes among a singleton's: by when it was received, then its ID. */
 function lockOrder(event: WireEvent, received: number) {
@@ -640,14 +628,15 @@ async function admit(
 export function lockRuns(engine: Engine, registry: Map<string, Registered>): LockRuns {
   return {
     find: (run) => findRun(engine, run),
-    running: async (arn) => (await runStatus(engine, arn)).running,
+    // One whose end is decided has done with its singleton, as Inngest's onFailure is a function
+    // of its own: the next starts beside what's done about how it ended, and doesn't stop it.
+    running: async (arn) => {
+      const { running, payload } = await runStatus(engine, arn);
+      return running && !(payload && (await engine.store.owner(endedKey(payload.runId))) === "ended");
+    },
     stop: async (runId, arn) => {
-      // One whose end is decided runs what's done about it, like onFailure: the next isn't
-      // started beside it, and waits.
-      if ((await engine.store.owner(endedKey(runId))) === "ended" && (await runStatus(engine, arn)).running) return "ending";
       if (await stop(engine, registry, { arn, runId, message: "The run was cancelled by a later one, as it's a singleton." }))
         log("Cancelled a run that a later one replaced", { run: runId });
-      return "stopped";
     },
   };
 }

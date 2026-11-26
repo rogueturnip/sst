@@ -759,7 +759,9 @@ describe("system events", () => {
     cluster.queue.length = 0;
     cluster.history.set(run.runId, { status: "RUNNING", payload: run.payload, events: [] });
     cluster.ended.delete(run.runId);
-    await cluster.flow.runs.cancel(run.runId);
+    // Its end was decided, so only a forced cancel stops it.
+    await expect(cluster.flow.runs.cancel(run.runId)).rejects.toThrow(/force/);
+    await cluster.flow.runs.cancel(run.runId, { force: true });
     expect(cluster.queue.map((m) => JSON.parse(m.body).event.name).sort()).toEqual(["inngest/function.cancelled", "inngest/function.finished"]);
   });
 });

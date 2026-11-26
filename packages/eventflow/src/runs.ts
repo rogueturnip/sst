@@ -219,7 +219,14 @@ export async function cancelRun(engine: Engine, runId: string, registry: Map<str
       throw new Error(`The run "${runId}" has returned or failed, and runs what's done about it, like its onFailure. Cancel it with force to cut that off.`);
     return { id: runId, stopped: false };
   }
-  const stopped = await engine.stopRun(found.arn);
+  let stopped: boolean;
+  try {
+    stopped = await engine.stopRun(found.arn);
+  } catch (error) {
+    // It isn't cancelled, so it doesn't end as cancelled when it decides how it ended.
+    if (!ended) await engine.store.unclaim(endedKey(runId), "stopping").catch(() => {});
+    throw error;
+  }
   const { status, payload } = await runStatus(engine, found.arn);
   // One that was stopped already is told again: what stopped it may have stopped first.
   const told = keyOf("ST", payload?.runId ?? runId);

@@ -73,7 +73,7 @@ describe("singleton ending", () => {
       }),
     ]);
 
-  it("a later run waits for the old one's onFailure without using its message's tries, then starts", async () => {
+  it("a later run starts beside the old one's onFailure, as in Inngest, and doesn't cut it off", async () => {
     const log: string[] = [];
     const c = make(log);
     await c.flow.send({ name: "go", data: { acct: "x", n: 1 } });
@@ -81,16 +81,39 @@ describe("singleton ending", () => {
     await waitFor(() => (log.includes("undo-1") ? true : undefined), 600);
     await settle(500);
     await c.flow.send({ name: "go", data: { acct: "x", n: 2 } });
-    // As SQS would deliver it, many times over, while the old onFailure waits.
-    for (let i = 0; i < 8; i++) await c.drain({ maxRounds: 1 });
-    expect(c.queue.every((m) => m.receiveCount <= 1)).toBe(true);
-    expect(log).toEqual(["work-1", "undo-1"]);
-    await c.flow.send({ name: "approve" });
-    await c.pump(6000);
+    await c.pump(4000);
     await waitFor(() => (log.includes("write-2") ? true : undefined), 600);
-    expect(log).toEqual(["work-1", "undo-1", "undone-1", "work-2", "write-2"]);
+    expect(c.stopped).toEqual([]);
+    await c.flow.send({ name: "approve" });
+    await c.pump(3000);
+    await waitFor(() => (log.includes("undone-1") ? true : undefined), 600);
+    expect(log).toEqual(["work-1", "undo-1", "work-2", "write-2", "undone-1"]);
     expect(c.stopped).toEqual([]);
   }, 90_000);
+
+  for (const mode of ["cancel", "skip"] as const)
+    it(`onFailure invokes its own function with the same key, with "${mode}"`, async () => {
+      const log: string[] = [];
+      let sync: any;
+      const c = new Cluster((flow: any) => {
+        sync = flow.createFunction({
+          id: "sync", triggers: { event: "go" }, retries: 0, singleton: { key: "event.data.acct", mode },
+          onFailure: async ({ step, event }: any) => {
+            const r = await step.invoke("again", { function: sync, data: { acct: event.data.event.data.acct, n: 2 }, timeout: "20s" }).then((v: any) => `ok:${v}`, (e: any) => `err:${e?.message}`);
+            await step.run("told", () => { log.push(`invoke ${r}`); });
+          },
+        }, async ({ step, event }: any) => {
+          await step.run("work", async () => { log.push(`work-${event.data.n}`); });
+          if (event.data.n === 1) throw new NonRetriableError("declined");
+          return "done";
+        });
+        return [sync];
+      });
+      await c.flow.send({ name: "go", data: { acct: "x", n: 1 } });
+      await c.pump(8000);
+      await waitFor(() => (log.some((l) => l.startsWith("invoke")) ? true : undefined), 600);
+      expect(log).toEqual(["work-1", "work-2", "invoke ok:done"]);
+    }, 90_000);
 
   it("an earlier event that comes late doesn't take the singleton from a later one's run", async () => {
     const log: string[] = [];

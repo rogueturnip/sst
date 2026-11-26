@@ -24,7 +24,6 @@ export function singletonKey(def: Definition, event: WireEvent) {
 export interface LockRuns {
   find(run: string): Promise<{ arn: string } | undefined>;
   running(arn: string): Promise<boolean>;
-  /** "ending" when its end is decided and what's done about it still runs, like onFailure. */
   stop(run: string, arn: string): Promise<unknown>;
 }
 
@@ -61,20 +60,14 @@ export async function takeLock(engine: Engine, runs: LockRuns, item: string, id:
   throw new Error("A singleton is busy.");
 }
 
-/**
- * Stop the runs a singleton was taken from. One that hasn't started finds that it lost it.
- * `ending` when one of them is ending, and runs what's done about how it ended: the run
- * that took it waits for that.
- */
-export async function settleLock(engine: Engine, runs: LockRuns, item: string, id: string): Promise<(Lock & { ending?: boolean }) | undefined> {
+/** Stop the runs a singleton was taken from. One that hasn't started finds that it lost it. */
+export async function settleLock(engine: Engine, runs: LockRuns, item: string, id: string) {
   const lock = await engine.store.lockRead(item);
   if (lock?.run !== id || !lock.replaces?.length) return lock;
-  let ending = false;
   for (const r of lock.replaces) {
     const arn = r.arn ?? (await runs.find(r.run))?.arn;
-    if (arn && (await runs.stop(r.run, arn)) === "ending") ending = true;
+    if (arn) await runs.stop(r.run, arn);
   }
-  if (ending) return { ...lock, ending };
   await engine.store.lockSettled(item, id);
   return lock;
 }
