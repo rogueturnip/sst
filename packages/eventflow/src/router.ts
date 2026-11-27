@@ -145,6 +145,22 @@ async function routeRecord(record: SQSRecord, registry: Map<string, Registered>,
     });
   }
   if (message.kind === "signal") return void (await deliverSignal(engine, message.tenant, message.signal, message.data, receivedAt));
+  // A held run that isn't due goes back to the queue, each time once, as an event of a time to
+  // come does: a copy SQS delivers twice doesn't go on as two.
+  if (message.kind === "start" && message.held && message.at > Date.now() + 1000 && message.exp >= Date.now()) {
+    const hop = message.hop ?? 0;
+    const taken = key("SH", message.fn, message.runId, message.at, hop);
+    if ((await engine.store.owner(`${taken}\nsent`)) || !(await engine.store.claim(taken, record.messageId, HOP_TAKE_MS))) return;
+    const { sig: _sig, ...rest } = message;
+    await engine.sendMessages([
+      {
+        message: sign({ ...rest, hop: hop + 1 }),
+        group: message.event.tenant ?? `t-${hash(message.fn, 10)}`,
+        delaySeconds: Math.min(900, Math.ceil((message.at - Date.now()) / 1000)),
+      },
+    ]);
+    return void (await engine.store.claim(`${taken}\nsent`, "sent", DEDUP_MS));
+  }
   if (message.kind === "start" || message.kind === "invoke") {
     // A signed message is good for longer than the dead-letter queue keeps it, so
     // one that's copied can't be sent again much later. The run that invoked it is
@@ -185,8 +201,10 @@ async function routeRecord(record: SQSRecord, registry: Map<string, Registered>,
     if (message.at > Date.now() + 1000) {
       const hop = message.hop ?? 0;
       const taken = key("EH", message.event.tenant ?? null, message.event.id, message.at, hop);
-      // Another copy of this time took it, or this one sent the next already.
-      if ((await engine.store.owner(`${taken}\nsent`)) || !(await engine.store.claim(taken, record.messageId, DEDUP_MS))) return;
+      // Another copy of this time took it, or this one sent the next already. The take is for a
+      // few minutes: a copy SQS delivers twice comes at once, and one moved back from the
+      // dead-letter queue, with a new ID, comes later, and goes on if the next wasn't sent.
+      if ((await engine.store.owner(`${taken}\nsent`)) || !(await engine.store.claim(taken, record.messageId, HOP_TAKE_MS))) return;
       await engine.sendMessages([due(message.event, message.at, hop + 1)]);
       return void (await engine.store.claim(`${taken}\nsent`, "sent", DEDUP_MS));
     }
@@ -250,6 +268,8 @@ async function routeRecord(record: SQSRecord, registry: Map<string, Registered>,
 
 /** How far ahead of SQS a sender's clock may be, before its event is one of a time to come. */
 const AHEAD_MS = 5000;
+// How long a hop of a message that's held is taken by the copy that came first.
+const HOP_TAKE_MS = 10 * 60_000;
 const DUE_CANCEL_MS = 367 * 86_400_000;
 
 

@@ -357,6 +357,7 @@ export function cleanEvent(event: WireEvent): WireEvent {
     ...(typeof event.v === "string" ? { v: event.v } : {}),
     ...(event.tenant ? { tenant: event.tenant } : {}),
     ...(event.sessions ? { sessions: event.sessions } : {}),
+    ...(event.about === true ? { about: true as const } : {}),
   };
 }
 

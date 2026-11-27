@@ -551,7 +551,7 @@ On the EventFlow, or on a function. It has the hooks of Inngest's: `transformFun
 
 ## Events about runs
 
-`inngest/function.finished` is sent for each run that ends, and `inngest/function.failed` or `inngest/function.cancelled`, where a function has a trigger for one. To wait for one in a step, send them for every run with `new EventFlow({ id, systemEvents: true })`. Runs they start send none, so they don't go on forever. A run that AWS ends, as one over its execution timeout, sends none. A sender can't send events whose names start with `inngest/`. Their `data.function_id` is the EventFlow's ID, then the function's, like `shop-charge`, as with Inngest.
+`inngest/function.finished` is sent for each run that ends, and `inngest/function.failed` or `inngest/function.cancelled`, where a function has a trigger for one. To wait for one in a step, send them for every run with `new EventFlow({ id, systemEvents: true })`. Runs they start send none, and nor do the runs those invoke, defer or start with `step.sendEvent()`, so they don't go on forever. A run that AWS ends, as one over its execution timeout, sends none. A sender can't send events whose names start with `inngest/`. Their `data.function_id` is the EventFlow's ID, then the function's, like `shop-charge`, as with Inngest.
 
 ---
 

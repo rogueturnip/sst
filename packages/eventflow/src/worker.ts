@@ -18,7 +18,7 @@ import { keyed, sign, verify } from "./sign.js";
 import type { LeaseWaiter, Limit } from "./store.js";
 import { sendSystemEvents, wantedSystemEvents } from "./system.js";
 import { infer, saveResponse, toResponse, type AiModel, type SavedResponse } from "./tools.js";
-import type { RunPayload, WireEvent } from "./types.js";
+import { SYSTEM_EVENTS, type RunPayload, type WireEvent } from "./types.js";
 
 // The worker runs every function of the engine, in one durable Lambda function.
 // A run is one durable execution. Its name is the run ID.
@@ -76,6 +76,11 @@ export function leaseWaitSeconds(round: number) {
 }
 /** A waiter whose callback is this, followed by a run's ARN, stops the run. */
 export const STOP = "stop:";
+/** Whether a run is about runs, or was started by one: what it starts sends no events about runs. */
+function aboutRuns(event: { name: string; about?: true }) {
+  return event.about === true || (SYSTEM_EVENTS as readonly string[]).includes(event.name);
+}
+
 /** A cancelOn heard for an event of a time to come, before its run starts. */
 export const DUE = "due:";
 
@@ -1013,6 +1018,7 @@ function makeStep(state: RunState) {
               ts: Date.now(),
               ...(state.event.tenant ? { tenant: state.event.tenant } : {}),
               ...(sessions ? { sessions } : {}),
+              ...(aboutRuns(state.event) ? { about: true as const } : {}),
             };
             if (app !== undefined) {
               await engine.sendMessages([{ message: { kind: "call", fn: target, event, parent: callbackId }, group: event.tenant }], engine.apps[app].queueUrl);
@@ -1097,7 +1103,7 @@ function makeStep(state: RunState) {
           id: p.id ?? hash(JSON.stringify([state.root, state.namespace, id, "added", added++]), 26),
           tenant: p.tenant ?? state.event.tenant,
         }, undefined, engine.propagateSessions ? state.sessions : undefined),
-      );
+      ).map((e) => (aboutRuns(state.event) ? { ...e, about: true as const } : e));
       await engine.sendEvents(wire);
       return { ids: wire.map((e) => e.id) };
     };
@@ -2115,6 +2121,7 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
                     from: { fn: def.id, runId: payload.runId },
                     ...(payload.event.tenant ? { tenant: payload.event.tenant } : {}),
                     ...(d.sessions ? { sessions: d.sessions } : {}),
+                    ...(aboutRuns(payload.event) ? { about: true as const } : {}),
                   }),
                   at: Date.now(),
                   runId: childId,

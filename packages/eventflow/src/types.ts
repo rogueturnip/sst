@@ -18,6 +18,8 @@ export interface WireEvent {
   tenant?: string;
   /** The sessions it's in, by name, as Inngest's. */
   sessions?: Record<string, string>;
+  /** It comes from a run about runs, or what one started: its runs send no events about runs. */
+  about?: true;
   /** For a deferred function's event, the run that deferred it. */
   from?: { fn: string; runId: string };
   /** Its data, when that's large, is in the table. */
@@ -51,6 +53,8 @@ export type Message =
       external?: boolean;
       /** It was held, and its timers were sent. */
       held?: boolean;
+      /** How many times it's gone back to the queue, while it's held. */
+      hop?: number;
       exp: number;
       sig: string;
     }
