@@ -52,3 +52,17 @@ describe("a cron's run name", () => {
     expect(localMinute(parseCron("TZ=America/New_York 0 1 * * *"), new Date("2026-11-01T06:00:00Z"))).toBe("2026-11-01T01:00");
   });
 });
+
+describe("finding a run", () => {
+  it("is by the ARN kept when it started, not by listing runs", async () => {
+    const c = new Cluster((flow: any) => [flow.createFunction({ id: "f", triggers: { event: "go" } }, async ({ step }: any) => step.sleep("s", "5s"))]);
+    await c.flow.send({ name: "go" });
+    await c.drain();
+    const id = c.runOf("f").runId;
+    c.listings = 0;
+    expect((await c.flow.runs.get(id))?.id).toBe(id);
+    expect(c.listings).toBe(0);
+    expect((await c.flow.runs.cancel(id)).stopped).toBe(true);
+    expect(c.listings).toBe(0);
+  }, 30_000);
+});

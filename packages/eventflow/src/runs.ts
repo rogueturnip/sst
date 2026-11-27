@@ -1,7 +1,7 @@
 import { isMarker, placeOfError, Places, unwrap, type Place } from "./order.js";
 import { awsFetch } from "./client.js";
 import { fat } from "./blobs.js";
-import type { Engine } from "./engine.js";
+import { arnKey, type Engine } from "./engine.js";
 import { replayId } from "./ids.js";
 import type { RunPayload, WireEvent } from "./types.js";
 import { key as keyOf } from "./ids.js";
@@ -165,6 +165,13 @@ export async function listRuns(engine: Engine, input: ListInput = {}, functions:
 }
 
 export async function findRun(engine: Engine, runId: string): Promise<RunSummary | undefined> {
+  // By its ARN, which the router kept when it started it.
+  const arn = await engine.store.owner(arnKey(runId)).catch(() => undefined);
+  if (arn) {
+    const found = await lambda<any>(engine, `/durable-executions/${encodeURIComponent(arn)}?IncludeExecutionData=false`).catch(() => undefined);
+    if (found?.DurableExecutionName === runId) return summary(found);
+  }
+  // One started before it was kept, or one the table doesn't have.
   const params = new URLSearchParams({ DurableExecutionName: runId, MaxItems: "10" });
   const page = await lambda<any>(engine, `/functions/${encodeURIComponent(engine.worker.name)}/durable-executions?${params}`);
   const match = (page.DurableExecutions ?? []).find((e: any) => e.DurableExecutionName === runId);

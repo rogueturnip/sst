@@ -52,6 +52,8 @@ export class Cluster {
   deadLetters: QueuedMessage[] = [];
   /** The ARNs of the runs that were stopped. The local runner can't stop them. */
   stopped: string[] = [];
+  /** How many times runs were listed: that is in the account's 15 a second. */
+  listings = 0;
   /** Finished runs that the run APIs list, with their history, for retry tests. */
   history = new Map<string, { status: string; payload: any; events: any[]; error?: any; startedAt?: number }>();
   /** The status to answer a callback's nth try with, like 429, to test throttles. */
@@ -147,6 +149,7 @@ export class Cluster {
     }
     const listed = path.match(/^\/2025-12-01\/functions\/[^/]+\/durable-executions\?(.*)$/);
     if (service === "lambda" && listed) {
+      this.listings++;
       const params = new URLSearchParams(listed[1]);
       const name = params.get("DurableExecutionName");
       // As AWS lists them: the latest first, or the oldest first with ReverseOrder.
@@ -168,7 +171,8 @@ export class Cluster {
       const h = this.history.get(id) ?? (run && { status: this.statusOf(id), payload: run.payload, events: [], error: undefined });
       if (!h) return new Response("ResourceNotFoundException", { status: 404 });
       if (executions[2]) return Response.json({ Events: h.events });
-      return Response.json({ Status: h.status, InputPayload: JSON.stringify(h.payload), Error: h.error });
+      // As AWS answers: with its name, ARN and times.
+      return Response.json({ DurableExecutionName: id, DurableExecutionArn: `arn/${id}`, StartTimestamp: (h as any).startedAt ?? 1, Status: h.status, InputPayload: JSON.stringify(h.payload), Error: h.error });
     }
     const stop = path.match(/^\/2025-12-01\/durable-executions\/(.+)\/stop$/);
     if (service === "lambda" && stop) {

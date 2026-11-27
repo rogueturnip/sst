@@ -147,7 +147,14 @@ export class Engine {
   async startRun(payload: RunPayload, worker = this.worker) {
     const signed = sign(payload);
     try {
-      return await startExecution(worker, { name: payload.runId, payload: signed }, this.aws);
+      const started = await startExecution(worker, { name: payload.runId, payload: signed }, this.aws);
+      // Kept, so a run is found by its ID in the table, and not by listing them: that's in
+      // the account's 15 a second of Lambda's control plane, for every function.
+      if (started.arn)
+        await this.store
+          .claim(arnKey(payload.runId), started.arn, ((this.resource.runTimeoutSeconds ?? 31_622_400) + 90 * 86_400) * 1000)
+          .catch(() => {});
+      return started;
     } catch (error) {
       if (error instanceof LambdaError) {
         const body = await error.response.text().catch(() => "");
@@ -409,4 +416,9 @@ export async function checkedData(payload: SendPayload) {
         .join("; ")}`,
     );
   return result.value;
+}
+
+/** Where a run's ARN is kept, by its ID. */
+export function arnKey(runId: string) {
+  return hash(`run-arn\n${runId}`);
 }

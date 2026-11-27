@@ -576,6 +576,8 @@ await flow.runs.list({ function: processOrder, status: "FAILED" });
 await flow.runs.cancel(runId);
 ```
 
+A run is found by its ID in the table, with Lambda's `GetDurableExecution`, which takes 300 requests a second. Listing runs, as `flow.runs.list` and `--all` do, takes Lambda's control plane, which has 15 requests a second for the whole account and region, as the router's own lookups and deploys do. So don't poll a list: poll `flow.runs.get`, or wait in a step.
+
 ### Retry after a fix
 
 A run that failed stays failed: AWS has no way to resume a failed durable execution. After you deploy a fix, **retry** it.
