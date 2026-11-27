@@ -1985,7 +1985,9 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
     if (!outcome.ok && def.onFailure && !isCancelled) {
       const { error } = outcome;
       try {
-        await root.runInChildContext("onFailure", async (child) => {
+        // What onFailure defers is saved with it, so a replay that doesn't run it again still has them.
+        const before = new Set(defers.keys());
+        const failed = await root.runInChildContext("onFailure", async (child) => {
           const ts = await child.step("sst:failed-at", async () => Date.now());
           const done = await attempts(named(child, replay), {
             namespace: "onFailure",
@@ -2005,8 +2007,15 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
               return guarded(state, () => def.onFailure!(args));
             },
           });
-          if (!done.ok) throw done.error;
+          const deferred = await Promise.all(
+            [...defers].filter(([name]) => !before.has(name)).map(async ([name, d]) => [name, { ...d, data: undefined, ...(await slimValue(engine, `defer\n${payload.runId}\n${name}`, d.data)) }] as const),
+          );
+          return { deferred, ...(done.ok ? {} : { error: errorInfo(done.error) }) };
         });
+        for (const [name, d] of (failed as any)?.deferred ?? [])
+          if (!defers.has(name))
+            defers.set(name, { fn: d.fn, sessions: d.sessions, data: await read(inv, ctx.lambdaContext, "what onFailure deferred", () => fatValue(engine, d), false) });
+        if ((failed as any)?.error) log("error", "onFailure failed", { run: runId, error: (failed as any).error.message });
       } catch (failure) {
         if (isDurableInternal(failure)) throw failure;
         log("error", "onFailure failed", { run: runId, error: errorInfo(failure).message });
