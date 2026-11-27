@@ -8,7 +8,7 @@ import { evaluate, getPath } from "./expression.js";
 import { callRunId, hash, key, runId as makeRunId, ulid } from "./ids.js";
 import { findRun, runStatus } from "./runs.js";
 import { deriveRoot, sign, verify } from "./sign.js";
-import { LOCK_GRACE_MS, lockTtl, settleLock, singletonKey, takeLock, type LockRuns } from "./singleton.js";
+import { LOCK_GRACE_MS, lockOrder, lockTtl, settleLock, singletonKey, takeLock, type LockRuns } from "./singleton.js";
 import type { Admission, Pending } from "./store.js";
 import { sendSystemEvents } from "./system.js";
 import { SYSTEM_EVENTS, type Message, type RunPayload, type Timer, type WireEvent } from "./types.js";
@@ -264,6 +264,8 @@ export async function stop(
   // One whose end is decided isn't stopped in the middle of what's done about it, like
   // onFailure's refund. Whichever says so first, the worker or this, decides.
   if ((await engine.store.successor(endedKey(run.runId), "stopping", ((engine.resource.runTimeoutSeconds ?? MAX_WAIT_S) + 86_400) * 1000)) === "ended") return false;
+  // It stays "stopping" if this fails: what stops it, as a timeout, is sent again, and it's
+  // cancelled as it ends, as it was meant to be.
   const stopped = await engine.stopRun(run.arn);
   const { status, payload } = await runStatus(engine, run.arn);
   if (!stopped && status !== "STOPPED") return false;
@@ -524,8 +526,12 @@ export async function startRun(
 
   // A run that had the singleton, and lost it to a later one while it was held. The runs it
   // took it from are stopped first.
-  if (lockItem && (await settleLock(engine, lockRuns(engine, registry), lockItem, id))?.run !== id)
+  if (lockItem && (await settleLock(engine, lockRuns(engine, registry), lockItem, id))?.run !== id) {
+    // A message that comes again for a run that started, and then lost the singleton as it
+    // ended: that run tells the run that invoked it how it ends, not this.
+    if (admission.decision === "start" && (await findRun(engine, id))) return;
     return skip("singleton", "Skipped a run that a later one replaced");
+  }
 
   const payload: RunPayload = {
     "sst:eventflow": 1,
@@ -541,11 +547,6 @@ export async function startRun(
   };
   const started = await engine.startRun(payload);
   if (lockItem && started?.arn) await engine.store.lockStarted(lockItem, id, started.arn);
-}
-
-/** Where an event comes among a singleton's: by when it was received, then its ID. */
-function lockOrder(event: WireEvent, received: number) {
-  return `${String(received).padStart(15, "0")}:${event.id}`;
 }
 
 const SKIPPED: Record<string, string> = {

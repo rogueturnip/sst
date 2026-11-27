@@ -1101,7 +1101,10 @@ function makeStep(state: RunState) {
           // A try after one that told it, and stopped before it saved, as the run waits again.
           if (await engine.store.owner(`${record}\ntold`)) return { runId };
           if (wait && wait.callbackId !== callbackId) return { runId: undefined };
-          const told = await engine.callback(callbackId, { signal: options.signal, data: options.data ?? null });
+          // A try after one that may have told it, and stopped before it said so, finds the wait
+          // gone: it was told, by that one.
+          const first = await engine.store.claim(`${record}\ntrying`, crypto.randomUUID(), ttl);
+          const told = (await engine.callback(callbackId, { signal: options.signal, data: options.data ?? null })) || !first;
           // Kept, so a try after one that told it, and stopped, says it was told too, and not a
           // send to a wait that was gone.
           if (told) await engine.store.claim(`${record}\ntold`, "told", ttl);

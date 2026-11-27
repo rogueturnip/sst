@@ -5,7 +5,7 @@ import type { Engine } from "./engine.js";
 import { replayId } from "./ids.js";
 import type { RunPayload, WireEvent } from "./types.js";
 import { key as keyOf } from "./ids.js";
-import { takeLock, type LockRuns } from "./singleton.js";
+import { lockOrder, takeLock, type LockRuns } from "./singleton.js";
 import { sendSystemEvents } from "./system.js";
 import { endedKey, ONCE, type InvokeOutcome, type Registered } from "./worker.js";
 
@@ -395,7 +395,8 @@ export async function rerun(
   }
   // A singleton's rerun needs the singleton, like its run did.
   if (payload.lock) {
-    const taken = await takeLock(engine, lockRuns, payload.lock, id, "skip");
+    // It comes after the singleton's runs so far, so an earlier event that comes late doesn't take it.
+    const taken = await takeLock(engine, lockRuns, payload.lock, id, "skip", lockOrder({ id }, Date.now()));
     if (!taken) throw new Error(`Another run has the singleton of "${runId}". Rerun it once that one has ended.`);
   }
   await engine.startRun({ ...rest, runId: id, root: payload.root ?? runId, replayOf: runId, memo, memoBlobs, memoOrder, at: Date.now() });

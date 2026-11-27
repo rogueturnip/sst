@@ -71,3 +71,8 @@ export async function settleLock(engine: Engine, runs: LockRuns, item: string, i
   await engine.store.lockSettled(item, id);
   return lock;
 }
+
+/** Where an event comes among a singleton's: by when it was received, then its ID. */
+export function lockOrder(event: { id: string }, received: number) {
+  return `${String(received).padStart(15, "0")}:${event.id}`;
+}
