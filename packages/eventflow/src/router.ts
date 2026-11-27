@@ -290,6 +290,11 @@ async function startMatched(event: WireEvent, receivedAt: number, engine: Engine
   const failed: string[] = [];
   for (const { def } of matched) {
     try {
+      // An event about runs doesn't start a function that one started on the way to it.
+      if (event.about?.includes(def.id) && (SYSTEM_EVENTS as readonly string[]).includes(event.name)) {
+        log("Skipped a run that an event about runs would start again", { fn: def.id, event: hash(event.id, 10) });
+        continue;
+      }
       if (cancelled && def.cancelOn.length && (await cancelled(def.id))) {
         log("Skipped a run that was cancelled before it was due", { fn: def.id, event: hash(event.id, 10) });
         continue;

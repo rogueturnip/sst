@@ -76,9 +76,13 @@ export function leaseWaitSeconds(round: number) {
 }
 /** A waiter whose callback is this, followed by a run's ARN, stops the run. */
 export const STOP = "stop:";
-/** Whether a run is about runs, or was started by one: what it starts sends no events about runs. */
-function aboutRuns(event: { name: string; about?: true }) {
-  return event.about === true || (SYSTEM_EVENTS as readonly string[]).includes(event.name);
+/**
+ * What an event from this run carries of the functions that events about runs started on the way
+ * to it: this one too, if an event about runs started it.
+ */
+function aboutOf(event: { name: string; about?: string[] }, fn: string): { about?: string[] } {
+  const about = (SYSTEM_EVENTS as readonly string[]).includes(event.name) ? [...new Set([...(event.about ?? []), fn])] : event.about;
+  return about?.length ? { about } : {};
 }
 
 /** A cancelOn heard for an event of a time to come, before its run starts. */
@@ -1018,7 +1022,7 @@ function makeStep(state: RunState) {
               ts: Date.now(),
               ...(state.event.tenant ? { tenant: state.event.tenant } : {}),
               ...(sessions ? { sessions } : {}),
-              ...(aboutRuns(state.event) ? { about: true as const } : {}),
+              ...aboutOf(state.event, def.id),
             };
             if (app !== undefined) {
               await engine.sendMessages([{ message: { kind: "call", fn: target, event, parent: callbackId }, group: event.tenant }], engine.apps[app].queueUrl);
@@ -1103,7 +1107,7 @@ function makeStep(state: RunState) {
           id: p.id ?? hash(JSON.stringify([state.root, state.namespace, id, "added", added++]), 26),
           tenant: p.tenant ?? state.event.tenant,
         }, undefined, engine.propagateSessions ? state.sessions : undefined),
-      ).map((e) => (aboutRuns(state.event) ? { ...e, about: true as const } : e));
+      ).map((e) => ({ ...e, ...aboutOf(state.event, def.id) }));
       await engine.sendEvents(wire);
       return { ids: wire.map((e) => e.id) };
     };
@@ -2121,7 +2125,7 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
                     from: { fn: def.id, runId: payload.runId },
                     ...(payload.event.tenant ? { tenant: payload.event.tenant } : {}),
                     ...(d.sessions ? { sessions: d.sessions } : {}),
-                    ...(aboutRuns(payload.event) ? { about: true as const } : {}),
+                    ...aboutOf(payload.event, def.id),
                   }),
                   at: Date.now(),
                   runId: childId,

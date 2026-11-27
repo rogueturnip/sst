@@ -26,8 +26,7 @@ const MAX_RESULT_BYTES = 64 * 1024;
 export function wantedSystemEvents(registry: Map<string, Registered>, engine: Engine, ended: Pick<Ended, "event" | "outcome">) {
   // What a run about a run did isn't told, or a function that fails would be started again
   // by its own failure, forever.
-  // Nor what such a run started, as a run it invoked, or an event it sent.
-  if ((SYSTEM_EVENTS as readonly string[]).includes(ended.event.name) || ended.event.about) return [];
+  if ((SYSTEM_EVENTS as readonly string[]).includes(ended.event.name)) return [];
   const names = [
     "inngest/function.finished",
     ...(ended.outcome === "failed" ? ["inngest/function.failed"] : ended.outcome === "cancelled" ? ["inngest/function.cancelled"] : []),
@@ -64,6 +63,8 @@ export async function sendSystemEvents(registry: Map<string, Registered>, engine
       data,
       ts: Date.now(),
       ...(ended.event.tenant ? { tenant: ended.event.tenant } : {}),
+      // What events about runs started on the way here: it doesn't start them again.
+      ...(ended.event.about?.length ? { about: ended.event.about } : {}),
     });
   }
 }

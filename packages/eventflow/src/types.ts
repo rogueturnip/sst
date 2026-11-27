@@ -18,8 +18,11 @@ export interface WireEvent {
   tenant?: string;
   /** The sessions it's in, by name, as Inngest's. */
   sessions?: Record<string, string>;
-  /** It comes from a run about runs, or what one started: its runs send no events about runs. */
-  about?: true;
+  /**
+   * The functions that events about runs started, on the way to it: an event about runs
+   * doesn't start one of them again, so they don't go on forever.
+   */
+  about?: string[];
   /** For a deferred function's event, the run that deferred it. */
   from?: { fn: string; runId: string };
   /** Its data, when that's large, is in the table. */
