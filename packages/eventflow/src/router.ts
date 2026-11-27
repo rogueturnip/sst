@@ -197,7 +197,8 @@ async function routeRecord(record: SQSRecord, registry: Map<string, Registered>,
   for (const { def } of matched) {
     try {
       if (def.batch && inBatch(def, event)) await addToBatch(def, event, receivedAt, engine, registry);
-      else await startRun(def, event, engine, registry, { received: receivedAt });
+      // An event of a time to come starts its runs then, as with Inngest.
+      else await startRun(def, event, engine, registry, { received: receivedAt, ...(event.ts > Date.now() + 1000 ? { notBefore: event.ts } : {}) });
     } catch (error) {
       failed.push(`${def.id}: ${error instanceof Error ? error.message : String(error)}`);
     }

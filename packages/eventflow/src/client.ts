@@ -82,10 +82,53 @@ export async function awsFetch(
   },
 ) {
   const c = await client(options?.aws);
-  if (options?.retries !== undefined) c.retries = options.retries;
+  const retries = options?.retries ?? 10;
+  // Tried again here, not by aws4fetch, so a throttle or an outage is seen in the logs, and
+  // isn't only a call that's slow.
+  c.retries = 0;
   const region = options?.aws?.region ?? c.region;
-  return c.fetch(`https://${service}.${region}.amazonaws.com${path}`, {
-    ...init,
-    aws: options?.aws,
-  });
+  const url = `https://${service}.${region}.amazonaws.com${path}`;
+  const began = Date.now();
+  let last: string | number = "";
+  for (let attempt = 0; ; attempt++) {
+    let response: Response | undefined;
+    try {
+      response = await c.fetch(url, { ...init, aws: options?.aws });
+    } catch (error) {
+      if (attempt >= retries) {
+        tell(service, path, String((error as Error)?.name ?? error), attempt + 1, began, true);
+        throw error;
+      }
+      last = String((error as Error)?.name ?? "error");
+    }
+    if (response && !(response.status === 429 || response.status >= 500)) {
+      if (attempt) tell(service, path, last, attempt + 1, began, false);
+      return response;
+    }
+    if (response) {
+      last = response.status;
+      if (attempt >= retries) {
+        tell(service, path, last, attempt + 1, began, true);
+        return response;
+      }
+      await response.body?.cancel().catch(() => {});
+    }
+    // As aws4fetch: from 50 ms, doubling, with jitter.
+    await new Promise((r) => setTimeout(r, Math.random() * 50 * 2 ** attempt));
+  }
+}
+
+/** One line for a call that AWS throttled, or that failed and was tried again. */
+function tell(service: string, path: string, status: string | number, tries: number, began: number, gaveUp: boolean) {
+  console.warn(
+    JSON.stringify({
+      level: "warn",
+      message: gaveUp ? "An AWS call failed after its tries" : "An AWS call was tried again",
+      service,
+      path: path.split("?")[0].slice(0, 120),
+      status,
+      tries,
+      ms: Date.now() - began,
+    }),
+  );
 }

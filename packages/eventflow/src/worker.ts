@@ -175,6 +175,8 @@ function retryDelay(error: unknown, attempt: number, retries: number, seed: stri
 
 /** A step used as it can't be. Trying the function again wouldn't help. */
 class UsageError extends TypeError {}
+/** A wait that needs what the run's event doesn't have: it never matches. */
+class MissingPathError extends UsageError {}
 
 /** A run that's cancelled, as it didn't start in time, or a later one replaced it. */
 export class CancelledError extends NonRetriableError {
@@ -824,7 +826,15 @@ function makeStep(state: RunState) {
         ? options.timeout.getTime() - Date.now()
         : parseDuration(options.timeout, `timeout of step "${id}"`);
     const timeout = bounded(timeoutMs, `timeout of step "${id}"`);
-    const { field, value, condition } = matcher(id, state.event, options);
+    // One that needs what the run's event doesn't have never matches, and times out with null.
+    let m: ReturnType<typeof matcher> | undefined;
+    try {
+      m = matcher(id, state.event, options);
+    } catch (error) {
+      if (!(error instanceof MissingPathError)) throw error;
+      log("warn", "A wait can't match, and waits for its timeout", { run: state.runId, step: id, reason: error.message.slice(0, 200) });
+    }
+    const { field, value, condition } = m ?? { field: "", value: undefined, condition: undefined };
 
     return op(id, "EventFlowWait", () => eager(
       ctx.runInChildContext(
@@ -834,6 +844,7 @@ function makeStep(state: RunState) {
           // The wait may find an event that came while it was registering. Then it uses
           // that event, and doesn't wait for the callback.
           const early = await child.step("listen", async () => {
+            if (!m) return undefined;
             const found = await listen(engine, {
               name,
               tenant: state.event.tenant,
@@ -1330,7 +1341,7 @@ export function matcher(
     const path = options.match.replace(/^(event|async)\./, "");
     const value = getPath(event, path.split("."));
     if (value === undefined)
-      throw new UsageError(`The step "${stepId}" matches on "${path}", which the run's event doesn't have.`);
+      throw new MissingPathError(`The step "${stepId}" matches on "${path}", which the run's event doesn't have.`);
     return { field: path, value: JSON.stringify(value) };
   }
   if (options.if) {
@@ -1342,7 +1353,7 @@ export function matcher(
       if ((part.kind === "binary" && part.op === "||") || part.kind === "ternary") continue;
       for (const path of paths(part))
         if (path[0] === "event" && getPath(event, path.slice(1)) === undefined)
-          throw new UsageError(`The "if" of step "${stepId}" uses "${path.join(".")}", which the run's event doesn't have.`);
+          throw new MissingPathError(`The "if" of step "${stepId}" uses "${path.join(".")}", which the run's event doesn't have.`);
     }
     const expr = bind(parsed, "event", event);
     if (Buffer.byteLength(JSON.stringify(expr)) > MAX_CONDITION_BYTES)
@@ -1729,7 +1740,7 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
               try {
                 m = matcher("cancelOn", event, c);
               } catch (error) {
-                if (!(error instanceof UsageError)) throw error;
+                if (!(error instanceof MissingPathError)) throw error;
                 log("warn", "A cancelOn can't match this run, which goes on", { fn: def.id, cancelOn: c.name, reason: error.message.slice(0, 200) });
                 continue;
               }

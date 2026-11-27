@@ -127,14 +127,14 @@ describe("waitForEvent", () => {
     expect(cluster.queue).toHaveLength(0);
   });
 
-  it("throws for a match path the run's event doesn't have", async () => {
+  it("waits for its timeout, and doesn't fail, for a match path the run's event doesn't have", async () => {
     const cluster = approvals({ match: "data.missing" });
     await cluster.flow.send({ name: "invoice/created", data: { invoiceId: "inv_1" } });
     await cluster.drain();
     const run = await waitFor(() => [...cluster.runs.values()][0]);
-    const result = await run.result;
-    expect(result.getStatus()).toBe(ExecutionStatus.FAILED);
-    expect(result.getError().errorMessage).toContain("data.missing");
+    await settle(1500);
+    // It can't match: it waits, and is given null at its timeout, as with Inngest.
+    expect(cluster.statusOf(run.runId)).toBe("RUNNING");
   });
 });
 
