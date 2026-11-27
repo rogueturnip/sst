@@ -1106,7 +1106,11 @@ function makeStep(state: RunState) {
           const tried = !!(await engine.store.owner(`${record}\ntrying`));
           if (wait && wait.callbackId !== callbackId) return { runId: tried ? runId : undefined };
           if (!tried) await engine.store.claim(`${record}\ntrying`, "trying", ttl);
-          const told = (await engine.callback(callbackId, { signal: options.signal, data: options.data ?? null })) || tried;
+          const told = (await engine.callback(callbackId, { signal: options.signal, data: options.data ?? null }).catch(async (error) => {
+            // Not told, for sure: a try after this doesn't take it that this one did.
+            if (!tried && error?.notResumed) await engine.store.unclaim(`${record}\ntrying`, "trying");
+            throw error;
+          })) || tried;
           // Kept, so a try after this, or a replay, says the same.
           await engine.store.claim(`${record}\n${told ? "told" : "not"}`, "1", ttl);
           await engine.store.signalFree(item, callbackId);

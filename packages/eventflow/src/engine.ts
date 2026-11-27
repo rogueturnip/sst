@@ -167,6 +167,10 @@ export class Engine {
    * not have been resumed.
    */
   async callback(callbackId: string, payload: unknown) {
+    // Whether a try may have resumed it: a throttle is a no.
+    let maybe = false;
+    // Thrown when it wasn't resumed, for sure.
+    const not = (error: unknown) => (maybe ? error : Object.assign(error instanceof Error ? error : new Error(String(error)), { notResumed: true }));
     for (let attempt = 0; ; attempt++) {
       try {
         await succeedCallback(callbackId, payload, this.aws);
@@ -178,11 +182,12 @@ export class Engine {
           // Closed, unless it's the answer that isn't taken: that isn't the callback's end.
           const body = error instanceof LambdaError ? await error.response.text().catch(() => "") : "";
           if (/InvalidParameter|Validation|TooLarge/i.test(body) && /size|length|large|exceed|bytes/i.test(body))
-            throw new Error(`The answer to a callback wasn't taken: ${body.slice(0, 300)}`);
+            throw not(new Error(`The answer to a callback wasn't taken: ${body.slice(0, 300)}`));
           return false;
         }
         const transient = status === undefined || status === 429 || status >= 500;
-        if (!transient || attempt >= 4) throw error;
+        if (status !== 429) maybe = true;
+        if (!transient || attempt >= 4) throw status === 429 ? not(error) : error;
         await new Promise((r) => setTimeout(r, (Math.random() + 1) * 50 * 2 ** attempt));
       }
     }
