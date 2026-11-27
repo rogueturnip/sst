@@ -1697,9 +1697,10 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
         const keyed = of !== undefined ? `${stepId(id)}@${JSON.stringify(of)}` : undefined;
         const refuse = (message: string) => {
           // Nothing it deferred starts: after the fix, a replay defers it again, by its new name,
-          // and it isn't done twice. It fails the run, though the code catches it.
-          defers.clear();
-          const error = new UsageError(`${message} The run fails, and nothing it deferred starts.`);
+          // and it isn't done twice. It fails the run, though the code catches it. Only what
+          // this part deferred: onFailure's refusal doesn't take what the function decided.
+          for (const k of [...defers.keys()]) if (k.startsWith(`${forState.namespace}\n`)) defers.delete(k);
+          const error = new UsageError(`${message} It fails, and nothing it deferred starts.`);
           forState.refuse(error);
           throw error;
         };

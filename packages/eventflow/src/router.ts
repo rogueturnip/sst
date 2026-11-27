@@ -312,8 +312,8 @@ async function resolveWaits(event: WireEvent, receivedAt: number, engine: Engine
         waiters.slice(i, i + 25).map(async (w) => {
           if (w.kind === "cancel" && w.callbackId.startsWith(DUE)) {
             // An event of a time to come whose run hasn't started: it won't.
-            const rest = w.callbackId.slice(DUE.length);
-            await engine.store.claim(rest.slice(0, rest.lastIndexOf("#")), "cancelled", DUE_CANCEL_MS);
+            // Its mark, without the cancelOn's place, which one written before had none of.
+            await engine.store.claim(w.callbackId.slice(DUE.length).replace(/#\d+$/, ""), "cancelled", DUE_CANCEL_MS);
             log("Cancelled a run that was still to come", { run: w.runId, event: event.id });
           } else if (w.kind === "cancel" && w.callbackId.startsWith(STOP)) {
             const arn = w.callbackId.slice(STOP.length);
@@ -488,7 +488,7 @@ async function routeTimer(message: Extract<Message, { kind: "timer" }>, registry
     if (!window || (!window.closing && window.last !== timer.last)) return;
     if (early && !window.closing) return engine.sendTimer(timer, at);
     // The function, or its debounce, was taken out: its last event isn't left.
-    if (!entry?.def.debounce && !entry) return warn("Skipped a run of a function that's gone", { fn: timer.fn });
+    if (!entry) return warn("Skipped a run of a function that's gone", { fn: timer.fn });
     if (!window.closing && !(await engine.store.debounceClose(timer.item, window.order))) return;
     return fireDebounce(entry.def, timer.item, engine, registry);
   }
