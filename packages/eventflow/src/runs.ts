@@ -131,11 +131,14 @@ function ofFunction(fn: string) {
   return new RegExp(`^${prefix}[0-9A-HJKMNP-TV-Z]{15,26}(_r[0-9A-HJKMNP-TV-Z]{10})?$`);
 }
 
-export async function listRuns(engine: Engine, input: ListInput = {}): Promise<RunSummary[]> {
+/**
+ * The runs, the latest first. `functions` are the EventFlow's functions: where another has
+ * the same prefix, like "a.b" and "a-b", each run is asked whose it is.
+ */
+export async function listRuns(engine: Engine, input: ListInput = {}, functions: Iterable<string> = []): Promise<RunSummary[]> {
   const fn = typeof input.function === "string" ? input.function : input.function?.id;
   const mine = fn ? ofFunction(fn) : undefined;
-  // Two IDs can make one prefix, like "a.b" and "a-b": then each run says whose it is.
-  const shared = fn !== undefined && runPrefix(fn) !== `${fn}-`;
+  const shared = fn !== undefined && [...functions].some((other) => other !== fn && runPrefix(other) === runPrefix(fn));
   const limit = Math.min(Math.max(1, input.limit ?? 100), 1000);
   const runs: RunSummary[] = [];
   let marker: string | undefined;
@@ -148,10 +151,12 @@ export async function listRuns(engine: Engine, input: ListInput = {}): Promise<R
     if (input.to) params.set("StartedBefore", new Date(input.to).toISOString());
     if (marker) params.set("Marker", marker);
     const result = await lambda<any>(engine, `/functions/${encodeURIComponent(engine.worker.name)}/durable-executions?${params}`);
-    for (const e of result.DurableExecutions ?? []) {
-      if (mine && !mine.test(String(e.DurableExecutionName))) continue;
-      if (shared && (await runStatus(engine, e.DurableExecutionArn)).payload?.fn !== fn) continue;
-      runs.push(summary(e));
+    const found = (result.DurableExecutions ?? []).filter((e: any) => !mine || mine.test(String(e.DurableExecutionName)));
+    // Ten at a time, and no more than it needs.
+    for (let i = 0; i < found.length && runs.length < limit; i += 10) {
+      const batch = found.slice(i, i + 10);
+      const whose = shared ? await Promise.all(batch.map(async (e: any) => (await runStatus(engine, e.DurableExecutionArn)).payload?.fn)) : [];
+      batch.forEach((e: any, j: number) => { if (!shared || whose[j] === fn) runs.push(summary(e)); });
     }
     marker = result.NextMarker;
     if (!marker || runs.length >= limit) break;
@@ -426,10 +431,11 @@ export async function rerunAll(
   engine: Engine,
   lockRuns: LockRuns,
   input: ListInput & { reuse: boolean; force?: boolean },
+  functions: Iterable<string> = [],
 ): Promise<{ id: string; result?: { id: string; existing?: boolean }; error?: string }[]> {
   if (input.status === "SUCCEEDED" && input.reuse)
     throw new Error("A retry reuses what succeeded, so there's nothing to retry in a run that succeeded. Replay it instead.");
-  const runs = await listRuns(engine, { ...input, status: input.status ?? "FAILED", limit: Math.min(input.limit ?? 50, 100) });
+  const runs = await listRuns(engine, { ...input, status: input.status ?? "FAILED", limit: Math.min(input.limit ?? 50, 100) }, functions);
   const out: { id: string; result?: { id: string }; error?: string }[] = [];
   for (const run of runs) {
     try {
@@ -450,7 +456,7 @@ export async function rerunAll(
 export async function cancelAll(engine: Engine, input: ListInput, registry: Map<string, Registered>, options: { force?: boolean } = {}) {
   const runs: RunSummary[] = [];
   for (const status of input.status ? [input.status] : (["RUNNING", "PAUSED"] as RunStatus[]))
-    runs.push(...(await listRuns(engine, { ...input, status, limit: Math.min(input.limit ?? 500, 500) })));
+    runs.push(...(await listRuns(engine, { ...input, status, limit: Math.min(input.limit ?? 500, 500) }, registry.keys())));
   const out: { id: string; stopped?: boolean; error?: string }[] = [];
   for (let i = 0; i < runs.length; i += 10) {
     const results = await Promise.allSettled(runs.slice(i, i + 10).map((r) => cancelRun(engine, r.id, registry, options)));

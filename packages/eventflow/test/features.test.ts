@@ -732,9 +732,9 @@ describe("system events", () => {
     await cluster.flow.send([{ name: "ok" }, { name: "bad" }]);
     await cluster.pump(800);
     expect(seen.sort()).toEqual([
-      ["inngest/function.failed", "bad", "Failed", "broken"],
-      ["inngest/function.finished", "bad", "Failed", "broken"],
-      ["inngest/function.finished", "ok", "Completed", "done"],
+      ["inngest/function.failed", "test-bad", "Failed", "broken"],
+      ["inngest/function.finished", "test-bad", "Failed", "broken"],
+      ["inngest/function.finished", "test-ok", "Completed", "done"],
     ]);
     // The watchers failed: that isn't told, or it would go on forever.
     await cluster.pump(300);

@@ -6,6 +6,7 @@ import { hash, ulid } from "./ids.js";
 import { sign } from "./sign.js";
 import { DynamoStore, type Store } from "./store.js";
 import type { RealtimeResource } from "./realtime.js";
+import type { StandardSchemaV1 } from "./index.js";
 import {
   ADMIN_MARKER,
   CONTRACT,
@@ -391,4 +392,21 @@ function findResource(): EngineResource {
       .map(([name]) => name)
       .join(", ")}). Pass the one to use, like "new EventFlow({ id, resource: Resource.${linked[0][0]} })".`,
   );
+}
+
+/** Where `eventType().create()` keeps the event's schema. */
+export const schemaOf = Symbol.for("sst.eventflow.schema");
+
+/** The event's data, checked against its type's schema, with what the schema makes of it. */
+export async function checkedData(payload: SendPayload) {
+  const schema = (payload as any)?.[schemaOf] as StandardSchemaV1 | undefined;
+  if (!schema) return payload.data;
+  const result = await schema["~standard"].validate(payload.data);
+  if (result.issues)
+    throw new TypeError(
+      `The event "${payload.name}" doesn't match its schema: ${result.issues
+        .map((i) => `${i.path?.length ? `${i.path.join(".")}: ` : ""}${i.message}`)
+        .join("; ")}`,
+    );
+  return result.value;
 }

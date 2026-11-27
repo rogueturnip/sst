@@ -40,7 +40,8 @@ export async function sendSystemEvents(registry: Map<string, Registered>, engine
   for (const name of wantedSystemEvents(registry, engine, ended)) {
     const large = ended.result !== undefined && Buffer.byteLength(JSON.stringify(ended.result)) > MAX_RESULT_BYTES;
     const full = {
-      function_id: ended.fn,
+      // As with Inngest: the app's ID, then the function's, like "shop-charge".
+      function_id: engine.appId ? `${engine.appId}-${ended.fn}` : ended.fn,
       run_id: ended.runId,
       // A large one is named, not carried.
       event: ended.event.blob ? { id: ended.event.id, name: ended.event.name, ts: ended.event.ts } : ended.event,

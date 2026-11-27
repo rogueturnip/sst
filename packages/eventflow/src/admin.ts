@@ -287,7 +287,7 @@ async function run(op: string, args: Record<string, any>, registry: Map<string, 
     case "deadLetters.redrive":
       return redrive(engine);
     case "runs.list":
-      return listRuns(engine, list());
+      return listRuns(engine, list(), registry.keys());
     case "runs.get":
       return (await getRun(engine, runId())) ?? null;
     case "runs.cancel":
@@ -299,7 +299,7 @@ async function run(op: string, args: Record<string, any>, registry: Map<string, 
     case "runs.retry":
       return rerun(engine, lockRuns(engine, registry), runId(), true, { force: args.force === true, again: args.again === true });
     case "runs.retryAll":
-      return rerunAll(engine, lockRuns(engine, registry), { ...list(), reuse: args.mode !== "replay", force: args.force === true });
+      return rerunAll(engine, lockRuns(engine, registry), { ...list(), reuse: args.mode !== "replay", force: args.force === true }, registry.keys());
     case "send": {
       const events = (Array.isArray(args.events) ? args.events : [args.events]).map((e: SendPayload) => toWireEvent(e));
       await engine.sendEvents(events);

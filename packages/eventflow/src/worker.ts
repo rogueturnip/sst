@@ -6,7 +6,7 @@ import { led, link, unlinked, type Link } from "./chain.js";
 import { Invocation } from "./invocation.js";
 import { priorityMs, type Definition } from "./definition.js";
 import { parseDuration, toDurableSeconds, type DurationInput } from "./duration.js";
-import { checkEvent, checkSignal, mergeSessions, MESSAGE_TTL_MS, toWireEvent, type Engine, type SendPayload } from "./engine.js";
+import { checkedData, checkEvent, checkSignal, mergeSessions, MESSAGE_TTL_MS, toWireEvent, type Engine, type SendPayload } from "./engine.js";
 import { InvokeFailedError, NonRetriableError, RetryAfterError, SignalConflictError, StepFailedError } from "./errors.js";
 import { bind, conjuncts, evaluate, getPath, parseExpression, paths, type Expression } from "./expression.js";
 import { callRunId, hash, key, runId as makeRunId } from "./ids.js";
@@ -1028,7 +1028,18 @@ function makeStep(state: RunState) {
     begin(first);
     // Each event's ID from the run's root, the step and its place in what's sent, before a
     // middleware changes the list: one it adds has its ID by its own place among those added.
-    const list = (Array.isArray(payload) ? payload : [payload]).map((p, i) => ({ ...p, id: p.id ?? hash(JSON.stringify([state.root, state.namespace, id, i]), 26) }));
+    const payloads = Array.isArray(payload) ? payload : [payload];
+    const list = payloads.map((p, i) => ({ ...p, id: p.id ?? hash(JSON.stringify([state.root, state.namespace, id, i]), 26) }));
+    // Each is checked against its type's schema, as flow.send() does, and given what it makes of
+    // the data. One that doesn't match fails the step, without retries.
+    const checked = async () => {
+      for (const [i, p] of payloads.entries())
+        try {
+          list[i].data = await checkedData(p);
+        } catch (error) {
+          throw new NonRetriableError((error as Error).message);
+        }
+    };
     const send = async (events: any[]) => {
       let added = 0;
       // IDs come from the run's root and the step, so a retried step, and a retry
@@ -1054,6 +1065,7 @@ function makeStep(state: RunState) {
         ctx.step(
           id,
           (c) => failing(id, delayOf(id, c.attempt), () => acting(async () => {
+            await checked();
             if (!state.hooks.any) return send(list);
             const info = state.hooks.info(id, undefined, "sendEvent", undefined, false);
             return handledWith(state, info, c.attempt, async () => {
@@ -1936,7 +1948,7 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
                 event: {
                   id: hash(`failed\n${runId}`),
                   name: "inngest/function.failed",
-                  data: { event, error: errorInfo(error), function_id: def.id, run_id: runId },
+                  data: { event, error: errorInfo(error), function_id: engine.appId ? `${engine.appId}-${def.id}` : def.id, run_id: runId },
                   ts,
                 },
               });

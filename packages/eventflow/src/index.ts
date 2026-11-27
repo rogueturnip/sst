@@ -16,7 +16,7 @@ import { mqttTopic, publish, type RealtimeResource, type TopicRef } from "./real
 import { BaseMiddleware, Hooks, registerMiddleware } from "./middleware.js";
 import type { AiModel } from "./tools.js";
 import type { MiddlewareClass } from "./definition.js";
-import { checkSignal } from "./engine.js";
+import { checkedData, checkSignal, schemaOf } from "./engine.js";
 import { createWorker, type Registered } from "./worker.js";
 
 export { NonRetriableError, RetryAfterError, InvokeFailedError, SignalConflictError, StepFailedError } from "./errors.js";
@@ -41,7 +41,7 @@ export type { EngineResource } from "./types.js";
  *
  * @example
  * ```ts title="src/flow.ts"
- * import { EventFlow, serve } from "sst/aws/eventflow";
+ * import { EventFlow, serve } from "@sst-community/eventflow";
  *
  * export const flow = new EventFlow({ id: "my-app" });
  *
@@ -663,7 +663,6 @@ export interface EventType<TName extends string = string, TData = any> {
   create(data: TData, options?: { id?: string; ts?: number; tenant?: string }): TypedPayload<TName, TData>;
 }
 
-const schemaOf = Symbol.for("sst.eventflow.schema");
 
 /**
  * Declare an event, with a schema for its data, as with Inngest v4. Use it in a
@@ -672,7 +671,7 @@ const schemaOf = Symbol.for("sst.eventflow.schema");
  * @example
  * ```ts
  * import { z } from "zod";
- * import { eventType, staticSchema } from "sst/aws/eventflow";
+ * import { eventType, staticSchema } from "@sst-community/eventflow";
  *
  * export const userCreated = eventType("user/created", {
  *   schema: z.object({ id: z.string(), email: z.string() }),
@@ -718,16 +717,7 @@ export function cron(expression: string, options?: { jitter?: DurationInput }) {
 }
 
 async function validate(payload: SendPayload) {
-  const schema = (payload as any)?.[schemaOf] as StandardSchemaV1 | undefined;
-  if (!schema) return;
-  const result = await schema["~standard"].validate(payload.data);
-  if (result.issues)
-    throw new TypeError(
-      `The event "${payload.name}" doesn't match its schema: ${result.issues
-        .map((i) => `${i.path?.length ? `${i.path.join(".")}: ` : ""}${i.message}`)
-        .join("; ")}`,
-    );
-  (payload as any).data = result.value;
+  if ((payload as any)?.[schemaOf]) (payload as any).data = await checkedData(payload);
 }
 
 // ---------------------------------------------------------------------------

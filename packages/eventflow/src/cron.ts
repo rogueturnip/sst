@@ -34,6 +34,8 @@ export interface Cron {
   // Cron's rule: when both day fields are restricted, a day matches either one.
   daysRestricted: boolean;
   weekdaysRestricted: boolean;
+  // Its hour starts with "*", like "*" or "*/2": it runs in both of an hour that repeats.
+  everyHour?: boolean;
 }
 
 const MACROS: Record<string, string> = {
@@ -79,6 +81,7 @@ export function parseCron(input: string): Cron {
     days: sets[2],
     months: sets[3],
     weekdays: sets[4],
+    everyHour: parts[1].startsWith("*"),
     // As in Vixie cron, a field that starts with "*", like "*/2", isn't restricted.
     daysRestricted: !/^[*?]/.test(parts[2]),
     weekdaysRestricted: !/^[*?]/.test(parts[4]),
@@ -167,9 +170,12 @@ export function cronMatches(cron: Cron, date: Date): boolean {
 
 /**
  * The minute on the cron's clock, like "2026-11-01T01:30". When the clocks go back,
- * the hour that repeats has the same minutes, so a run named after it starts once.
+ * the hour that repeats has the same minutes, so a run named after it starts once, as
+ * in Vixie cron. A cron whose hour starts with "*", like an hourly one, runs in both, so
+ * its minute is the minute itself.
  */
 export function localMinute(cron: Cron, date: Date) {
+  if (cron.everyHour) return date.toISOString().slice(0, 16) + "Z";
   const p = partsIn(date, cron.timezone);
   const two = (n: number) => String(n).padStart(2, "0");
   return `${p.year}-${two(p.month)}-${two(p.day)}T${two(p.hour)}:${two(p.minute)}`;
