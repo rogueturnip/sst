@@ -605,7 +605,9 @@ function makeStep(state: RunState) {
     // fails as a try that timed out, and is retried as any other.
     if (begun) {
       let n = 1;
-      while (n <= RESTARTS && !(await engine.store.claim(key("SR", state.runId, state.namespace, id, attempt, n), crypto.randomUUID(), RESTART_TTL_MS))) n++;
+      // By the invocation, so a write whose answer was lost, and is sent again, is this one's.
+      const me = ctx.lambdaContext?.awsRequestId ?? crypto.randomUUID();
+      while (n <= RESTARTS && !(await patient(() => engine.store.claim(key("SR", state.runId, state.namespace, id, attempt, n), me, RESTART_TTL_MS)))) n++;
       if (n > RESTARTS)
         throw Object.assign(
           new Error(`The step "${id}" was started ${RESTARTS + 1} times without finishing: it doesn't fit in one invocation of the worker. Give the worker a longer invocation timeout, or split the step.`),
@@ -678,8 +680,9 @@ function makeStep(state: RunState) {
         ).catch((error) => {
           throw isInterruption(error) ? new StepFailedError(id, interrupted(id)) : error;
         }) as Promise<T>;
-      // Begun before this invocation, and not done: its code may be run again.
-      const begun = ctx.known(id) && !ctx.saved(id);
+      // Its try was started before this invocation, which ended in it: its code is run again.
+      // Not one that waits for its next try.
+      const begun = ctx.status(id) === "STARTED";
       return eager(
         ctx.step(id, (c) => failing(id, delayOf(id, c.attempt), async () => jsonify(await inStep(id, c.attempt, code, begun))), {
           retryStrategy: retrying(id),
@@ -704,6 +707,9 @@ function makeStep(state: RunState) {
               // step that's retried asks for the same lease.
               const leaseId = `${hash(`${state.runId}\n${state.namespace}\n${id}`, 12)}.${attempt}.${lost}`;
               const placed = await takeLeases(child, leaseId, `${attempt}.${lost}`, place, again);
+              // The run step was started before this invocation, which ended in it.
+              const raw = child as any;
+              const begun = raw._executionContext?.getStepData?.(raw.peekStepId?.())?.Status === "STARTED";
               const outcome = await child.step(
                 attempt === 1 && lost === 0 ? "run" : `run:${attempt}.${lost}`,
                 async () => {
@@ -719,7 +725,7 @@ function makeStep(state: RunState) {
                   if (!held) return { lost: true as const };
                   let outcome: { ok: true; value?: any; blob?: string; kept?: true } | { ok: false; error: { name: string; message: string }; delay: number | undefined; kept?: true };
                   try {
-                    const value = jsonify(await inStep(id, attempt, code, again));
+                    const value = jsonify(await inStep(id, attempt, code, begun));
                     // In its context's result it's with more: a large one is kept apart.
                     outcome = { ok: true, ...(await patient(() => slimValue(engine, `step\n${state.runId}\n${state.namespace}\n${id}`, value)).catch(() => ({ value }))) };
                   } catch (error) {

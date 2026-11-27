@@ -42,6 +42,8 @@ export interface NamedContext {
   kind(name: string): string | undefined;
   /** Whether an operation was begun already. */
   known(name: string): boolean;
+  /** The saved status of an operation, as STARTED for a step an invocation ended in. */
+  status(name: string): string | undefined;
   readonly lambdaContext: durable.DurableContext["lambdaContext"];
   step<T>(name: string, fn: durable.StepFunc<T>, config?: durable.StepConfig<T>): durable.DurablePromise<T>;
   wait(name: string, duration: durable.Duration): durable.DurablePromise<void>;
@@ -102,6 +104,7 @@ export function named(ctx: durable.DurableContext, replay: Replay): NamedContext
       return op && (/^EventFlow/.test(op.SubType ?? "") ? op.SubType : op.Type);
     },
     known: (name) => c._executionContext.getStepData(idOf(name)) !== undefined,
+    status: (name) => c._executionContext.getStepData(idOf(name))?.Status,
     lambdaContext: ctx.lambdaContext,
     step: (name, fn, config) => at(name, () => ctx.step(name, fn, config)),
     wait: (name, duration) => at(name, () => ctx.wait(name, duration)),
