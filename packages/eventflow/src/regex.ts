@@ -31,6 +31,24 @@ const not = (t: Test): Test => (c) => !t(c);
 const CLASSES: Record<string, Test> = { d: digit, D: not(digit), w: word, W: not(word), s: space, S: not(space) };
 const ESCAPES: Record<string, number> = { n: 10, t: 9, r: 13, f: 12, v: 11 };
 
+// RE2's POSIX classes, which are ASCII.
+const POSIX: Record<string, Test> = {
+  alnum: (x) => (x >= 48 && x <= 57) || (x >= 65 && x <= 90) || (x >= 97 && x <= 122),
+  alpha: (x) => (x >= 65 && x <= 90) || (x >= 97 && x <= 122),
+  ascii: (x) => x <= 0x7f,
+  blank: (x) => x === 9 || x === 32,
+  cntrl: (x) => x <= 0x1f || x === 0x7f,
+  digit: (x) => x >= 48 && x <= 57,
+  graph: (x) => x >= 0x21 && x <= 0x7e,
+  lower: (x) => x >= 97 && x <= 122,
+  print: (x) => x >= 0x20 && x <= 0x7e,
+  punct: (x) => (x >= 0x21 && x <= 0x2f) || (x >= 0x3a && x <= 0x40) || (x >= 0x5b && x <= 0x60) || (x >= 0x7b && x <= 0x7e),
+  space: (x) => (x >= 9 && x <= 13) || x === 32,
+  upper: (x) => x >= 65 && x <= 90,
+  word: (x) => (x >= 48 && x <= 57) || (x >= 65 && x <= 90) || (x >= 97 && x <= 122) || x === 95,
+  xdigit: (x) => (x >= 48 && x <= 57) || (x >= 65 && x <= 70) || (x >= 97 && x <= 102),
+};
+
 export class Regex {
   private readonly program: Inst[] = [];
 
@@ -248,6 +266,16 @@ class Parser {
       const c = this.chars[this.i++];
       if (c === undefined) this.fail();
       if (c === "]" && !first) break;
+      // A POSIX class, as RE2 has them: [[:alpha:]], or [[:^digit:]] for its opposite.
+      if (c === "[" && this.chars[this.i] === ":") {
+        const rest = this.chars.slice(this.i + 1).join("");
+        const m = rest.match(/^(\^?)([a-z]+):\]/);
+        if (!m || !Object.hasOwn(POSIX, m[2])) return this.fail();
+        const test = POSIX[m[2]];
+        tests.push(m[1] ? (x) => !test(x) : test);
+        this.i += 1 + m[0].length;
+        continue;
+      }
       let from: number;
       if (c === "\\") {
         const e = this.chars[this.i++];

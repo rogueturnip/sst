@@ -180,8 +180,16 @@ async function routeRecord(record: SQSRecord, registry: Map<string, Registered>,
   }
   if (message.kind === "due") {
     if (message.exp < Date.now()) return warn("Dropped a message that expired", { kind: message.kind });
-    // Not yet: it goes back to the queue, 15 minutes at a time.
-    if (message.at > Date.now() + 1000) return engine.sendMessages([due(message.event, message.at)]);
+    // Not yet: it goes back to the queue, 15 minutes at a time. Each time once: a message that
+    // comes twice, as SQS may deliver it, doesn't go on as two.
+    if (message.at > Date.now() + 1000) {
+      const hop = message.hop ?? 0;
+      const taken = key("EH", message.event.tenant ?? null, message.event.id, message.at, hop);
+      // Another copy of this time took it, or this one sent the next already.
+      if ((await engine.store.owner(`${taken}\nsent`)) || !(await engine.store.claim(taken, record.messageId, DEDUP_MS))) return;
+      await engine.sendMessages([due(message.event, message.at, hop + 1)]);
+      return void (await engine.store.claim(`${taken}\nsent`, "sent", DEDUP_MS));
+    }
     const event = await fat(engine, message.event);
     const item = key("ED", event.tenant ?? null, event.id);
     if ((await engine.store.beginEvent(item, record.messageId, DEDUP_MS)) === "duplicate") return;
@@ -246,9 +254,9 @@ const DUE_CANCEL_MS = 367 * 86_400_000;
 
 
 /** The message that brings an event of a time to come back when it's due. */
-function due(event: WireEvent, at: number) {
+function due(event: WireEvent, at: number, hop = 0) {
   return {
-    message: sign({ kind: "due" as const, event, at, exp: at + MESSAGE_TTL_MS }),
+    message: sign({ kind: "due" as const, event, at, exp: at + MESSAGE_TTL_MS, hop }),
     group: event.tenant ?? `t-${hash(event.name, 10)}`,
     delaySeconds: Math.max(0, Math.min(900, Math.ceil((at - Date.now()) / 1000))),
   };
