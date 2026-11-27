@@ -1431,7 +1431,8 @@ export async function listen(
   },
 ): Promise<{ event: WireEvent | null; registered: { key: string; createdAt: number; callbackId: string } }> {
   await engine.store.addWaitField(input.name, input.tenant, input.field, input.expiresAt);
-  const createdAt = Date.now();
+  // From when it listens: an event received from then on is its, whenever the router gets to it.
+  const createdAt = input.since ?? Date.now();
   const k = waitKey(input.name, input.tenant, input.field, input.value);
   const waiter = {
     callbackId: input.callbackId,
@@ -1445,7 +1446,7 @@ export async function listen(
   };
   await engine.store.putWaiter(k, waiter);
   const registered = { key: k, createdAt, callbackId: input.callbackId };
-  const recent = await engine.store.recent(recentKey(input.name, input.tenant), Math.min(createdAt, input.since ?? createdAt));
+  const recent = await engine.store.recent(recentKey(input.name, input.tenant), createdAt);
   for (const { event: kept } of recent) {
     const event = await fat(engine, kept);
     if (!eventMatches(event, input.field, input.value, waiter.condition)) continue;
@@ -1671,7 +1672,7 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
       if (forState.sessions) args.sessions = forState.sessions;
       if (def.deferred) args.parents = events.map((e) => ({ fnSlug: e.from?.fn ?? "", runId: e.from?.runId ?? "" }));
       // Start a deferred function once this run has ended.
-      args.defer = (id: string, input: { function: any; data?: unknown; meta?: SendPayload["meta"] }) => {
+      args.defer = (id: string, input: { function: any; data?: unknown; meta?: SendPayload["meta"]; idempotencyKey?: string | number }) => {
         if (stepKeys.getStore()) throw new UsageError(`defer("${id}") can't be called in a step. Call it in the function.`);
         const target = input?.function?.id ?? input?.function?.opts?.id;
         if (!target || !registry.get(target)?.def.deferred)
@@ -1688,7 +1689,16 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
         }
         if (forState.fence.down) return { abort: () => {} };
         const data = jsonify(checked ? checked.value : (input.data ?? {}));
-        const name = occurrence({ counts: forState.deferCounts, used: forState.deferUsed } as any, stepId(id));
+        const of = input.idempotencyKey;
+        if (of !== undefined && (typeof of === "number" ? !Number.isFinite(of) : typeof of !== "string" || !of))
+          throw new UsageError(`The idempotencyKey of defer("${id}") is what it's of, like an order's ID.`);
+        // By what it's of, or its place among the uses of its ID. Which use is which can be another
+        // in a replay where a list changed, and the run it starts would have another's keys.
+        const name = of !== undefined ? `${stepId(id)}@${JSON.stringify(of)}` : occurrence({ counts: forState.deferCounts, used: forState.deferUsed } as any, stepId(id));
+        if (of === undefined && (forState.deferCounts.get(stepId(id)) ?? 0) > 1)
+          throw new UsageError(
+            `defer("${id}") is called more than once, so the run it starts could have another's idempotency keys in a replay. Say what each is of: defer(id, { ..., idempotencyKey: order.id }).`,
+          );
         defers.set(`${forState.namespace}\n${name}`, {
           fn: target,
           data,

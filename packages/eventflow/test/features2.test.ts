@@ -71,8 +71,8 @@ describe("defer", () => {
   it("starts once the run has ended, once, with its data and its run", async () => {
     let during = -1;
     const { c, ran } = make(async ({ defer, step }: any, audit: any) => {
-      defer("a", { function: audit, data: { what: "one" } });
-      defer("a", { function: audit, data: { what: "two" } });
+      defer("a", { function: audit, data: { what: "one" }, idempotencyKey: "one" });
+      defer("a", { function: audit, data: { what: "two" }, idempotencyKey: "two" });
       const dropped = defer("b", { function: audit, data: { what: "dropped" } });
       await step.sleep("pause", "1h");
       await step.run("w", () => void (during = ran.length));

@@ -290,7 +290,7 @@ const audit = createDefer(flow, { id: "audit" }, async ({ event, parents, step }
 const deferred = defer("audit", { function: audit, data: { what: "paid" } });
 ```
 
-A deferred function starts once the run that deferred it has ended, whether it succeeded or failed, and not if it was cancelled. `deferred.abort()` takes it back. Call `defer()` in the function, not in a step. Pass it to `serve()` with the others.
+A deferred function starts once the run that deferred it has ended, whether it succeeded or failed, and not if it was cancelled. `deferred.abort()` takes it back. Call `defer()` in the function, not in a step. Pass it to `serve()` with the others. To defer more than once with one ID, as in a loop, say what each is of, like `defer("refund", { function: refund, data: { item }, idempotencyKey: item.id })`: the run it starts takes its idempotency keys from that, so a replay where the list changed doesn't give one item another's. Without it, a second use of the ID throws, as `step.invoke()` does.
 
 ### Sessions
 

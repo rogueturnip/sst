@@ -504,7 +504,8 @@ export function requiredPaths(node: Node): string[][] {
     case "unary":
       return requiredPaths(node.of);
     case "binary":
-      return node.op === "||" ? [] : [...requiredPaths(node.left), ...requiredPaths(node.right)];
+      // Either side of `||` or `&&` can decide it alone.
+      return node.op === "||" || node.op === "&&" ? [] : [...requiredPaths(node.left), ...requiredPaths(node.right)];
     case "ternary":
       return requiredPaths(node.if);
     case "get":

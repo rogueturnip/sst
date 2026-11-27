@@ -800,7 +800,11 @@ export interface Context<TEvent = FlowEvent> {
   /** Start a deferred function once this run has ended, unless it's cancelled, or `abort()` is called. */
   defer: (
     id: string,
-    options: { function: EventFlowFunction<any>; data?: unknown; meta?: SendPayload["meta"] },
+    /**
+     * `idempotencyKey` is what it's of, like an order's ID: needed when one ID defers more than
+     * once, as in a loop, so a replay where the list changed doesn't give one another's keys.
+     */
+    options: { function: EventFlowFunction<any>; data?: unknown; meta?: SendPayload["meta"]; idempotencyKey?: string | number },
   ) => { abort: () => void };
 }
 
