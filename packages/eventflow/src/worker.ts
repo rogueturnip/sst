@@ -40,6 +40,10 @@ export type InvokeOutcome = (
 
 export { NonRetriableError, RetryAfterError, StepFailedError, InvokeFailedError, SignalConflictError } from "./errors.js";
 
+// How many times a step's try may be started again after an invocation ended in it.
+const RESTARTS = 3;
+const RESTART_TTL_MS = 30 * 86_400_000;
+
 /** The error name of an at-most-once step that stopped part way. */
 export const INTERRUPTED = "StepInterrupted";
 
@@ -590,11 +594,24 @@ function makeStep(state: RunState) {
     work.then(over, over);
     return work;
   };
-  const inStep = async <T>(id: string, attempt: number, fn: () => T | Promise<T>): Promise<T> => {
+  const inStep = async <T>(id: string, attempt: number, fn: () => T | Promise<T>, begun = false): Promise<T> => {
     // The invocation has ended, and goes on in a Lambda that's been thawed: the next one runs it.
     if (inv.over) return never();
     await state.start();
     if (inv.over) return never();
+    // A step that was begun before, in an invocation that ended, as one longer than the worker's
+    // timeout, or a crash. AWS runs it again as the same attempt, so a step that can't fit would
+    // run, and do what it does, until the run times out. Each time is counted: after a few, it
+    // fails as a try that timed out, and is retried as any other.
+    if (begun) {
+      let n = 1;
+      while (n <= RESTARTS && !(await engine.store.claim(key("SR", state.runId, state.namespace, id, attempt, n), crypto.randomUUID(), RESTART_TTL_MS))) n++;
+      if (n > RESTARTS)
+        throw Object.assign(
+          new Error(`The step "${id}" was started ${RESTARTS + 1} times without finishing: it doesn't fit in one invocation of the worker. Give the worker a longer invocation timeout, or split the step.`),
+          { name: "StepTimedOut" },
+        );
+    }
     // It was waiting, for its next try or its lease, as the function failed. What's done about
     // that, like a refund, may have been done.
     if (state.shared.ended) throw new NonRetriableError("The function ended before this step ran.");
@@ -661,8 +678,10 @@ function makeStep(state: RunState) {
         ).catch((error) => {
           throw isInterruption(error) ? new StepFailedError(id, interrupted(id)) : error;
         }) as Promise<T>;
+      // Begun before this invocation, and not done: its code may be run again.
+      const begun = ctx.known(id) && !ctx.saved(id);
       return eager(
-        ctx.step(id, (c) => failing(id, delayOf(id, c.attempt), async () => jsonify(await inStep(id, c.attempt, code))), {
+        ctx.step(id, (c) => failing(id, delayOf(id, c.attempt), async () => jsonify(await inStep(id, c.attempt, code, begun))), {
           retryStrategy: retrying(id),
           serdes: state.shared.places.serdes(id),
         }),
@@ -700,7 +719,7 @@ function makeStep(state: RunState) {
                   if (!held) return { lost: true as const };
                   let outcome: { ok: true; value?: any; blob?: string; kept?: true } | { ok: false; error: { name: string; message: string }; delay: number | undefined; kept?: true };
                   try {
-                    const value = jsonify(await inStep(id, attempt, code));
+                    const value = jsonify(await inStep(id, attempt, code, again));
                     // In its context's result it's with more: a large one is kept apart.
                     outcome = { ok: true, ...(await patient(() => slimValue(engine, `step\n${state.runId}\n${state.namespace}\n${id}`, value)).catch(() => ({ value }))) };
                   } catch (error) {

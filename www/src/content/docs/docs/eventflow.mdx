@@ -761,7 +761,7 @@ The worker is a published version. A run keeps the version it started on, throug
 | Event ID memory | 24 hours |
 | Run length | `timeout.execution`, up to 366 days; 14 days by default |
 | Sleep, or a wait's timeout | Up to the run length. A longer one fails the run with a message that says so |
-| One invocation | `timeout.invocation`, up to 15 minutes; 5 minutes by default. A step must fit in one |
+| One invocation | `timeout.invocation`, up to 15 minutes; 5 minutes by default. A step must fit in one: AWS starts a step that an invocation ended in again, as the same try, so one that's started 4 times without finishing fails, and is retried as a try that timed out |
 | Run kept for | `retention`, 1 to 90 days; 30 by default |
 | Operations per run | 30,000. A step is 1, a step with a concurrency limit 3 or more, a wait for an event 3 |
 | Step result | 1 MB |
