@@ -68,7 +68,9 @@ export async function client(aws?: AwsOptions): Promise<AwsClient> {
     });
   }
 
-  throw new Error("No AWS credentials found");
+  throw new Error(
+    "No AWS credentials found: set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, as `eval \"$(aws configure export-credentials --format env)\"` does for a profile, or run this in Lambda or a container with a role.",
+  );
 }
 
 export async function awsFetch(

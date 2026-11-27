@@ -207,7 +207,7 @@ async function routeRecord(record: SQSRecord, registry: Map<string, Registered>,
   if (event.ts > receivedAt + AHEAD_MS && [...registry.values()].some((r) => matchesTrigger(r.def, event))) {
     // Its cancelOn listens from now, as its run would if it slept until then, as with Inngest.
     for (const { def } of [...registry.values()].filter((r) => matchesTrigger(r.def, event) && r.def.cancelOn.length))
-      for (const c of def.cancelOn) {
+      for (const [n, c] of def.cancelOn.entries()) {
         let m: ReturnType<typeof matcher>;
         try {
           m = matcher("cancelOn", event, c);
@@ -220,7 +220,8 @@ async function routeRecord(record: SQSRecord, registry: Map<string, Registered>,
           name: c.name,
           tenant: event.tenant,
           ...m,
-          callbackId: `${DUE}${mark}`,
+          // Each of its cancelOns a waiter of its own: their keys are by when and by this.
+          callbackId: `${DUE}${mark}#${n}`,
           runId: `${def.id} ${event.id}`,
           // Until its run starts, and listens itself.
           expiresAt: Math.min(event.ts + 120_000, Date.now() + (c.timeoutMs ?? Infinity)),
@@ -311,7 +312,8 @@ async function resolveWaits(event: WireEvent, receivedAt: number, engine: Engine
         waiters.slice(i, i + 25).map(async (w) => {
           if (w.kind === "cancel" && w.callbackId.startsWith(DUE)) {
             // An event of a time to come whose run hasn't started: it won't.
-            await engine.store.claim(w.callbackId.slice(DUE.length), "cancelled", DUE_CANCEL_MS);
+            const rest = w.callbackId.slice(DUE.length);
+            await engine.store.claim(rest.slice(0, rest.lastIndexOf("#")), "cancelled", DUE_CANCEL_MS);
             log("Cancelled a run that was still to come", { run: w.runId, event: event.id });
           } else if (w.kind === "cancel" && w.callbackId.startsWith(STOP)) {
             const arn = w.callbackId.slice(STOP.length);

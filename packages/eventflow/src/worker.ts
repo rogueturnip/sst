@@ -954,7 +954,7 @@ function makeStep(state: RunState) {
     const { id, base, first } = claim(state, idInput);
     const of = options?.idempotencyKey;
     if (of !== undefined && (typeof of === "number" ? !Number.isFinite(of) : typeof of !== "string" || !of))
-      throw new UsageError(`The idempotencyKey of step "${id}" is what the run it invokes is of, like an order's ID.`);
+      throw new UsageError(`The idempotencyKey of step "${id}" must be a string that isn't empty, or a finite number: what the run it invokes is of, like an order's ID.`);
     // Which use of an ID is which can be another in a retry or a replay, where a list changed, and
     // then the run it invokes would have another's keys.
     if (of === undefined && (state.uses.get(base) ?? 0) > 1) {
@@ -1691,14 +1691,23 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
         const data = jsonify(checked ? checked.value : (input.data ?? {}));
         const of = input.idempotencyKey;
         if (of !== undefined && (typeof of === "number" ? !Number.isFinite(of) : typeof of !== "string" || !of))
-          throw new UsageError(`The idempotencyKey of defer("${id}") is what it's of, like an order's ID.`);
+          throw new UsageError(`The idempotencyKey of defer("${id}") must be a string that isn't empty, or a finite number: what it's of, like an order's ID.`);
         // By what it's of, or its place among the uses of its ID. Which use is which can be another
         // in a replay where a list changed, and the run it starts would have another's keys.
-        const name = of !== undefined ? `${stepId(id)}@${JSON.stringify(of)}` : occurrence({ counts: forState.deferCounts, used: forState.deferUsed } as any, stepId(id));
-        if (of === undefined && (forState.deferCounts.get(stepId(id)) ?? 0) > 1)
-          throw new UsageError(
-            `defer("${id}") is called more than once, so the run it starts could have another's idempotency keys in a replay. Say what each is of: defer(id, { ..., idempotencyKey: order.id }).`,
-          );
+        const keyed = of !== undefined ? `${stepId(id)}@${JSON.stringify(of)}` : undefined;
+        const refuse = (message: string) => {
+          // Nothing it deferred starts: after the fix, a replay defers it again, by its new name,
+          // and it isn't done twice. It fails the run, though the code catches it.
+          defers.clear();
+          const error = new UsageError(`${message} The run fails, and nothing it deferred starts.`);
+          forState.refuse(error);
+          throw error;
+        };
+        if (keyed && forState.deferUsed.has(keyed)) refuse(`defer("${id}") is called twice with the idempotencyKey ${JSON.stringify(of)}. Give each its own.`);
+        const name = keyed ?? occurrence({ counts: forState.deferCounts, used: forState.deferUsed } as any, stepId(id));
+        if (keyed) forState.deferUsed.add(keyed);
+        if (!keyed && (forState.deferCounts.get(stepId(id)) ?? 0) > 1)
+          refuse(`defer("${id}") is called more than once, so the run it starts could have another's idempotency keys in a replay. Say what each is of: defer(id, { ..., idempotencyKey: order.id }).`);
         defers.set(`${forState.namespace}\n${name}`, {
           fn: target,
           data,
@@ -2051,6 +2060,8 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
             shared: sharedOf("onFailure"),
             more: { memo: Object.create(null), start: async () => {} },
             run: (state) => {
+              // What an attempt that failed deferred, the next does again, if it comes to it.
+              for (const name of [...defers.keys()]) if (!before.has(name)) defers.delete(name);
               const args = makeArgs(state, {
                 error,
                 event: {

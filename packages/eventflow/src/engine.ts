@@ -234,7 +234,12 @@ export class Engine {
     const text = await response.text();
     if (!response.ok)
       throw new Error(
-        `The EventFlow admin API failed: ${response.status} ${text}. Is this function linked to the EventFlow's admin, with "link: [flow.admin]"?`,
+        `The EventFlow admin API failed: ${response.status} ${text.slice(0, 500)}.` +
+          (response.status === 403 || response.status === 401
+            ? ` Is this function linked to the EventFlow's admin, with "link: [flow.admin]"?`
+            : response.status === 404
+              ? " Is the EventFlow deployed, in this region and stage?"
+              : " AWS may be throttling or failing: try again."),
       );
     if (response.headers.get("X-Amz-Function-Error")) {
       const error = JSON.parse(text || "{}");
