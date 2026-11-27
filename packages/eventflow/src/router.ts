@@ -225,8 +225,9 @@ async function routeRecord(record: SQSRecord, registry: Map<string, Registered>,
           // Until its run starts, and listens itself.
           expiresAt: Math.min(event.ts + 120_000, Date.now() + (c.timeoutMs ?? Infinity)),
           kind: "cancel",
-          // From when SQS took it, not when it's routed, which can be later.
-          since: receivedAt,
+          // From just after SQS took it, not when it's routed, which can be later. Not one that
+          // SQS took in the same moment, as a cancel sent with it: that's not after it.
+          since: receivedAt + 1,
         });
         if (heard.event) await engine.store.claim(mark, "cancelled", DUE_CANCEL_MS);
       }

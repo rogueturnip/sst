@@ -494,6 +494,30 @@ export function paths(node: Node): string[][] {
   }
 }
 
+/** The paths an expression reads whatever its values: not those in a branch of `?:` or `||`, or in `has()`. */
+export function requiredPaths(node: Node): string[][] {
+  switch (node.kind) {
+    case "path":
+      return [node.path];
+    case "list":
+      return node.items.flatMap(requiredPaths);
+    case "unary":
+      return requiredPaths(node.of);
+    case "binary":
+      return node.op === "||" ? [] : [...requiredPaths(node.left), ...requiredPaths(node.right)];
+    case "ternary":
+      return requiredPaths(node.if);
+    case "get":
+      return [...requiredPaths(node.of), ...requiredPaths(node.key)];
+    case "call":
+      return node.name === "has" ? [] : node.args.flatMap(requiredPaths);
+    case "macro":
+      return requiredPaths(node.of);
+    default:
+      return [];
+  }
+}
+
 /**
  * Replace every path under `root` with its value in `scope`, so the expression only
  * refers to the other roots. A wait uses it to fix the values from the run's event

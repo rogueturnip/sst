@@ -8,7 +8,7 @@ import { priorityMs, type Definition } from "./definition.js";
 import { parseDuration, toDurableSeconds, type DurationInput } from "./duration.js";
 import { arnKey, arnTtl, checkedData, checkEvent, checkSignal, mergeSessions, MESSAGE_TTL_MS, toWireEvent, type Engine, type SendPayload } from "./engine.js";
 import { InvokeFailedError, NonRetriableError, RetryAfterError, SignalConflictError, StepFailedError } from "./errors.js";
-import { bind, conjuncts, evaluate, getPath, parseExpression, paths, type Expression } from "./expression.js";
+import { bind, conjuncts, evaluate, getPath, parseExpression, paths, requiredPaths, type Expression } from "./expression.js";
 import { callRunId, hash, key, runId as makeRunId } from "./ids.js";
 import { Hooks } from "./middleware.js";
 import { publish, type TopicRef } from "./realtime.js";
@@ -1356,9 +1356,8 @@ export function matcher(
     // A path of the run's event that it doesn't have never matches. Where the whole `if`
     // needs it, say so instead.
     for (const part of conjuncts(parsed.node)) {
-      // One with a branch, as `a || b` or `has(x) ? a : b`, may not need it.
-      if ((part.kind === "binary" && part.op === "||") || part.kind === "ternary") continue;
-      for (const path of paths(part))
+      // What it reads whatever the values: a branch, as `a || b` or `has(x) ? a : b`, may not.
+      for (const path of requiredPaths(part))
         if (path[0] === "event" && getPath(event, path.slice(1)) === undefined)
           throw new MissingPathError(`The "if" of step "${stepId}" uses "${path.join(".")}", which the run's event doesn't have.`);
     }
@@ -1771,7 +1770,8 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
               found ||= !!heard.event;
             }
             // One that was heard for its event before it was due, as it started, cancels it too.
-            found ||= (await engine.store.owner(dueCancelKey(def.id, payload.event))) === "cancelled";
+            // Not a retry or replay of it, which starts after that, and isn't cancelled by it.
+            if (!payload.replayOf) found ||= (await engine.store.owner(dueCancelKey(def.id, payload.event))) === "cancelled";
             return { keys, found };
           },
           SETUP,
