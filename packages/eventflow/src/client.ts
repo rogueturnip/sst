@@ -95,11 +95,10 @@ export async function awsFetch(
     try {
       response = await c.fetch(url, { ...init, aws: options?.aws });
     } catch (error) {
-      if (attempt >= retries) {
-        tell(service, path, String((error as Error)?.name ?? error), attempt + 1, began, true);
-        throw error;
-      }
-      last = String((error as Error)?.name ?? "error");
+      // A network error is thrown, as aws4fetch does: the callers that may try again, like
+      // DynamoDB's and a callback's, have their own tries for it.
+      if (attempt) tell(service, path, String((error as Error)?.name ?? error), attempt + 1, began, true);
+      throw error;
     }
     if (response && !(response.status === 429 || response.status >= 500)) {
       if (attempt) tell(service, path, last, attempt + 1, began, false);

@@ -54,6 +54,9 @@ export type Message =
       exp: number;
       sig: string;
     }
+  // From the router: an event of a time to come, whose runs start at `at`. Its waits were
+  // resumed when it came. Signed, and good until `exp`.
+  | { kind: "due"; event: WireEvent; at: number; exp: number; sig: string }
   // From the worker: a run another run invokes. Signed, and good until `exp`.
   | { kind: "invoke"; fn: string; event: WireEvent; parent: string; runId: string; root: string; exp: number; sig: string }
   // From the router or the worker: something to do at `at`. Signed, and good until `exp`.

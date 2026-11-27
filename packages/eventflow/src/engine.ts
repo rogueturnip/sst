@@ -21,6 +21,8 @@ import {
 /** The largest message SQS takes, and the largest batch: 1 MiB. */
 const MAX_BATCH_BYTES = 1_048_576;
 /** The largest event, in bytes of JSON, that `send()` accepts. It leaves room for the message around it. */
+/** How far ahead an event's ts may be. */
+const MAX_AHEAD_MS = 366 * 86_400_000;
 export const MAX_EVENT_BYTES = 1_000_000;
 /**
  * How long a signed message in the queue is good for: longer than the dead-letter
@@ -300,6 +302,10 @@ export function checkEvent(input: Partial<WireEvent> & Record<string, unknown>, 
     throw new TypeError(`The id of ${label} "${name}" must be 1 to 128 printable characters, with no spaces.`);
   if (input.ts !== undefined && (typeof input.ts !== "number" || !Number.isFinite(input.ts)))
     throw new TypeError(`The ts of ${label} "${name}" must be a number of milliseconds.`);
+  // Its runs start then: no later than a run can last, so a ts in microseconds isn't a run
+  // that never starts.
+  if (typeof input.ts === "number" && input.ts > Date.now() + MAX_AHEAD_MS)
+    throw new TypeError(`The ts of ${label} "${name}" is more than a year from now. It's in milliseconds: is it in microseconds?`);
   if (input.v !== undefined && (typeof input.v !== "string" || input.v.length > 64))
     throw new TypeError(`The v of ${label} "${name}" must be at most 64 characters.`);
   if (input.sessions !== undefined) {

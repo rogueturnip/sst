@@ -81,7 +81,7 @@ function parse(record: SQSRecord): Message {
   }
   if (!message || typeof message !== "object") throw new Rejected("The body isn't a message.");
   const group = record.attributes.MessageGroupId;
-  if (message.kind === "timer" || message.kind === "system" || message.kind === "start" || message.kind === "invoke") {
+  if (message.kind === "timer" || message.kind === "system" || message.kind === "start" || message.kind === "invoke" || message.kind === "due") {
     if (!verify(message)) throw new Rejected(`The ${message.kind} message isn't signed by this EventFlow.`);
     if (typeof message.exp !== "number") throw new Rejected(`The ${message.kind} message has no expiry.`);
     return message as Message;
@@ -178,6 +178,17 @@ async function routeRecord(record: SQSRecord, registry: Map<string, Registered>,
     if (message.exp < Date.now() || !(SYSTEM_EVENTS as readonly string[]).includes(message.event.name))
       return warn("Dropped a message that expired", { kind: message.kind });
   }
+  if (message.kind === "due") {
+    if (message.exp < Date.now()) return warn("Dropped a message that expired", { kind: message.kind });
+    // Not yet: it goes back to the queue, 15 minutes at a time.
+    if (message.at > Date.now() + 1000) return engine.sendMessages([due(message.event, message.at)]);
+    const event = await fat(engine, message.event);
+    const item = key("ED", event.tenant ?? null, event.id);
+    if ((await engine.store.beginEvent(item, record.messageId, DEDUP_MS)) === "duplicate") return;
+    // As though it came now: its flow control is decided when it's due.
+    await startMatched(event, message.at, engine, registry);
+    return engine.store.finishEvent(item, DEDUP_MS);
+  }
   const event = await fat(engine, message.event);
 
   // An event ID is used once per tenant in 24 hours. The same message delivered
@@ -190,6 +201,26 @@ async function routeRecord(record: SQSRecord, registry: Map<string, Registered>,
 
   await resolveWaits(event, receivedAt, engine, registry);
 
+  // An event of a time to come resumes waits now, and starts its runs then, as with Inngest.
+  if (event.ts > Date.now() + 1000 && [...registry.values()].some((r) => matchesTrigger(r.def, event))) {
+    await engine.sendMessages([due(message.event, event.ts)]);
+    return engine.store.finishEvent(item, DEDUP_MS);
+  }
+  await startMatched(event, receivedAt, engine, registry);
+  await engine.store.finishEvent(item, DEDUP_MS);
+}
+
+/** The message that brings an event of a time to come back when it's due. */
+function due(event: WireEvent, at: number) {
+  return {
+    message: sign({ kind: "due" as const, event, at, exp: at + MESSAGE_TTL_MS }),
+    group: event.tenant ?? `t-${hash(event.name, 10)}`,
+    delaySeconds: Math.max(0, Math.min(900, Math.ceil((at - Date.now()) / 1000))),
+  };
+}
+
+/** Start the runs of every function the event triggers. */
+async function startMatched(event: WireEvent, receivedAt: number, engine: Engine, registry: Map<string, Registered>) {
   const matched = [...registry.values()].filter((r) => matchesTrigger(r.def, event));
   // Each on its own: one that fails, as when its key throws, doesn't keep the others from
   // starting. The message comes again for it, and the ones that started are found by name.
@@ -197,14 +228,12 @@ async function routeRecord(record: SQSRecord, registry: Map<string, Registered>,
   for (const { def } of matched) {
     try {
       if (def.batch && inBatch(def, event)) await addToBatch(def, event, receivedAt, engine, registry);
-      // An event of a time to come starts its runs then, as with Inngest.
-      else await startRun(def, event, engine, registry, { received: receivedAt, ...(event.ts > Date.now() + 1000 ? { notBefore: event.ts } : {}) });
+      else await startRun(def, event, engine, registry, { received: receivedAt });
     } catch (error) {
       failed.push(`${def.id}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
   if (failed.length) throw new Error(`Failed to start ${failed.length} of ${matched.length} functions: ${failed.join("; ").slice(0, 2000)}`);
-  await engine.store.finishEvent(item, DEDUP_MS);
 }
 
 /** Answer the run that invoked another. `by` is that other's ID: it takes no one else's answer. */
