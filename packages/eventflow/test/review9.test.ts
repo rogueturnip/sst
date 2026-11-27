@@ -54,12 +54,13 @@ describe("singleton ended, invoked, held", () => {
     await c.flow.send({ name: "go", data: { acct: "x", n: 2 } });
     await c.pump(4000);
     await waitFor(() => (log.includes("work-2") ? true : undefined), 600);
-    expect(log.filter((l) => l.startsWith("parent"))).toEqual([]);
+    // Told the child failed, at once, as with Inngest: its onFailure is a function of its own.
+    expect(log.filter((l) => l.startsWith("parent"))).toEqual(["parent err:declined"]);
     // SQS delivers the held start message again.
     await c.deliver([{ ...held[held.length - 1], messageId: "again", receiveCount: 0 }]);
     await c.pump(2000);
-    // The child hasn't ended: its onFailure waits. The parent isn't told it was skipped.
-    expect(log.filter((l) => l.startsWith("parent"))).toEqual([]);
+    // Its onFailure waits. The parent isn't told again, that it was skipped.
+    expect(log.filter((l) => l.startsWith("parent"))).toEqual(["parent err:declined"]);
   }, 90_000);
 });
 

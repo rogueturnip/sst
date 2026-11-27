@@ -1947,6 +1947,41 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
         }),
       );
     const isCancelled = !outcome.ok && (outcome.error instanceof CancelledError || errorInfo(outcome.error).name === CANCELLED);
+    // Each of these is done whatever becomes of the others.
+    const error = outcome.ok ? undefined : { ...errorInfo(outcome.error), ...(isCancelled ? { name: "Cancelled" } : {}) };
+    const ending = async (what: string, fn: () => Promise<void>) => {
+      try {
+        await fn();
+      } catch (failure) {
+        if (isDurableInternal(failure)) throw failure;
+        log("error", `Failed to ${what}`, { run: runId, error: errorInfo(failure).message });
+      }
+    };
+    // Give back the singleton, and send the events about the run.
+    const ended = outcome.ok ? "completed" : isCancelled ? "cancelled" : "failed";
+    const wanted = wantedSystemEvents(registry, engine, { event: payload.event, outcome: ended });
+    const end = async () => {
+      if (payload.lock || wanted.length)
+        await ending("end the run", () =>
+          tellRun("sst:end", async () => {
+            if (payload.lock) await engine.store.lockFree(payload.lock, payload.runId);
+            if (wanted.length)
+              await sendSystemEvents(registry, engine, {
+                fn: def.id,
+                runId: payload.runId,
+                event: payload.event,
+                events,
+                outcome: ended,
+                ...(outcome.ok ? { result: outcome.value } : { error }),
+              });
+          }),
+        );
+      await ending("tell the run that invoked it", () => finish(outcome.ok ? { ok: true, result: outcome.value } : { ok: false, error: error! }));
+    };
+    // A failure is told at once, as Inngest's onFailure is a function of its own: the run that
+    // invoked it, and the events about it, don't wait for what's done about it.
+    const early = !outcome.ok && !!def.onFailure && !isCancelled;
+    if (early) await end();
     if (!outcome.ok && def.onFailure && !isCancelled) {
       const { error } = outcome;
       try {
@@ -1978,16 +2013,6 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
       }
     }
 
-    // Each of these is done whatever becomes of the others.
-    const error = outcome.ok ? undefined : { ...errorInfo(outcome.error), ...(isCancelled ? { name: "Cancelled" } : {}) };
-    const ending = async (what: string, fn: () => Promise<void>) => {
-      try {
-        await fn();
-      } catch (failure) {
-        if (isDurableInternal(failure)) throw failure;
-        log("error", `Failed to ${what}`, { run: runId, error: errorInfo(failure).message });
-      }
-    };
     if (outcome.ok && hooks.has("onRunComplete")) {
       const output = outcome.value;
       await ending("tell the middleware", () => tellRun("sst:onRunComplete", () => hooks.tell("onRunComplete", { output })));
@@ -2025,25 +2050,7 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
           await engine.sendMessages(messages);
         }),
       );
-    // Give back the singleton, and send the events about the run.
-    const ended = outcome.ok ? "completed" : isCancelled ? "cancelled" : "failed";
-    const wanted = wantedSystemEvents(registry, engine, { event: payload.event, outcome: ended });
-    if (payload.lock || wanted.length)
-      await ending("end the run", () =>
-        tellRun("sst:end", async () => {
-          if (payload.lock) await engine.store.lockFree(payload.lock, payload.runId);
-          if (wanted.length)
-            await sendSystemEvents(registry, engine, {
-              fn: def.id,
-              runId: payload.runId,
-              event: payload.event,
-              events,
-              outcome: ended,
-              ...(outcome.ok ? { result: outcome.value } : { error }),
-            });
-        }),
-      );
-    await ending("tell the run that invoked it", () => finish(outcome.ok ? { ok: true, result: outcome.value } : { ok: false, error: error! }));
+    if (!early) await end();
     if (!outcome.ok) {
       // It's cancelled, not failed, as it would be by an event that came later.
       if (isCancelled)

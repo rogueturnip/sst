@@ -52,8 +52,8 @@ describe("singleton ended, invoked", () => {
       // SQS delivers the invoke message again (at least once), or the parent's send step ran twice.
       await c.deliver([{ ...invokes[0], messageId: "again", receiveCount: 0 }]);
       await c.pump(2000);
-      // The parent is still waiting for its child, which hasn't ended: it isn't told the run was skipped.
-      expect(log.filter((l) => l.startsWith("parent"))).toEqual([]);
+      // The parent was told the child failed, at once, as with Inngest, and isn't told it was skipped.
+      expect(log.filter((l) => l.startsWith("parent"))).toEqual(["parent err:declined"]);
     }, 90_000);
 });
 
