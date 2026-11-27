@@ -166,6 +166,14 @@ func TestSnapshot(t *testing.T) {
 	}
 }
 
+func TestParseSinceLocal(t *testing.T) {
+	zone := time.FixedZone("EST", -5*3600)
+	got, err := ParseSince("2026-11-20T08:30", now.In(zone))
+	if want := time.Date(2026, 11, 20, 13, 30, 0, 0, time.UTC); err != nil || !got.Equal(want) {
+		t.Errorf("ParseSince of a time without a zone = %v, %v; want %v", got, err, want)
+	}
+}
+
 func TestParseSince(t *testing.T) {
 	for _, tc := range []struct {
 		input string

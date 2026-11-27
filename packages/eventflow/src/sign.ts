@@ -62,6 +62,8 @@ function secret() {
 
 /** JSON with sorted keys, so the same value always signs the same. */
 export function canonical(value: unknown): string {
+  // As it's sent: a Date, or anything with toJSON, is what that gives.
+  if (value !== null && typeof value === "object" && typeof (value as any).toJSON === "function") return canonical((value as any).toJSON());
   if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
   const entries = Object.keys(value as Record<string, unknown>)

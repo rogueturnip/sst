@@ -122,9 +122,20 @@ export function runPrefix(fn: string) {
   return `${fn.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 36) || "fn"}-`;
 }
 
+/**
+ * Whether a run ID is one of the function's: its prefix, then the hash alone, and a
+ * rerun's suffix. So `send` doesn't take the runs of `send-welcome`.
+ */
+function ofFunction(fn: string) {
+  const prefix = runPrefix(fn).replace(/[-]/g, "\\-");
+  return new RegExp(`^${prefix}[0-9A-HJKMNP-TV-Z]{15,26}(_r[0-9A-HJKMNP-TV-Z]{10})?$`);
+}
+
 export async function listRuns(engine: Engine, input: ListInput = {}): Promise<RunSummary[]> {
   const fn = typeof input.function === "string" ? input.function : input.function?.id;
-  const prefix = fn ? runPrefix(fn) : undefined;
+  const mine = fn ? ofFunction(fn) : undefined;
+  // Two IDs can make one prefix, like "a.b" and "a-b": then each run says whose it is.
+  const shared = fn !== undefined && runPrefix(fn) !== `${fn}-`;
   const limit = Math.min(Math.max(1, input.limit ?? 100), 1000);
   const runs: RunSummary[] = [];
   let marker: string | undefined;
@@ -138,7 +149,8 @@ export async function listRuns(engine: Engine, input: ListInput = {}): Promise<R
     if (marker) params.set("Marker", marker);
     const result = await lambda<any>(engine, `/functions/${encodeURIComponent(engine.worker.name)}/durable-executions?${params}`);
     for (const e of result.DurableExecutions ?? []) {
-      if (prefix && !String(e.DurableExecutionName).startsWith(prefix)) continue;
+      if (mine && !mine.test(String(e.DurableExecutionName))) continue;
+      if (shared && (await runStatus(engine, e.DurableExecutionArn)).payload?.fn !== fn) continue;
       runs.push(summary(e));
     }
     marker = result.NextMarker;

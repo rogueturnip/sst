@@ -107,14 +107,16 @@ func ParseStatus(input string) (string, error) {
 }
 
 // ParseSince is the time --since says: a duration back from now, like 90s,
-// 30m, 1h, 2d or 1w, or a time, like 2026-11-24 or 2026-11-24T10:00:00Z
+// 30m, 1h, 2d or 1w, or a time, like 2026-11-24 or 2026-11-24T10:00:00Z. A
+// time without a zone is local
 func ParseSince(input string, now time.Time) (time.Time, error) {
 	s := strings.TrimSpace(input)
 	if s == "" {
 		return time.Time{}, util.NewReadableError(nil, "--since needs a value, like 1h")
 	}
 	for _, layout := range []string{time.RFC3339, "2006-01-02T15:04", "2006-01-02"} {
-		if t, err := time.Parse(layout, s); err == nil {
+		// A time without a zone is in the zone of now, which is local
+		if t, err := time.ParseInLocation(layout, s, now.Location()); err == nil {
 			return t, nil
 		}
 	}

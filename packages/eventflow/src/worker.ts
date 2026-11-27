@@ -965,7 +965,8 @@ function makeStep(state: RunState) {
             const event: WireEvent = {
               id: hash(identity),
               name: "inngest/function.invoked",
-              data: options.data ?? {},
+              // As JSON, as it's sent and signed: a Date is its string.
+              data: jsonify(options.data ?? {}),
               ts: Date.now(),
               ...(state.event.tenant ? { tenant: state.event.tenant } : {}),
               ...(sessions ? { sessions } : {}),
