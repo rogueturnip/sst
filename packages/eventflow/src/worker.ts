@@ -78,6 +78,11 @@ export function leaseWaitSeconds(round: number) {
 export const STOP = "stop:";
 /** A cancelOn heard for an event of a time to come, before its run starts. */
 export const DUE = "due:";
+
+/** Where a cancelOn heard for an event of a time to come is kept: for that send of it, by its ts. */
+export function dueCancelKey(fn: string, event: { id: string; tenant?: string; ts: number }) {
+  return key("DC", fn, event.tenant ?? null, event.id, event.ts);
+}
 /** The largest answer of an invoked run: what the callback API takes. */
 const MAX_ANSWER_BYTES = 250 * 1024;
 /** How long a received event is kept for a wait that registers just after it. */
@@ -1422,6 +1427,8 @@ export async function listen(
     expiresAt: number;
     kind: "wait" | "cancel";
     parent?: string;
+    /** From when an event counts, if not from now. */
+    since?: number;
   },
 ): Promise<{ event: WireEvent | null; registered: { key: string; createdAt: number; callbackId: string } }> {
   await engine.store.addWaitField(input.name, input.tenant, input.field, input.expiresAt);
@@ -1439,7 +1446,7 @@ export async function listen(
   };
   await engine.store.putWaiter(k, waiter);
   const registered = { key: k, createdAt, callbackId: input.callbackId };
-  const recent = await engine.store.recent(recentKey(input.name, input.tenant), createdAt);
+  const recent = await engine.store.recent(recentKey(input.name, input.tenant), Math.min(createdAt, input.since ?? createdAt));
   for (const { event: kept } of recent) {
     const event = await fat(engine, kept);
     if (!eventMatches(event, input.field, input.value, waiter.condition)) continue;
@@ -1763,6 +1770,8 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
               keys.push(heard.registered);
               found ||= !!heard.event;
             }
+            // One that was heard for its event before it was due, as it started, cancels it too.
+            found ||= (await engine.store.owner(dueCancelKey(def.id, payload.event))) === "cancelled";
             return { keys, found };
           },
           SETUP,

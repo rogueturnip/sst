@@ -12,7 +12,7 @@ import { LOCK_GRACE_MS, lockOrder, lockTtl, settleLock, singletonKey, takeLock, 
 import type { Admission, Pending } from "./store.js";
 import { sendSystemEvents } from "./system.js";
 import { SYSTEM_EVENTS, type Message, type RunPayload, type Timer, type WireEvent } from "./types.js";
-import { DUE, listen, matcher, MissingPathError, endedKey, eventMatches, MAX_WAIT_S, RECENT_MS, recentKey, signalKey, startKey, STOP, waitKey, type InvokeOutcome, type Registered } from "./worker.js";
+import { DUE, dueCancelKey, listen, matcher, MissingPathError, endedKey, eventMatches, MAX_WAIT_S, RECENT_MS, recentKey, signalKey, startKey, STOP, waitKey, type InvokeOutcome, type Registered } from "./worker.js";
 
 // The router reads the engine's queue. For each event it resolves the waits that
 // match it, and starts a run of each function it triggers. It also gets the tick of
@@ -225,6 +225,8 @@ async function routeRecord(record: SQSRecord, registry: Map<string, Registered>,
           // Until its run starts, and listens itself.
           expiresAt: Math.min(event.ts + 120_000, Date.now() + (c.timeoutMs ?? Infinity)),
           kind: "cancel",
+          // From when SQS took it, not when it's routed, which can be later.
+          since: receivedAt,
         });
         if (heard.event) await engine.store.claim(mark, "cancelled", DUE_CANCEL_MS);
       }
@@ -240,10 +242,6 @@ async function routeRecord(record: SQSRecord, registry: Map<string, Registered>,
 const AHEAD_MS = 5000;
 const DUE_CANCEL_MS = 367 * 86_400_000;
 
-/** Where a cancelOn that was heard for an event of a time to come is kept, for its function. */
-function dueCancelKey(fn: string, event: WireEvent) {
-  return key("DC", fn, event.tenant ?? null, event.id);
-}
 
 /** The message that brings an event of a time to come back when it's due. */
 function due(event: WireEvent, at: number) {
@@ -282,7 +280,10 @@ async function notifyParent(engine: Engine, parent: string, error: { name: strin
 
 async function resolveWaits(event: WireEvent, receivedAt: number, engine: Engine, registry: Map<string, Registered>) {
   const fields = await engine.store.waitFields(event.name, event.tenant);
-  if (!fields.length) return;
+  // A function's cancelOn event is kept, though nothing listens yet, for an event of a time to
+  // come that's routed after it, and listens from when it was sent.
+  const cancels = [...registry.values()].some((r) => r.def.cancelOn.some((c) => c.name === event.name));
+  if (!fields.length && !cancels) return;
   // Its data, for waits that start in the next hour, is kept that long, unless one takes it. A
   // sender can't make the table keep what no run uses.
   let kept = await slim(engine, event, RECENT_MS + 86_400_000);
@@ -621,6 +622,18 @@ export async function startRun(
   };
   const started = await engine.startRun(payload);
   if (lockItem && started?.arn) await engine.store.lockStarted(lockItem, id, started.arn);
+  // Its name is taken. By this event, delivered again, or by an earlier one with its ID, sent
+  // more than 24 hours ago, whose run AWS still keeps: that one starts no run.
+  if (!started && !opts.runId) {
+    const run = await lookupRun(engine, id).catch(() => undefined);
+    const earlier = run && (await runStatus(engine, run.arn).catch(() => undefined))?.payload?.event;
+    if (earlier && earlier.ts !== event.ts)
+      warn("An event ID was used again after 24 hours, while the run of its first use is kept. No run started: give each event its own ID", {
+        fn: def.id,
+        event: hash(event.id, 10),
+        run: id,
+      });
+  }
 }
 
 const SKIPPED: Record<string, string> = {
