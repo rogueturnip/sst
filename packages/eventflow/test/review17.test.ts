@@ -67,6 +67,6 @@ describe("a step's restarts", () => {
     await Promise.all([...c.runs.values()].map((r) => r.result));
     expect(calls).toBe(2);
     // Nothing was restarted: no restart is counted, and none of the three is used up.
-    expect(claimed.filter((k) => k.includes("SR"))).toEqual([]);
+    expect(claimed.filter((k) => k.startsWith("SR#"))).toEqual([]);
   }, 60_000);
 });

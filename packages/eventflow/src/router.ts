@@ -2,7 +2,7 @@ import { createHash } from "crypto";
 import type { SQSBatchItemFailure, SQSBatchResponse, SQSEvent, SQSRecord } from "aws-lambda";
 import { cronMatches, localMinute } from "./cron.js";
 import { matchesTrigger, type Definition } from "./definition.js";
-import { fat, slim } from "./blobs.js";
+import { blobTtl, fat, slim } from "./blobs.js";
 import { checkEvent, checkSignal, cleanEvent, DEDUP_MS, MESSAGE_TTL_MS, type Engine } from "./engine.js";
 import { evaluate, getPath } from "./expression.js";
 import { callRunId, hash, key, runId as makeRunId, ulid } from "./ids.js";
@@ -12,7 +12,7 @@ import { LOCK_GRACE_MS, lockOrder, lockTtl, settleLock, singletonKey, takeLock, 
 import type { Admission, Pending } from "./store.js";
 import { sendSystemEvents } from "./system.js";
 import { SYSTEM_EVENTS, type Message, type RunPayload, type Timer, type WireEvent } from "./types.js";
-import { endedKey, eventMatches, MAX_WAIT_S, RECENT_MS, recentKey, signalKey, startKey, STOP, waitKey, type InvokeOutcome, type Registered } from "./worker.js";
+import { DUE, listen, matcher, MissingPathError, endedKey, eventMatches, MAX_WAIT_S, RECENT_MS, recentKey, signalKey, startKey, STOP, waitKey, type InvokeOutcome, type Registered } from "./worker.js";
 
 // The router reads the engine's queue. For each event it resolves the waits that
 // match it, and starts a run of each function it triggers. It also gets the tick of
@@ -185,8 +185,9 @@ async function routeRecord(record: SQSRecord, registry: Map<string, Registered>,
     const event = await fat(engine, message.event);
     const item = key("ED", event.tenant ?? null, event.id);
     if ((await engine.store.beginEvent(item, record.messageId, DEDUP_MS)) === "duplicate") return;
-    // As though it came now: its flow control is decided when it's due.
-    await startMatched(event, message.at, engine, registry);
+    // As though it came now: its flow control is decided when it's due. Not for a function
+    // whose cancelOn was heard since.
+    await startMatched(event, message.at, engine, registry, async (fn) => (await engine.store.owner(dueCancelKey(fn, event))) === "cancelled");
     return engine.store.finishEvent(item, DEDUP_MS);
   }
   const event = await fat(engine, message.event);
@@ -202,12 +203,46 @@ async function routeRecord(record: SQSRecord, registry: Map<string, Registered>,
   await resolveWaits(event, receivedAt, engine, registry);
 
   // An event of a time to come resumes waits now, and starts its runs then, as with Inngest.
-  if (event.ts > Date.now() + 1000 && [...registry.values()].some((r) => matchesTrigger(r.def, event))) {
-    await engine.sendMessages([due(message.event, event.ts)]);
+  // Later than when SQS took it, by more than a sender's clock may be ahead.
+  if (event.ts > receivedAt + AHEAD_MS && [...registry.values()].some((r) => matchesTrigger(r.def, event))) {
+    // Its cancelOn listens from now, as its run would if it slept until then, as with Inngest.
+    for (const { def } of [...registry.values()].filter((r) => matchesTrigger(r.def, event) && r.def.cancelOn.length))
+      for (const c of def.cancelOn) {
+        let m: ReturnType<typeof matcher>;
+        try {
+          m = matcher("cancelOn", event, c);
+        } catch (error) {
+          if (error instanceof MissingPathError) continue;
+          throw error;
+        }
+        const mark = dueCancelKey(def.id, event);
+        const heard = await listen(engine, {
+          name: c.name,
+          tenant: event.tenant,
+          ...m,
+          callbackId: `${DUE}${mark}`,
+          runId: `${def.id} ${event.id}`,
+          // Until its run starts, and listens itself.
+          expiresAt: Math.min(event.ts + 120_000, Date.now() + (c.timeoutMs ?? Infinity)),
+          kind: "cancel",
+        });
+        if (heard.event) await engine.store.claim(mark, "cancelled", DUE_CANCEL_MS);
+      }
+    // Its data is kept in the table until then, not carried each time it comes back.
+    await engine.sendMessages([due(await slim(engine, event, event.ts - Date.now() + MESSAGE_TTL_MS + blobTtl(engine)), event.ts)]);
     return engine.store.finishEvent(item, DEDUP_MS);
   }
   await startMatched(event, receivedAt, engine, registry);
   await engine.store.finishEvent(item, DEDUP_MS);
+}
+
+/** How far ahead of SQS a sender's clock may be, before its event is one of a time to come. */
+const AHEAD_MS = 5000;
+const DUE_CANCEL_MS = 367 * 86_400_000;
+
+/** Where a cancelOn that was heard for an event of a time to come is kept, for its function. */
+function dueCancelKey(fn: string, event: WireEvent) {
+  return key("DC", fn, event.tenant ?? null, event.id);
 }
 
 /** The message that brings an event of a time to come back when it's due. */
@@ -220,13 +255,17 @@ function due(event: WireEvent, at: number) {
 }
 
 /** Start the runs of every function the event triggers. */
-async function startMatched(event: WireEvent, receivedAt: number, engine: Engine, registry: Map<string, Registered>) {
+async function startMatched(event: WireEvent, receivedAt: number, engine: Engine, registry: Map<string, Registered>, cancelled?: (fn: string) => Promise<boolean>) {
   const matched = [...registry.values()].filter((r) => matchesTrigger(r.def, event));
   // Each on its own: one that fails, as when its key throws, doesn't keep the others from
   // starting. The message comes again for it, and the ones that started are found by name.
   const failed: string[] = [];
   for (const { def } of matched) {
     try {
+      if (cancelled && def.cancelOn.length && (await cancelled(def.id))) {
+        log("Skipped a run that was cancelled before it was due", { fn: def.id, event: hash(event.id, 10) });
+        continue;
+      }
       if (def.batch && inBatch(def, event)) await addToBatch(def, event, receivedAt, engine, registry);
       else await startRun(def, event, engine, registry, { received: receivedAt });
     } catch (error) {
@@ -268,7 +307,11 @@ async function resolveWaits(event: WireEvent, receivedAt: number, engine: Engine
     for (let i = 0; i < waiters.length; i += 25)
       await Promise.all(
         waiters.slice(i, i + 25).map(async (w) => {
-          if (w.kind === "cancel" && w.callbackId.startsWith(STOP)) {
+          if (w.kind === "cancel" && w.callbackId.startsWith(DUE)) {
+            // An event of a time to come whose run hasn't started: it won't.
+            await engine.store.claim(w.callbackId.slice(DUE.length), "cancelled", DUE_CANCEL_MS);
+            log("Cancelled a run that was still to come", { run: w.runId, event: event.id });
+          } else if (w.kind === "cancel" && w.callbackId.startsWith(STOP)) {
             const arn = w.callbackId.slice(STOP.length);
             if (await stop(engine, registry, { arn, runId: w.runId, parent: w.parent, message: `The run was cancelled by "${event.name}".` }))
               log("Cancelled a run", { run: w.runId, event: event.id });

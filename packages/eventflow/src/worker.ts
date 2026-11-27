@@ -76,6 +76,8 @@ export function leaseWaitSeconds(round: number) {
 }
 /** A waiter whose callback is this, followed by a run's ARN, stops the run. */
 export const STOP = "stop:";
+/** A cancelOn heard for an event of a time to come, before its run starts. */
+export const DUE = "due:";
 /** The largest answer of an invoked run: what the callback API takes. */
 const MAX_ANSWER_BYTES = 250 * 1024;
 /** How long a received event is kept for a wait that registers just after it. */
@@ -176,7 +178,7 @@ function retryDelay(error: unknown, attempt: number, retries: number, seed: stri
 /** A step used as it can't be. Trying the function again wouldn't help. */
 class UsageError extends TypeError {}
 /** A wait that needs what the run's event doesn't have: it never matches. */
-class MissingPathError extends UsageError {}
+export class MissingPathError extends UsageError {}
 
 /** A run that's cancelled, as it didn't start in time, or a later one replaced it. */
 export class CancelledError extends NonRetriableError {
@@ -1407,7 +1409,7 @@ export function recentKey(name: string, tenant: string | undefined) {
 // and doesn't wait for the callback. An event with R < T came before the wait
 // started, and isn't matched. When both see each other, the run goes on with the
 // event the wait found, and the callback is left to time out.
-async function listen(
+export async function listen(
   engine: Engine,
   input: {
     name: string;

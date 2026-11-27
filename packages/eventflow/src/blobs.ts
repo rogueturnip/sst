@@ -51,6 +51,6 @@ export async function fatValue(engine: Engine, kept: { value?: unknown; blob?: s
 }
 
 /** As long as a run that has it, and as it can be looked at, retried and replayed. */
-function blobTtl(engine: Engine) {
+export function blobTtl(engine: Engine) {
   return ((engine.resource.runTimeoutSeconds ?? 31_622_400) + 106 * 86_400) * 1000;
 }
