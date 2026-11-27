@@ -6,7 +6,7 @@ import { led, link, unlinked, type Link } from "./chain.js";
 import { Invocation } from "./invocation.js";
 import { priorityMs, type Definition } from "./definition.js";
 import { parseDuration, toDurableSeconds, type DurationInput } from "./duration.js";
-import { checkedData, checkEvent, checkSignal, mergeSessions, MESSAGE_TTL_MS, toWireEvent, type Engine, type SendPayload } from "./engine.js";
+import { arnKey, arnTtl, checkedData, checkEvent, checkSignal, mergeSessions, MESSAGE_TTL_MS, toWireEvent, type Engine, type SendPayload } from "./engine.js";
 import { InvokeFailedError, NonRetriableError, RetryAfterError, SignalConflictError, StepFailedError } from "./errors.js";
 import { bind, conjuncts, evaluate, getPath, parseExpression, paths, type Expression } from "./expression.js";
 import { callRunId, hash, key, runId as makeRunId } from "./ids.js";
@@ -1468,6 +1468,9 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
     // Whether this invocation goes on from what's saved. The SDK's own logger can't tell, in a
     // virtual context.
     const replay: Replay = replayOf(ctx);
+    // Its ARN, where the router may not have kept it, as one that crashed as it started it, so
+    // it's found without listing runs. Once, as it begins.
+    if (!replay.on && arn) await engine.store.claim(arnKey(payload.runId), arn, arnTtl(engine)).catch(() => {});
     // The run's own operations, by name too, so one that's only sometimes there doesn't move
     // the rest.
     const root = named(ctx, replay);

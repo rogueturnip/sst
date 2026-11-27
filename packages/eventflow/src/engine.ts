@@ -150,10 +150,8 @@ export class Engine {
       const started = await startExecution(worker, { name: payload.runId, payload: signed }, this.aws);
       // Kept, so a run is found by its ID in the table, and not by listing them: that's in
       // the account's 15 a second of Lambda's control plane, for every function.
-      if (started.arn)
-        await this.store
-          .claim(arnKey(payload.runId), started.arn, ((this.resource.runTimeoutSeconds ?? 31_622_400) + 90 * 86_400) * 1000)
-          .catch(() => {});
+      // If it can't be kept, the message comes again: a start by the same name is the same run.
+      if (started.arn) await this.store.claim(arnKey(payload.runId), started.arn, arnTtl(this));
       return started;
     } catch (error) {
       if (error instanceof LambdaError) {
@@ -416,6 +414,11 @@ export async function checkedData(payload: SendPayload) {
         .join("; ")}`,
     );
   return result.value;
+}
+
+/** How long a run's ARN is kept: as long as the run, and the 90 days its history is. */
+export function arnTtl(engine: { resource: { runTimeoutSeconds?: number } }) {
+  return ((engine.resource.runTimeoutSeconds ?? 31_622_400) + 90 * 86_400) * 1000;
 }
 
 /** Where a run's ARN is kept, by its ID. */

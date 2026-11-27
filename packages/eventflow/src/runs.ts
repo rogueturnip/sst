@@ -5,12 +5,15 @@ import { arnKey, type Engine } from "./engine.js";
 import { replayId } from "./ids.js";
 import type { RunPayload, WireEvent } from "./types.js";
 import { key as keyOf } from "./ids.js";
+const key = keyOf;
 import { lockOrder, takeLock, type LockRuns } from "./singleton.js";
 import { sendSystemEvents } from "./system.js";
 import { endedKey, ONCE, type InvokeOutcome, type Registered } from "./worker.js";
 
 /** How long a run's retry is remembered: as long as AWS keeps the run. */
 const RETENTION_MS = 90 * 86_400_000;
+// How long a run that wasn't found isn't listed again.
+const MISSING_MS = 10 * 60_000;
 
 // Runs, by their run ID, as the router's admin API serves them. A run is a durable
 // execution of the worker, and its ID is the execution's name, so it can be found
@@ -164,18 +167,41 @@ export async function listRuns(engine: Engine, input: ListInput = {}, functions:
   return runs.sort((a, b) => b.startedAt.getTime() - a.startedAt.getTime()).slice(0, limit);
 }
 
-export async function findRun(engine: Engine, runId: string): Promise<RunSummary | undefined> {
-  // By its ARN, which the router kept when it started it.
-  const arn = await engine.store.owner(arnKey(runId)).catch(() => undefined);
-  if (arn) {
-    const found = await lambda<any>(engine, `/durable-executions/${encodeURIComponent(arn)}?IncludeExecutionData=false`).catch(() => undefined);
-    if (found?.DurableExecutionName === runId) return summary(found);
+/**
+ * A run by its ID, from the ARN kept in the table when it started, with GetDurableExecution,
+ * which takes 300 requests a second. Undefined if it hasn't started. A throttle throws: it isn't
+ * put on the control plane's 15 a second.
+ */
+export async function lookupRun(engine: Engine, runId: string): Promise<RunSummary | undefined> {
+  const arn = await engine.store.owner(arnKey(runId));
+  if (!arn) return undefined;
+  try {
+    const found = await lambda<any>(engine, `/durable-executions/${encodeURIComponent(arn)}?IncludeExecutionData=false`);
+    return found?.DurableExecutionName === runId ? summary(found) : undefined;
+  } catch (error) {
+    if (/\b404\b|ResourceNotFound/.test(String((error as Error)?.message))) return undefined;
+    throw error;
   }
+}
+
+/**
+ * A run by its ID, as lookupRun, or by listing for one the table doesn't have, as one started
+ * before ARNs were kept. Listing takes the control plane's 15 a second: only for what a person asks.
+ */
+export async function findRun(engine: Engine, runId: string): Promise<RunSummary | undefined> {
+  const found = await lookupRun(engine, runId);
+  if (found) return found;
+  // One that wasn't there a moment ago, as one polled before it starts, isn't listed again for
+  // a while: once it starts, its ARN finds it.
+  const missing = key("RN", runId);
+  if (Number(await engine.store.owner(missing)) > Date.now()) return undefined;
   // One started before it was kept, or one the table doesn't have.
   const params = new URLSearchParams({ DurableExecutionName: runId, MaxItems: "10" });
   const page = await lambda<any>(engine, `/functions/${encodeURIComponent(engine.worker.name)}/durable-executions?${params}`);
   const match = (page.DurableExecutions ?? []).find((e: any) => e.DurableExecutionName === runId);
-  return match ? summary(match) : undefined;
+  if (match) return summary(match);
+  await engine.store.claim(missing, String(Date.now() + MISSING_MS), MISSING_MS).catch(() => {});
+  return undefined;
 }
 
 async function history(engine: Engine, arn: string) {

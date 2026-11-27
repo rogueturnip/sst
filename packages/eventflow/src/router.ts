@@ -6,7 +6,7 @@ import { fat, slim } from "./blobs.js";
 import { checkEvent, checkSignal, cleanEvent, DEDUP_MS, MESSAGE_TTL_MS, type Engine } from "./engine.js";
 import { evaluate, getPath } from "./expression.js";
 import { callRunId, hash, key, runId as makeRunId, ulid } from "./ids.js";
-import { findRun, runStatus } from "./runs.js";
+import { lookupRun, runStatus } from "./runs.js";
 import { deriveRoot, sign, verify } from "./sign.js";
 import { LOCK_GRACE_MS, lockOrder, lockTtl, settleLock, singletonKey, takeLock, type LockRuns } from "./singleton.js";
 import type { Admission, Pending } from "./store.js";
@@ -427,7 +427,7 @@ async function routeTimer(message: Extract<Message, { kind: "timer" }>, registry
     return void (await stop(engine, registry, { arn: timer.arn, runId: timer.runId, parent: timer.parent, message: "The run didn't finish in time." }));
   // A run that hasn't started: whichever is written first decides, this or its start.
   if ((await engine.store.successor(startKey(timer.runId), "cancelled", (engine.resource.runTimeoutSeconds ?? MAX_WAIT_S) * 1000)) !== "cancelled") return;
-  const run = await findRun(engine, timer.runId);
+  const run = await lookupRun(engine, timer.runId);
   const message_ = "The run didn't start in time.";
   if (run) return void (await stop(engine, registry, { arn: run.arn, runId: timer.runId, parent: timer.parent, message: message_ }));
   // It's held, and finds that it's cancelled when it's due.
@@ -530,7 +530,7 @@ export async function startRun(
   if (lockItem && (await settleLock(engine, lockRuns(engine, registry), lockItem, id))?.run !== id) {
     // A message that comes again for a run that started, and then lost the singleton as it
     // ended: that run tells the run that invoked it how it ends, not this.
-    if (await findRun(engine, id)) return;
+    if (await lookupRun(engine, id)) return;
     return skip("singleton", "Skipped a run that a later one replaced");
   }
 
@@ -629,7 +629,7 @@ async function admit(
 /** What a singleton needs of runs, for the router. */
 export function lockRuns(engine: Engine, registry: Map<string, Registered>): LockRuns {
   return {
-    find: (run) => findRun(engine, run),
+    find: (run) => lookupRun(engine, run),
     // One whose end is decided has done with its singleton, as Inngest's onFailure is a function
     // of its own: the next starts beside what's done about how it ended, and doesn't stop it.
     running: async (arn) => {

@@ -576,7 +576,9 @@ await flow.runs.list({ function: processOrder, status: "FAILED" });
 await flow.runs.cancel(runId);
 ```
 
-A run is found by its ID in the table, with Lambda's `GetDurableExecution`, which takes 300 requests a second. Listing runs, as `flow.runs.list` and `--all` do, takes Lambda's control plane, which has 15 requests a second for the whole account and region, as the router's own lookups and deploys do. So don't poll a list: poll `flow.runs.get`, or wait in a step.
+A run is found by its ID: the router keeps its ARN in the table when it starts it, and `flow.runs.get` reads it with Lambda's `GetDurableExecution`, which takes 300 requests a second for the account, and its history, which takes 150. Listing runs, as `flow.runs.list`, `sst eventflow runs`, `cancel --all` and `retry --failed` do, takes Lambda's control plane, which has 15 requests a second for the whole account and region, with deploys and stopping runs. So poll `flow.runs.get`, not a list, or wait in a step. A run that isn't found, as one that hasn't started, is listed once, for a run that started before ARNs were kept, and then not for 10 minutes.
+
+Stopping a run takes the control plane too. An event that cancels many runs, with `cancelOn`, a singleton, or `cancel --all`, stops them at about 15 a second: 1,000 runs in about a minute.
 
 ### Retry after a fix
 

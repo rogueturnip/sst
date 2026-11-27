@@ -13,7 +13,7 @@ const run = async (handler, options = {}) => {
   const def = { id: "f", name: "f", retries: 2, concurrency: [], cancelOn: [], middleware: [], triggers: [], ...options };
   // Who first said how a run ends: the run itself, here.
   const owners = new Map();
-  const store = { successor: async (item, owner) => (owners.has(item) || owners.set(item, owner), owners.get(item)) };
+  const store = { successor: async (item, owner) => (owners.has(item) || owners.set(item, owner), owners.get(item)), claim: async () => true };
   const engine = { resource: {}, store, apps: {}, propagateSessions: false, systemEvents: false };
   const worker = createWorker(new Map([["f", { def, handler }]]), () => engine, {});
   const payload = sign({ "sst:eventflow": 1, fn: "f", runId: "r1", root: "r1", event: { id: "e", name: "go", data: {}, ts: 1 } });
