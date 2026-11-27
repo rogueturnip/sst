@@ -529,7 +529,7 @@ export async function startRun(
   if (lockItem && (await settleLock(engine, lockRuns(engine, registry), lockItem, id))?.run !== id) {
     // A message that comes again for a run that started, and then lost the singleton as it
     // ended: that run tells the run that invoked it how it ends, not this.
-    if (admission.decision === "start" && (await findRun(engine, id))) return;
+    if (await findRun(engine, id)) return;
     return skip("singleton", "Skipped a run that a later one replaced");
   }
 

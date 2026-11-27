@@ -1098,16 +1098,17 @@ function makeStep(state: RunState) {
           const to = await engine.store.successor(record, wait ? JSON.stringify([wait.callbackId, wait.runId]) : "", ttl);
           if (!to) return { runId: undefined };
           const [callbackId, runId] = JSON.parse(to) as [string, string];
-          // A try after one that told it, and stopped before it saved, as the run waits again.
+          // How a try before this one went, if it said: told, or not.
           if (await engine.store.owner(`${record}\ntold`)) return { runId };
-          if (wait && wait.callbackId !== callbackId) return { runId: undefined };
-          // A try after one that may have told it, and stopped before it said so, finds the wait
-          // gone: it was told, by that one.
-          const first = await engine.store.claim(`${record}\ntrying`, crypto.randomUUID(), ttl);
-          const told = (await engine.callback(callbackId, { signal: options.signal, data: options.data ?? null })) || !first;
-          // Kept, so a try after one that told it, and stopped, says it was told too, and not a
-          // send to a wait that was gone.
-          if (told) await engine.store.claim(`${record}\ntold`, "told", ttl);
+          if (await engine.store.owner(`${record}\nnot`)) return { runId: undefined };
+          // A try before this one may have told it, and stopped before it said so. If the wait it
+          // found is gone, or the run waits again, it was told, by that one.
+          const tried = !!(await engine.store.owner(`${record}\ntrying`));
+          if (wait && wait.callbackId !== callbackId) return { runId: tried ? runId : undefined };
+          if (!tried) await engine.store.claim(`${record}\ntrying`, "trying", ttl);
+          const told = (await engine.callback(callbackId, { signal: options.signal, data: options.data ?? null })) || tried;
+          // Kept, so a try after this, or a replay, says the same.
+          await engine.store.claim(`${record}\n${told ? "told" : "not"}`, "1", ttl);
           await engine.store.signalFree(item, callbackId);
           return { runId: told ? runId : undefined };
         }), { serdes: state.shared.places.serdes(id), subType: "EventFlowSignalSend" }),
