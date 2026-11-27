@@ -415,7 +415,8 @@ async function routeTimer(message: Extract<Message, { kind: "timer" }>, registry
     if (!window.closing && !(await engine.store.debounceClose(timer.item, window.order))) return;
     return fireDebounce(entry.def, timer.item, engine, registry);
   }
-  if (early) return engine.sendTimer(timer, at);
+  // A batch closes only once it's due, so a timer a moment early comes again then.
+  if (early || (timer.type === "batch" && at > now)) return engine.sendTimer(timer, at);
   if (timer.type === "batch") {
     if (!entry) return warn("Skipped a batch of a function that's gone", { fn: timer.fn });
     // Its batching was taken out: what's left of it starts as one batch.

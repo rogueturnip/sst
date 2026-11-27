@@ -1313,7 +1313,8 @@ export function matcher(
     // A path of the run's event that it doesn't have never matches. Where the whole `if`
     // needs it, say so instead.
     for (const part of conjuncts(parsed.node)) {
-      if (part.kind === "binary" && part.op === "||") continue;
+      // One with a branch, as `a || b` or `has(x) ? a : b`, may not need it.
+      if ((part.kind === "binary" && part.op === "||") || part.kind === "ternary") continue;
       for (const path of paths(part))
         if (path[0] === "event" && getPath(event, path.slice(1)) === undefined)
           throw new UsageError(`The "if" of step "${stepId}" uses "${path.join(".")}", which the run's event doesn't have.`);
@@ -1694,7 +1695,17 @@ export function createWorker(registry: Map<string, Registered>, getEngine: () =>
             const keys: typeof cancelKeys = [];
             let found = false;
             for (const c of def.cancelOn) {
-              const { field, value, condition } = matcher("cancelOn", event, c);
+              // One that matches on what the run's event doesn't have, as a cron run's, never
+              // cancels it, as with Inngest: the run goes on.
+              let m: ReturnType<typeof matcher>;
+              try {
+                m = matcher("cancelOn", event, c);
+              } catch (error) {
+                if (!(error instanceof UsageError)) throw error;
+                log("warn", "A cancelOn can't match this run, which goes on", { fn: def.id, cancelOn: c.name, reason: error.message.slice(0, 200) });
+                continue;
+              }
+              const { field, value, condition } = m;
               const expiresAt = Date.now() + (c.timeoutMs ?? ttlMs);
               const heard = await listen(engine, {
                 name: c.name,

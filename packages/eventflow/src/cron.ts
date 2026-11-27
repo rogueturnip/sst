@@ -171,12 +171,16 @@ export function cronMatches(cron: Cron, date: Date): boolean {
 /**
  * The minute on the cron's clock, like "2026-11-01T01:30". When the clocks go back,
  * the hour that repeats has the same minutes, so a run named after it starts once, as
- * in Vixie cron. A cron whose hour starts with "*", like an hourly one, runs in both, so
- * its minute is the minute itself.
+ * in Vixie cron. A cron whose hour starts with "*", like an hourly one, runs in both.
  */
 export function localMinute(cron: Cron, date: Date) {
-  if (cron.everyHour) return date.toISOString().slice(0, 16) + "Z";
-  const p = partsIn(date, cron.timezone);
-  const two = (n: number) => String(n).padStart(2, "0");
-  return `${p.year}-${two(p.month)}-${two(p.day)}T${two(p.hour)}:${two(p.minute)}`;
+  const on = (d: Date) => {
+    const p = partsIn(d, cron.timezone);
+    const two = (n: number) => String(n).padStart(2, "0");
+    return `${p.year}-${two(p.month)}-${two(p.day)}T${two(p.hour)}:${two(p.minute)}`;
+  };
+  const minute = on(date);
+  // The second time of an hour that repeats has a name of its own.
+  if (cron.everyHour && on(new Date(date.getTime() - 3_600_000)) === minute) return `${minute}+1h`;
+  return minute;
 }

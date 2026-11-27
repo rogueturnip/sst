@@ -433,7 +433,7 @@ flow.createFunction(
 );
 ```
 
-When an event in `cancelOn` matches, the run is stopped, even while it sleeps or waits. Its status is `STOPPED`, and the steps that already ran aren't undone. `match` and `if` work as they do for [waits](#waiting-for-events), with the same rules: only events of the run's tenant, received after the run started listening. The run starts listening before its first step, and stops when it ends. A `timeout` stops listening sooner.
+When an event in `cancelOn` matches, the run is stopped, even while it sleeps or waits. Its status is `STOPPED`, and the steps that already ran aren't undone. `match` and `if` work as they do for [waits](#waiting-for-events), with the same rules: only events of the run's tenant, received after the run started listening. The run starts listening before its first step, and stops when it ends. A `timeout` stops listening sooner. A `cancelOn` whose `match`, or `if`, needs what the run's event doesn't have, as a cron run's, can't cancel it: the run goes on, with a warning in the logs.
 
 The event IDs come from the run and the step, so a retried step sends the same IDs, and they aren't routed twice.
 
